@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -98,22 +97,13 @@ func getCreateTime(path string, info os.FileInfo) time.Time {
 			}
 		}
 	}
-
-	// Fallback to OS-specific file creation time
-	stat := info.Sys().(*syscall.Stat_t)
-
-	var createTime time.Time
-	switch runtime.GOOS {
-	case "darwin": // macOS
-		// 正确将 stat.TimeSpec 转换为 time.Time
-		createTime = time.Unix(stat.Birthtimespec.Sec, stat.Birthtimespec.Nsec)
-	case "linux": // Linux
-		// 注意：Linux 系统没有标准的创建时间，这里的 ctime 是文件状态更改时间
-		createTime = time.Unix(stat.Ctimespec.Sec, stat.Ctimespec.Nsec)
-	default:
-		createTime = info.ModTime() // Fallback to modification time
+	// 尝试转换为 syscall.Stat_t 获取更底层信息
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		// Linux 系统中 ctime 是 inode 更改时间，并非真正的创建时间
+		// 但在没有创建时间的情况下，这是最接近的替代值
+		return time.Unix(int64(stat.Ctim.Sec), int64(stat.Ctim.Nsec))
 	}
-	return createTime
+	return info.ModTime()
 }
 
 func worker(files <-chan fileInfo, repoPath string, statsChan chan<- string, wg *sync.WaitGroup) {
@@ -137,6 +127,7 @@ func worker(files <-chan fileInfo, repoPath string, statsChan chan<- string, wg 
 		}
 		statsChan <- string(fPath)
 	}
+	close(statsChan)
 }
 
 func getDestPath(t time.Time, repo, src string) string {
