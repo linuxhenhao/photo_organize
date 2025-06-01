@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -33,6 +34,11 @@ const (
 	SourceFname   // filename
 )
 
+var (
+	ErrNotOverwrite = errors.New("target exist and not overwrite")
+	ErrBadStr       = errors.New("bad str")
+)
+
 type Stat struct {
 	SourcePath string
 	TargetPath string
@@ -44,8 +50,43 @@ func (s Stat) String() string {
 }
 
 func (s *Stat) LoadString(str string) error {
-	_, err := fmt.Sscanf(str, "<%s><%s><%d>", &s.SourcePath, &s.TargetPath, &s.Source)
-	return err
+	l := len(str)
+
+	parse := func(start int, end int, str string) (string, int, error) {
+		if start >= end {
+			return "", 0, io.EOF
+		}
+		if str[start] != '<' {
+			return "", 0, ErrBadStr
+		}
+		for i := start + 1; i < end; i++ {
+			if str[i] == '>' {
+				return str[start+1 : i], i + 1, nil
+			}
+		}
+		return "", 0, ErrBadStr
+	}
+	start, end := 0, l
+	seg, next, err := parse(start, end, str)
+	if err != nil {
+		return err
+	}
+	s.SourcePath = seg
+	seg, next, err = parse(next, end, str)
+	if err != nil {
+		return err
+	}
+	s.TargetPath = seg
+	seg, _, err = parse(next, end, str)
+	if err != nil {
+		return err
+	}
+	got, err := strconv.ParseInt(seg, 10, 32)
+	if err != nil {
+		return err
+	}
+	s.Source = Source(got)
+	return nil
 }
 
 // extractDateFromFilename uses regex to find and parse date patterns in filenames
@@ -231,7 +272,10 @@ func worker(files <-chan fileInfo, repoPath string, statsChan chan<- Stat, proce
 		destPath := getDestPath(createTime, repoPath, string(fPath))
 		if err := copyFile(string(fPath), destPath, overwrite); err != nil {
 			log.Printf("Error copying %s: %v", fPath, err)
-			continue
+			if !errors.Is(err, ErrNotOverwrite) {
+				continue
+			}
+			// not overwrite should send stat
 		}
 		statsChan <- Stat{
 			SourcePath: string(fPath),
@@ -253,7 +297,7 @@ func copyFile(src, dest string, overwrite bool) error {
 	// Check if destination exists
 	if _, err := os.Stat(dest); err == nil {
 		if !overwrite {
-			return fmt.Errorf("destination file %s already exists and overwrite is disabled", dest)
+			return ErrNotOverwrite
 		}
 	} else if !os.IsNotExist(err) {
 		// Other error checking
@@ -289,9 +333,10 @@ func loadProcessedFiles(path string) map[string]bool {
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		stat := Stat{}
-		err := (&stat).LoadString(scanner.Text())
+		stat := &Stat{}
+		err := stat.LoadString(scanner.Text())
 		if err != nil {
+			log.Printf("load stats err: %v\n", err)
 			continue
 		}
 		processed[stat.SourcePath] = true
