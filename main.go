@@ -2,12 +2,15 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -21,25 +24,121 @@ const (
 	bufferSize    = 100
 )
 
+type Source int
+
+const (
+	SourceExif    = iota
+	SourceCTime   // ctime
+	SourceModTime // mod time
+	SourceFname   // filename
+)
+
+type Stat struct {
+	SourcePath string
+	TargetPath string
+	Source     Source
+}
+
+func (s Stat) String() string {
+	return fmt.Sprintf("<%s><%s><%d>", s.SourcePath, s.TargetPath, s.Source)
+}
+
+func (s *Stat) LoadString(str string) error {
+	_, err := fmt.Sscanf(str, "<%s><%s><%d>", &s.SourcePath, &s.TargetPath, &s.Source)
+	return err
+}
+
+// extractDateFromFilename uses regex to find and parse date patterns in filenames
+func extractDateFromFilename(filename string) (time.Time, bool) {
+	// Common date regex patterns: yyyy-mm-dd, yyyy/mm/dd, yyyymmdd, yyyy_mm_dd, yyyy
+	patterns := []string{
+		`(\d{4})-(\d{2})-(\d{2})`, // yyyy-mm-dd
+		`(\d{4})/(\d{2})/(\d{2})`, // yyyy/mm/dd
+		`(\d{4})(\d{2})(\d{2})`,   // yyyymmdd
+		`(\d{4})_(\d{2})_(\d{2})`, // yyyy_mm_dd
+	}
+
+	minDate := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	currentDate := time.Now().UTC().Truncate(24 * time.Hour) // Truncate to midnight
+	currentYear := currentDate.Year()
+	minYear := minDate.Year()
+
+	for _, pattern := range patterns {
+		re := regexp.MustCompile(pattern)
+		matches := re.FindStringSubmatch(filename)
+		if len(matches) < 2 {
+			continue
+		}
+
+		var year, month, day int
+		switch len(matches) {
+		case 2: // yyyy
+			if _, err := strconv.Atoi(matches[1]); err != nil {
+				continue
+			}
+			year, _ = strconv.Atoi(matches[1])
+			month = 1
+			day = 1
+		case 4: // yyyy-mm-dd, yyyy/mm/dd, yyyymmdd, yyyy_mm_dd
+			yearStr, monthStr, dayStr := matches[1], matches[2], matches[3]
+			year, _ = strconv.Atoi(yearStr)
+			month, _ = strconv.Atoi(monthStr)
+			day, _ = strconv.Atoi(dayStr)
+		default:
+			continue
+		}
+
+		// Validate individual date components
+		if year < minYear || year > currentYear {
+			continue
+		}
+		if month < 1 || month > 12 {
+			continue
+		}
+		if day < 1 || day > 31 {
+			continue
+		}
+
+		// Create candidate date
+		parsedTime := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+
+		// Validate date range (2000-01-01 to today)
+		if parsedTime.Before(minDate) || parsedTime.After(currentDate) {
+			continue
+		}
+
+		return parsedTime, true
+	}
+
+	return time.Time{}, false
+}
+
 // Simplified to just track file paths, metadata will be read in workers
 type fileInfo string
 
 func main() {
-	if len(os.Args) < 3 {
-		log.Fatal("Usage: photo_organize <source_dirs...> <repo_path>")
+	var overwrite bool
+	flag.BoolVar(&overwrite, "overwrite", false, "Overwrite existing files in the repository")
+	flag.Parse()
+
+	if len(flag.Args()) < 2 {
+		log.Fatal("Usage: photo_organize [-overwrite] <source_dirs...> <repo_path>")
 	}
-	sourceDirs := os.Args[1 : len(os.Args)-1]
-	repoPath := os.Args[len(os.Args)-1]
+	sourceDirs := flag.Args()[:len(flag.Args())-1]
+	repoPath, err := filepath.Abs(flag.Args()[len(flag.Args())-1])
+	if err != nil {
+		panic(fmt.Sprintf("Error getting absolute path for %s: %v", repoPath, err))
+	}
 
 	processed := loadProcessedFiles(statsFileName)
 
-	files := collectFiles(sourceDirs, processed)
+	files := collectFiles(sourceDirs)
 	if len(files) == 0 {
 		log.Println("No files to process")
 		return
 	}
 
-	statsChan := make(chan string, bufferSize)
+	statsChan := make(chan Stat, bufferSize)
 	var statswg sync.WaitGroup
 	var wg sync.WaitGroup
 
@@ -51,7 +150,7 @@ func main() {
 	fileChan := make(chan fileInfo, workerCount*2)
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
-		go worker(fileChan, repoPath, statsChan, &wg)
+		go worker(fileChan, repoPath, statsChan, processed, overwrite, &wg)
 	}
 
 	// Send files to workers
@@ -75,23 +174,15 @@ func collectFiles(sourceDirs []string) []fileInfo {
 			if err != nil || info.IsDir() {
 				return nil
 			}
+			absPath, _ := filepath.Abs(path)
 			// Just collect file paths - metadata will be read in workers
-			files = append(files, fileInfo(path))
+			files = append(files, fileInfo(absPath))
 			return nil
 		})
 	}
 
 	return files
 }
-
-type Source int
-
-const (
-	SourceExif    = iota
-	SourceCTime   // ctime
-	SourceModTime // mod time
-	SourceFname   // filename
-)
 
 func getCreateTime(path string, info os.FileInfo) (time.Time, Source) {
 	// Try EXIF metadata first
@@ -106,7 +197,11 @@ func getCreateTime(path string, info os.FileInfo) (time.Time, Source) {
 			}
 		}
 	}
-	// get time from filename
+	// Try regex-based filename date extraction
+	parsedTime, ok := extractDateFromFilename(filepath.Base(path))
+	if ok {
+		return parsedTime, SourceFname
+	}
 	// 尝试转换为 syscall.Stat_t 获取更底层信息
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
 		// Linux 系统中 ctime 是 inode 更改时间，并非真正的创建时间
@@ -116,10 +211,13 @@ func getCreateTime(path string, info os.FileInfo) (time.Time, Source) {
 	return info.ModTime(), SourceModTime
 }
 
-func worker(files <-chan fileInfo, repoPath string, statsChan chan<- string, wg *sync.WaitGroup) {
+func worker(files <-chan fileInfo, repoPath string, statsChan chan<- Stat, processed map[string]bool, overwrite bool, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for fPath := range files {
 		// Get file info from OS
+		if processed[string(fPath)] {
+			continue
+		}
 		info, err := os.Stat(string(fPath))
 		if err != nil {
 			log.Printf("Error getting stats for %s: %v", fPath, err)
@@ -127,15 +225,19 @@ func worker(files <-chan fileInfo, repoPath string, statsChan chan<- string, wg 
 		}
 
 		// Get create time (now happens in worker)
-		createTime := getCreateTime(string(fPath), info)
+		createTime, source := getCreateTime(string(fPath), info)
 
 		// Process file
 		destPath := getDestPath(createTime, repoPath, string(fPath))
-		if err := copyFile(string(fPath), destPath); err != nil {
+		if err := copyFile(string(fPath), destPath, overwrite); err != nil {
 			log.Printf("Error copying %s: %v", fPath, err)
 			continue
 		}
-		statsChan <- string(fPath)
+		statsChan <- Stat{
+			SourcePath: string(fPath),
+			TargetPath: destPath,
+			Source:     source,
+		}
 	}
 }
 
@@ -147,7 +249,17 @@ func getDestPath(t time.Time, repo, src string) string {
 	return filepath.Join(dir, base)
 }
 
-func copyFile(src, dest string) error {
+func copyFile(src, dest string, overwrite bool) error {
+	// Check if destination exists
+	if _, err := os.Stat(dest); err == nil {
+		if !overwrite {
+			return fmt.Errorf("destination file %s already exists and overwrite is disabled", dest)
+		}
+	} else if !os.IsNotExist(err) {
+		// Other error checking
+		return fmt.Errorf("error checking destination file %s: %v", dest, err)
+	}
+
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -177,12 +289,17 @@ func loadProcessedFiles(path string) map[string]bool {
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		processed[scanner.Text()] = true
+		stat := Stat{}
+		err := (&stat).LoadString(scanner.Text())
+		if err != nil {
+			continue
+		}
+		processed[stat.SourcePath] = true
 	}
 	return processed
 }
 
-func statsWriter(ch <-chan string, wg *sync.WaitGroup, path string) {
+func statsWriter(ch <-chan Stat, wg *sync.WaitGroup, path string) {
 	defer wg.Done()
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -190,7 +307,7 @@ func statsWriter(ch <-chan string, wg *sync.WaitGroup, path string) {
 	}
 	defer f.Close()
 
-	buffer := make([]string, 0, bufferSize)
+	buffer := make([]Stat, 0, bufferSize)
 	flushTicker := time.NewTicker(5 * time.Second)
 
 	exit := make(chan os.Signal, 1)
@@ -221,9 +338,9 @@ func statsWriter(ch <-chan string, wg *sync.WaitGroup, path string) {
 	}
 }
 
-func flushBuffer(f *os.File, buffer []string) {
-	for _, line := range buffer {
-		if _, err := f.WriteString(line + "\n"); err != nil {
+func flushBuffer(f *os.File, buffer []Stat) {
+	for _, s := range buffer {
+		if _, err := f.WriteString(s.String()); err != nil {
 			log.Printf("Error writing to stats file: %v", err)
 		}
 	}
