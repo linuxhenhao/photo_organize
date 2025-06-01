@@ -40,11 +40,12 @@ func main() {
 	}
 
 	statsChan := make(chan string, bufferSize)
+	var statswg sync.WaitGroup
 	var wg sync.WaitGroup
 
 	// Start stats writer
-	wg.Add(1)
-	go statsWriter(statsChan, &wg, statsFileName)
+	statswg.Add(1)
+	go statsWriter(statsChan, &statswg, statsFileName)
 
 	// Setup worker pool
 	fileChan := make(chan fileInfo, workerCount*2)
@@ -59,11 +60,14 @@ func main() {
 	}
 	close(fileChan)
 
-	// Wait for all workers and stats writer
+	// Wait for all workers
 	wg.Wait()
+	close(statsChan)
+	// wait for stats writer
+	statswg.Wait()
 }
 
-func collectFiles(sourceDirs []string, processed map[string]bool) []fileInfo {
+func collectFiles(sourceDirs []string) []fileInfo {
 	var files []fileInfo
 
 	for _, dir := range sourceDirs {
@@ -71,10 +75,6 @@ func collectFiles(sourceDirs []string, processed map[string]bool) []fileInfo {
 			if err != nil || info.IsDir() {
 				return nil
 			}
-			if processed[path] {
-				return nil
-			}
-
 			// Just collect file paths - metadata will be read in workers
 			files = append(files, fileInfo(path))
 			return nil
@@ -84,7 +84,16 @@ func collectFiles(sourceDirs []string, processed map[string]bool) []fileInfo {
 	return files
 }
 
-func getCreateTime(path string, info os.FileInfo) time.Time {
+type Source int
+
+const (
+	SourceExif    = iota
+	SourceCTime   // ctime
+	SourceModTime // mod time
+	SourceFname   // filename
+)
+
+func getCreateTime(path string, info os.FileInfo) (time.Time, Source) {
 	// Try EXIF metadata first
 	f, err := os.Open(path)
 	if err == nil {
@@ -93,17 +102,18 @@ func getCreateTime(path string, info os.FileInfo) time.Time {
 		if err == nil {
 			date, err := ex.DateTime()
 			if err == nil {
-				return date
+				return date, SourceExif
 			}
 		}
 	}
+	// get time from filename
 	// 尝试转换为 syscall.Stat_t 获取更底层信息
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
 		// Linux 系统中 ctime 是 inode 更改时间，并非真正的创建时间
 		// 但在没有创建时间的情况下，这是最接近的替代值
-		return time.Unix(int64(stat.Ctim.Sec), int64(stat.Ctim.Nsec))
+		return time.Unix(int64(stat.Ctim.Sec), int64(stat.Ctim.Nsec)), SourceCTime
 	}
-	return info.ModTime()
+	return info.ModTime(), SourceModTime
 }
 
 func worker(files <-chan fileInfo, repoPath string, statsChan chan<- string, wg *sync.WaitGroup) {
@@ -127,7 +137,6 @@ func worker(files <-chan fileInfo, repoPath string, statsChan chan<- string, wg 
 		}
 		statsChan <- string(fPath)
 	}
-	close(statsChan)
 }
 
 func getDestPath(t time.Time, repo, src string) string {
