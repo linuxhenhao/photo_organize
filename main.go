@@ -385,7 +385,7 @@ func statsWriter(ch <-chan Stat, wg *sync.WaitGroup, path string) {
 
 func flushBuffer(f *os.File, buffer []Stat) {
 	for _, s := range buffer {
-		if _, err := f.WriteString(s.String()); err != nil {
+		if _, err := f.WriteString(s.String() + "\n"); err != nil {
 			log.Printf("Error writing to stats file: %v", err)
 		}
 	}
