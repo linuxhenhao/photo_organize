@@ -16,7 +16,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rwcarlsen/goexif/exif"
+	"os/exec"
+	"strings"
 )
 
 const (
@@ -226,18 +227,23 @@ func collectFiles(sourceDirs []string) []fileInfo {
 }
 
 func getCreateTime(path string, info os.FileInfo) (time.Time, Source) {
-	// Try EXIF metadata first
-	f, err := os.Open(path)
+	// Try exiftool first (supports both images and videos)
+	cmd := exec.Command("exiftool", "-s3", "-CreateDate", "-DateTimeOriginal", "-FileModifyDate", path)
+	output, err := cmd.Output()
 	if err == nil {
-		ex, err := exif.Decode(f)
-		_ = f.Close() // Close early to release file handle
-		if err == nil {
-			date, err := ex.DateTime()
+		dateStr := strings.TrimSpace(string(output))
+		if dateStr != "" {
+			// Parse common exiftool date formats (YYYY:MM:DD HH:MM:SS)
+			parsedTime, err := time.Parse("2006:01:02 15:04:05", dateStr)
 			if err == nil {
-				return date, SourceExif
+				return parsedTime, SourceExif
 			}
 		}
+	} else {
+		log.Printf("Error running exiftool for %s: %v", path, err)
 	}
+
+	// Fallback to regex-based filename date extraction
 	// Try regex-based filename date extraction
 	parsedTime, ok := extractDateFromFilename(filepath.Base(path))
 	if ok {
