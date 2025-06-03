@@ -1,403 +1,206 @@
 package main
 
 import (
-	"bufio"
-	"errors"
+	"bytes"
+	"database/sql"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
-	"os/signal"
+	"os/exec"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"sync"
-	"syscall"
 	"time"
 
-	"os/exec"
-	"strings"
+	"github.com/twmb/murmur3"
+	_ "modernc.org/sqlite"
 )
 
 const (
-	statsFileName = "import_stats.txt"
-	workerCount   = 8
-	bufferSize    = 100
-)
-
-type Source int
-
-const (
-	SourceExif    = iota
-	SourceCTime   // ctime
-	SourceModTime // mod time
-	SourceFname   // filename
+	workers   = 10
+	batchSize = 200
 )
 
 var (
-	ErrNotOverwrite = errors.New("target exist and not overwrite")
-	ErrBadStr       = errors.New("bad str")
+	dbPath     string
+	sourceDirs []string
+	destDir    string
 )
 
-type Stat struct {
-	SourcePath string
-	TargetPath string
-	Source     Source
-}
-
-func (s Stat) String() string {
-	return fmt.Sprintf("<%s><%s><%d>", s.SourcePath, s.TargetPath, s.Source)
-}
-
-func (s *Stat) LoadString(str string) error {
-	l := len(str)
-
-	parse := func(start int, end int, str string) (string, int, error) {
-		if start >= end {
-			return "", 0, io.EOF
-		}
-		if str[start] != '<' {
-			return "", 0, ErrBadStr
-		}
-		for i := start + 1; i < end; i++ {
-			if str[i] == '>' {
-				return str[start+1 : i], i + 1, nil
-			}
-		}
-		return "", 0, ErrBadStr
-	}
-	start, end := 0, l
-	seg, next, err := parse(start, end, str)
-	if err != nil {
-		return err
-	}
-	s.SourcePath = seg
-	seg, next, err = parse(next, end, str)
-	if err != nil {
-		return err
-	}
-	s.TargetPath = seg
-	seg, _, err = parse(next, end, str)
-	if err != nil {
-		return err
-	}
-	got, err := strconv.ParseInt(seg, 10, 32)
-	if err != nil {
-		return err
-	}
-	s.Source = Source(got)
-	return nil
-}
-
-// extractDateFromFilename uses regex to find and parse date patterns in filenames
-func extractDateFromFilename(filename string) (time.Time, bool) {
-	// Common date regex patterns: yyyy-mm-dd, yyyy/mm/dd, yyyymmdd, yyyy_mm_dd, yyyy
-	patterns := []string{
-		`(\d{4})-(\d{2})-(\d{2})`, // yyyy-mm-dd
-		`(\d{4})/(\d{2})/(\d{2})`, // yyyy/mm/dd
-		`(\d{4})(\d{2})(\d{2})`,   // yyyymmdd
-		`(\d{4})_(\d{2})_(\d{2})`, // yyyy_mm_dd
-	}
-
-	minDate := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-	currentDate := time.Now().UTC().Truncate(24 * time.Hour) // Truncate to midnight
-	currentYear := currentDate.Year()
-	minYear := minDate.Year()
-
-	for _, pattern := range patterns {
-		re := regexp.MustCompile(pattern)
-		matches := re.FindStringSubmatch(filename)
-		if len(matches) < 2 {
-			continue
-		}
-
-		var year, month, day int
-		switch len(matches) {
-		case 2: // yyyy
-			if _, err := strconv.Atoi(matches[1]); err != nil {
-				continue
-			}
-			year, _ = strconv.Atoi(matches[1])
-			month = 1
-			day = 1
-		case 4: // yyyy-mm-dd, yyyy/mm/dd, yyyymmdd, yyyy_mm_dd
-			yearStr, monthStr, dayStr := matches[1], matches[2], matches[3]
-			year, _ = strconv.Atoi(yearStr)
-			month, _ = strconv.Atoi(monthStr)
-			day, _ = strconv.Atoi(dayStr)
-		default:
-			continue
-		}
-
-		// Validate individual date components
-		if year < minYear || year > currentYear {
-			continue
-		}
-		if month < 1 || month > 12 {
-			continue
-		}
-		if day < 1 || day > 31 {
-			continue
-		}
-
-		// Create candidate date
-		parsedTime := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
-
-		// Validate date range (2000-01-01 to today)
-		if parsedTime.Before(minDate) || parsedTime.After(currentDate) {
-			continue
-		}
-
-		return parsedTime, true
-	}
-
-	return time.Time{}, false
-}
-
-// Simplified to just track file paths, metadata will be read in workers
-type fileInfo string
-
 func main() {
-	var overwrite bool
-	flag.BoolVar(&overwrite, "overwrite", false, "Overwrite existing files in the repository")
-	flag.Parse()
+	scanCmd := flag.NewFlagSet("scan", flag.ExitOnError)
+	scanCmd.StringVar(&dbPath, "db", "photos.db", "sqlite database path")
+	scanCmd.Parse(os.Args[2:])
 
-	if len(flag.Args()) < 2 {
-		log.Fatal("Usage: photo_organize [-overwrite] <source_dirs...> <repo_path>")
+	importCmd := flag.NewFlagSet("import", flag.ExitOnError)
+	importCmd.StringVar(&dbPath, "db", "photos.db", "sqlite database path")
+	importCmd.StringVar(&destDir, "dest", "", "destination directory")
+	importCmd.Parse(os.Args[2:])
+
+	switch os.Args[1] {
+	case "scan":
+		handleScan()
+	case "import":
+		handleImport()
+	default:
+		log.Fatal("invalid command")
 	}
-	sourceDirs := flag.Args()[:len(flag.Args())-1]
-	repoPath, err := filepath.Abs(flag.Args()[len(flag.Args())-1])
+}
+
+func handleScan() {
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
-		panic(fmt.Sprintf("Error getting absolute path for %s: %v", repoPath, err))
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`PRAGMA journal_mode = WAL;`)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	processed := loadProcessedFiles(statsFileName)
-
-	files := collectFiles(sourceDirs)
-	if len(files) == 0 {
-		log.Println("No files to process")
-		return
-	}
-
-	statsChan := make(chan Stat, bufferSize)
-	var statswg sync.WaitGroup
+	// 创建工作池
+	files := make(chan string, 100)
 	var wg sync.WaitGroup
 
-	// Start stats writer
-	statswg.Add(1)
-	go statsWriter(statsChan, &statswg, statsFileName)
-
-	// Setup worker pool
-	fileChan := make(chan fileInfo, workerCount*2)
-	for i := 0; i < workerCount; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go worker(fileChan, repoPath, statsChan, processed, overwrite, &wg)
-	}
-
-	// Send files to workers
-	for _, f := range files {
-		fileChan <- f
-	}
-	close(fileChan)
-
-	// Wait for all workers
-	wg.Wait()
-	close(statsChan)
-	// wait for stats writer
-	statswg.Wait()
-}
-
-func collectFiles(sourceDirs []string) []fileInfo {
-	var files []fileInfo
-
-	for _, dir := range sourceDirs {
-		_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() {
-				return nil
+		go func() {
+			defer wg.Done()
+			for file := range files {
+				processFile(db, file)
 			}
-			absPath, _ := filepath.Abs(path)
-			// Just collect file paths - metadata will be read in workers
-			files = append(files, fileInfo(absPath))
+		}()
+	}
+
+	// 遍历目录
+	for _, dir := range sourceDirs {
+		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if !info.IsDir() {
+				files <- path
+			}
 			return nil
 		})
 	}
 
-	return files
+	close(files)
+	wg.Wait()
+
+	// 在文件遍历完成后添加
+	updateHashes(db)
+	assignGroupIDs(db)
 }
 
-func getCreateTime(path string, info os.FileInfo) (time.Time, Source) {
-	// Try exiftool first (supports both images and videos)
-	cmd := exec.Command("exiftool", "-s3", "-CreateDate", "-DateTimeOriginal", "-FileModifyDate", path)
+func processFile(db *sql.DB, path string) {
+	stat, err := os.Stat(path)
+	if err != nil {
+		log.Printf("获取文件状态失败: %v", err)
+		return
+	}
+
+	// 获取创建时间
+	createTime, err := getCreateTime(path)
+	if err != nil {
+		log.Printf("获取创建时间失败: %v", err)
+		createTime = stat.ModTime()
+	}
+
+	_, err = db.Exec(`INSERT OR IGNORE INTO photos(source_path, size, create_time) VALUES(?, ?, ?)`,
+		path, stat.Size(), createTime.Format(time.RFC3339))
+	if err != nil {
+		log.Printf("数据库写入失败: %v", err)
+	}
+}
+
+func getCreateTime(path string) (time.Time, error) {
+	cmd := exec.Command("exiftool", "-d", "%Y-%m-%dT%H:%M:%S%z", "-CreateDate", "-T", path)
 	output, err := cmd.Output()
-	if err == nil {
-		// Split multi-line output into individual date strings
-		dateLines := strings.Split(string(output), "\n")
-		for _, line := range dateLines {
-			dateStr := strings.TrimSpace(line)
-			if dateStr != "" {
-				// Parse common exiftool date formats (YYYY:MM:DD HH:MM:SS)
-				parsedTime, err := time.Parse("2006:01:02 15:04:05", dateStr)
-				if err == nil {
-					return parsedTime, SourceExif
-				}
-			}
-		}
-	} else {
-		log.Printf("Error running exiftool for %s: %v", path, err)
+	if err != nil {
+		return time.Time{}, err
 	}
-
-	// Fallback to regex-based filename date extraction
-	// Try regex-based filename date extraction
-	parsedTime, ok := extractDateFromFilename(filepath.Base(path))
-	if ok {
-		return parsedTime, SourceFname
-	}
-	// 尝试转换为 syscall.Stat_t 获取更底层信息
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		// Linux 系统中 ctime 是 inode 更改时间，并非真正的创建时间
-		// 但在没有创建时间的情况下，这是最接近的替代值
-		return time.Unix(int64(stat.Ctim.Sec), int64(stat.Ctim.Nsec)), SourceCTime
-	}
-	return info.ModTime(), SourceModTime
+	return time.Parse(time.RFC3339, string(bytes.TrimSpace(output)))
 }
 
-func worker(files <-chan fileInfo, repoPath string, statsChan chan<- Stat, processed map[string]bool, overwrite bool, wg *sync.WaitGroup) {
-	defer wg.Done()
-	for fPath := range files {
-		// Get file info from OS
-		if processed[string(fPath)] {
-			continue
-		}
-		info, err := os.Stat(string(fPath))
+func handleImport() {
+	// TODO: 实现导入逻辑
+}
+
+func updateHashes(db *sql.DB) {
+	tx, _ := db.Begin()
+	defer tx.Rollback()
+
+	rows, _ := tx.Query(`
+		SELECT size, source_path
+		FROM photos 
+		WHERE mmh3_hash = '' 
+		GROUP BY size 
+		HAVING COUNT(*) > 1
+	`)
+
+	batch := 0
+	stmt, _ := tx.Prepare(`UPDATE photos SET mmh3_hash = ? WHERE source_path = ?`)
+	defer stmt.Close()
+
+	for rows.Next() {
+		var size int64
+		var path string
+		rows.Scan(&size, &path)
+
+		hash, err := calculateHash(path)
 		if err != nil {
-			log.Printf("Error getting stats for %s: %v", fPath, err)
+			log.Printf("哈希计算失败[%s]: %v", path, err)
 			continue
 		}
 
-		// Get create time (now happens in worker)
-		createTime, source := getCreateTime(string(fPath), info)
-
-		// Process file
-		destPath := getDestPath(createTime, repoPath, string(fPath))
-		if err := copyFile(string(fPath), destPath, overwrite); err != nil {
-			log.Printf("Error copying %s: %v", fPath, err)
-			if !errors.Is(err, ErrNotOverwrite) {
-				continue
-			}
-			// not overwrite should send stat
+		if _, err = stmt.Exec(hash, path); err != nil {
+			log.Printf("更新失败[%s]: %v", path, err)
 		}
-		statsChan <- Stat{
-			SourcePath: string(fPath),
-			TargetPath: destPath,
-			Source:     source,
+
+		batch++
+		if batch%200 == 0 {
+			tx.Commit()
+			tx, _ = db.Begin()
+			stmt, _ = tx.Prepare(`UPDATE photos SET mmh3_hash = ? WHERE source_path = ?`)
 		}
 	}
+	tx.Commit()
 }
 
-func getDestPath(t time.Time, repo, src string) string {
-	year, month, day := t.Date()
-	base := filepath.Base(src)
-	dir := filepath.Join(repo, fmt.Sprintf("%d", year), fmt.Sprintf("%02d", int(month)), fmt.Sprintf("%02d", day))
-	_ = os.MkdirAll(dir, 0755)
-	return filepath.Join(dir, base)
+func calculateHash(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hasher := murmur3.New64()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hasher.Sum64()), nil
 }
 
-func copyFile(src, dest string, overwrite bool) error {
-	// Check if destination exists
-	if _, err := os.Stat(dest); err == nil {
-		if !overwrite {
-			return ErrNotOverwrite
-		}
-	} else if !os.IsNotExist(err) {
-		// Other error checking
-		return fmt.Errorf("error checking destination file %s: %v", dest, err)
-	}
+// 添加分组逻辑
+func assignGroupIDs(db *sql.DB) {
+	tx, _ := db.Begin()
+	defer tx.Rollback()
 
-	in, err := os.Open(src)
+	_, err := tx.Exec(`UPDATE photos SET group_id = 0 WHERE mmh3_hash = ''`)
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
-	defer in.Close()
 
-	out, err := os.Create(dest)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, in)
-	if err != nil {
-		return err
-	}
-	return out.Sync()
-}
-
-func loadProcessedFiles(path string) map[string]bool {
-	processed := make(map[string]bool)
-	f, err := os.Open(path)
-	if err != nil {
-		return processed
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		stat := &Stat{}
-		err := stat.LoadString(scanner.Text())
+	rows, _ := tx.Query(`SELECT DISTINCT mmh3_hash FROM photos WHERE mmh3_hash != '' ORDER BY mmh3_hash`)
+	groupID := 1
+	for rows.Next() {
+		var hash string
+		rows.Scan(&hash)
+		_, err = tx.Exec(`UPDATE photos SET group_id = ? WHERE mmh3_hash = ?`, groupID, hash)
 		if err != nil {
-			log.Printf("load stats err: %v\n", err)
-			continue
+			log.Fatal(err)
 		}
-		processed[stat.SourcePath] = true
+		groupID++
 	}
-	return processed
-}
-
-func statsWriter(ch <-chan Stat, wg *sync.WaitGroup, path string) {
-	defer wg.Done()
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Fatalf("Error opening stats file: %v", err)
-	}
-	defer f.Close()
-
-	buffer := make([]Stat, 0, bufferSize)
-	flushTicker := time.NewTicker(5 * time.Second)
-
-	exit := make(chan os.Signal, 1)
-	signal.Notify(exit, os.Interrupt)
-
-	for {
-		select {
-		case file, ok := <-ch:
-			if !ok {
-				flushBuffer(f, buffer)
-				return
-			}
-			buffer = append(buffer, file)
-			if len(buffer) >= bufferSize {
-				flushBuffer(f, buffer)
-				buffer = buffer[:0]
-			}
-		case <-flushTicker.C:
-			if len(buffer) > 0 {
-				flushBuffer(f, buffer)
-				buffer = buffer[:0]
-			}
-		case <-exit:
-			flushBuffer(f, buffer)
-			log.Println("Gracefully shutting down...")
-			return
-		}
-	}
-}
-
-func flushBuffer(f *os.File, buffer []Stat) {
-	for _, s := range buffer {
-		if _, err := f.WriteString(s.String() + "\n"); err != nil {
-			log.Printf("Error writing to stats file: %v", err)
-		}
-	}
-	_ = f.Sync()
+	tx.Commit()
 }

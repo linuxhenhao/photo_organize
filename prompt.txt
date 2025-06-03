@@ -1,0 +1,25 @@
+设计并编写一个 golang 的程序，这是一个命令行程序，有两个子命令
+## scan
+输入：多个文件夹
+输出：指定路径的 sqlite db
+sqlite 表：`source_path`(文件绝对路径)、size(文件精确大小)、create_time, group_id、mmh3_hash 5 字段组成，默认值为 0 或者空字符串
+工作流程：
+* 使用默认 10 个的 goroutin 遍历输入的多个文件夹将文件的绝对路径、文件大小、create_time写入到 sqlite 中，其中
+  * 文件大小使用文件的 stat 信息获取
+  * create_time 使用 os.exec 调用 exiftool 获取文件的创建时间，如果 exiftool 获取不到，则使用文件本身的 stat 信息中的创建时间
+* 计算并写入 mmh3_hash ：对于 size 不同的文件，一定没有其他文件和它重复，无需计算哈希，对于有相同 size 的文件，需要计算哈希并保存到 mmh3_hash字段
+  * 具体实现方式为，对 sqlitedb 进行 group by `size` 筛选所有 count > 1 的文件，计算他们的哈希并写入 
+* 计算并写入group_id: 给所有 mmh3_hash 不为空的行按照 mmh3_hash 分组，相同 mmh3_hash 的为一组，group_id 从 1 开始递增
+# import
+输入：指定的 sqlitedb 文件，目标文件夹
+输出：对 sqlitedb 中相关文件按一定逻辑重新组织后写入到目标文件夹
+工作流程：
+* 筛选避免写入重复文件：
+  * 对于 group_id 为 0 的，全部需要写入到目标文件夹
+  * 对于 group_id 非 0 的，每个 group_id 按照 mmh3_hash 升序取第一个文件写入目标文件夹，其余同 group_id 下的忽略
+* 复制文件并按照一个的规则组织写入到目标文件夹
+  * 写入的目标文件路径为 `[标文件夹]/year/month/day/filename` 其中 year/month/day 根据 db 中的 create_time 计算得到
+  * filename 规则：如果目标位置无同名文件，直接写入；如果已有同名文件，则计算目标文件的 murmurhash3，如果是相同文件则跳过，否则添加-n后缀(已有则递增数字)，如 base.ext 写入 base-1.ext，base-1.ext 写入 base-2.ext
+* 写入状态记录 stats.txt：由于涉及文件数量较多，需在写入过程中记录进度，万一异常退出，可以延续之前的进度
+  * 文件写入使用 append 的方式，每行记录一个已写入到目标的文件的路径
+  * 每 200 个强制刷盘一次，避免异常时丢失信息过多
