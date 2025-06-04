@@ -6,7 +6,10 @@ sqlite 表：`source_path`(文件绝对路径)、size(文件精确大小)、crea
 工作流程：
 * 使用默认 10 个的 goroutin 遍历输入的多个文件夹将文件的绝对路径、文件大小、create_time写入到 sqlite 中，其中
   * 文件大小使用文件的 stat 信息获取
-  * create_time 使用 os.exec 调用 exiftool 获取文件的创建时间，如果 exiftool 获取不到，则使用文件本身的 stat 信息中的创建时间
+  * create_time 获取逻辑按优先级排序如下，先获取成功则直接返回
+    1. 使用 os.exec 调用 exiftool 获取文件的创建时间
+    2. 先使用文件名可能包含的 yyyy-mm-dd 或则 yyyy_mm_dd 等常见日期格式
+    3. 文件本身的 stat 信息中的创建时间
 * 计算并写入 mmh3_hash ：对于 size 不同的文件，一定没有其他文件和它重复，无需计算哈希，对于有相同 size 的文件，需要计算哈希并保存到 mmh3_hash字段
   * 具体实现方式为，对 sqlitedb 进行 group by `size` 筛选所有 count > 1 的文件，计算他们的哈希并写入 
 * 计算并写入group_id: 给所有 mmh3_hash 不为空的行按照 mmh3_hash 分组，相同 mmh3_hash 的为一组，group_id 从 1 开始递增
