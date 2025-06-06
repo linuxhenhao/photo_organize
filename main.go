@@ -92,7 +92,21 @@ func main() {
 }
 
 func initDB(db *sql.DB) error {
-	_, err := db.Exec(`
+	// 设置无事务模式的优化参数
+	_, err := db.Exec(`PRAGMA synchronous = OFF`)
+	if err != nil {
+		log.Printf("Warning: Failed to set synchronous mode: %v", err)
+	}
+	_, err = db.Exec(`PRAGMA journal_mode = MEMORY`)
+	if err != nil {
+		log.Printf("Warning: Failed to set journal mode: %v", err)
+	}
+	_, err = db.Exec(`PRAGMA cache_size = -64000`) // 64MB cache
+	if err != nil {
+		log.Printf("Warning: Failed to set cache size: %v", err)
+	}
+
+	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS photos (
 			source_path TEXT PRIMARY KEY,
 			size INTEGER,
@@ -103,12 +117,6 @@ func initDB(db *sql.DB) error {
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to create database table: %w", err)
-	}
-	// Set WAL mode for better concurrency
-	_, err = db.Exec(`PRAGMA journal_mode = WAL;`)
-	if err != nil {
-		// Non-fatal, but log it as it can affect performance
-		log.Printf("Warning: Failed to set WAL journal mode: %v", err)
 	}
 	return nil
 }
@@ -591,14 +599,8 @@ func handleImport(dbPath string, destDir string) {
 }
 
 func updateHashes(db *sql.DB) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction for hash update: %w", err)
-	}
-	defer tx.Rollback()
-
 	// Select files where mmh3_hash is empty AND their size appears more than once
-	rows, err := tx.Query(`
+	rows, err := db.Query(`
 		SELECT p.source_path
 		FROM photos p
 		JOIN (SELECT size FROM photos GROUP BY size HAVING COUNT(*) > 1) AS samesize
@@ -609,12 +611,6 @@ func updateHashes(db *sql.DB) error {
 		return fmt.Errorf("failed to query for files needing hash update: %w", err)
 	}
 	defer rows.Close()
-
-	stmt, err := tx.Prepare(`UPDATE photos SET mmh3_hash = ? WHERE source_path = ?`)
-	if err != nil {
-		return fmt.Errorf("failed to prepare hash update statement: %w", err)
-	}
-	defer stmt.Close()
 
 	count := 0
 	log.Println("Processing files for hash calculation...")
@@ -628,42 +624,24 @@ func updateHashes(db *sql.DB) error {
 		hash, errCalc := calculateHash(path)
 		if errCalc != nil {
 			log.Printf("Hash calculation failed for [%s]: %v. Skipping hash update for this file.", path, errCalc)
-			// Optionally, set mmh3_hash to a special error value or leave it empty
 			continue
 		}
 
-		if _, err = stmt.Exec(hash, path); err != nil {
-			// Log and continue, don't let one failed update stop others
+		if _, err = db.Exec(`UPDATE photos SET mmh3_hash = ? WHERE source_path = ?`, hash, path); err != nil {
 			log.Printf("Failed to update hash for [%s]: %v", path, err)
-			// If a single update fails, the transaction will be rolled back at the end
-			// unless we decide to commit partial progress, which adds complexity.
-			// For now, one failure in batch means batch rollback.
-			// To avoid this, one could commit more frequently or handle errors differently.
+			continue
 		}
 		count++
 		if count%batchSize == 0 {
-			log.Printf("Updated hashes for %d files, committing batch...", count)
-			if err := tx.Commit(); err != nil {
-				return fmt.Errorf("failed to commit transaction during hash update (batch %d): %w", count/batchSize, err)
-			}
-			// Start new transaction for next batch
-			tx, err = db.Begin()
-			if err != nil {
-				return fmt.Errorf("failed to begin new transaction for hash update: %w", err)
-			}
-			// Re-prepare statement for the new transaction
-			stmt, err = tx.Prepare(`UPDATE photos SET mmh3_hash = ? WHERE source_path = ?`)
-			if err != nil {
-				return fmt.Errorf("failed to re-prepare hash update statement: %w", err)
-			}
+			log.Printf("Updated hashes for %d files...", count)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		log.Printf("Error iterating rows for hash update: %v", err)
 	}
 
-	log.Printf("Committing final batch of hash updates (total %d updated)...", count)
-	return tx.Commit()
+	log.Printf("Finished updating hashes for %d files", count)
+	return nil
 }
 
 func calculateHash(path string) (string, error) {
@@ -684,29 +662,17 @@ func calculateHash(path string) (string, error) {
 }
 
 func assignGroupIDs(db *sql.DB) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction for group ID assignment: %w", err)
-	}
-	defer tx.Rollback() // Rollback if not committed
-
 	// Set group_id = 0 for files with empty mmh3_hash (includes those that failed hashing)
-	if _, err = tx.Exec(`UPDATE photos SET group_id = 0 WHERE mmh3_hash = '' OR mmh3_hash IS NULL`); err != nil {
+	if _, err := db.Exec(`UPDATE photos SET group_id = 0 WHERE mmh3_hash = '' OR mmh3_hash IS NULL`); err != nil {
 		return fmt.Errorf("failed to reset group_id for empty hashes: %w", err)
 	}
 
 	// Query distinct, non-empty hashes to assign group IDs
-	rows, err := tx.Query(`SELECT DISTINCT mmh3_hash FROM photos WHERE mmh3_hash != '' ORDER BY mmh3_hash`)
+	rows, err := db.Query(`SELECT DISTINCT mmh3_hash FROM photos WHERE mmh3_hash != '' ORDER BY mmh3_hash`)
 	if err != nil {
 		return fmt.Errorf("failed to query distinct hashes for group ID assignment: %w", err)
 	}
 	defer rows.Close()
-
-	stmt, err := tx.Prepare(`UPDATE photos SET group_id = ? WHERE mmh3_hash = ?`)
-	if err != nil {
-		return fmt.Errorf("failed to prepare group ID update statement: %w", err)
-	}
-	defer stmt.Close()
 
 	groupID := 1
 	count := 0
@@ -717,33 +683,23 @@ func assignGroupIDs(db *sql.DB) error {
 			log.Printf("Failed to scan hash for group ID assignment: %v", err)
 			continue
 		}
-		if _, err = stmt.Exec(groupID, hash); err != nil {
+		if _, err = db.Exec(`UPDATE photos SET group_id = ? WHERE mmh3_hash = ?`, groupID, hash); err != nil {
 			log.Printf("Failed to update group_id for hash [%s]: %v", hash, err)
-			// Continue to try other groups, but this transaction will be rolled back
+			continue
 		}
 		groupID++
 		count++
 		if count%batchSize == 0 {
-			log.Printf("Assigned group IDs for %d unique hashes, committing batch...", count)
-			if err := tx.Commit(); err != nil {
-				return fmt.Errorf("failed to commit transaction during group ID assignment (batch %d): %w", count/batchSize, err)
-			}
-			tx, err = db.Begin()
-			if err != nil {
-				return fmt.Errorf("failed to begin new transaction for group ID assignment: %w", err)
-			}
-			stmt, err = tx.Prepare(`UPDATE photos SET group_id = ? WHERE mmh3_hash = ?`)
-			if err != nil {
-				return fmt.Errorf("failed to re-prepare group ID update statement: %w", err)
-			}
+			log.Printf("Assigned group IDs for %d unique hashes...", count)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		log.Printf("Error iterating rows for group ID assignment: %v", err)
+		return fmt.Errorf("error during group ID assignment iteration: %w", err)
 	}
 
-	log.Printf("Committing final batch of group ID assignments (total %d groups)...", count)
-	return tx.Commit()
+	log.Printf("Finished assigning group IDs for %d groups", count)
+	return nil
 }
 
 func copyFile(src, dst string) error {
