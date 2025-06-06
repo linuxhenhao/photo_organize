@@ -254,10 +254,25 @@ func insertData(db *sql.DB, insertChan <-chan Insert, wg *sync.WaitGroup) {
 	}
 }
 
+// validateDate checks if the given year, month, and day form a valid date
+func validateDate(year, month, day int, path string) (bool, error) {
+	currentYear := time.Now().Year()
+	if year < 1900 || year > currentYear+5 { // Allow a bit into the future for camera clock issues
+		return false, fmt.Errorf("unlikely year %d for file [%s]. Range: 1900-%d", year, path, currentYear+5)
+	}
+	if month < 1 || month > 12 {
+		return false, fmt.Errorf("invalid month %d", month)
+	}
+	if day < 1 || day > 31 {
+		return false, fmt.Errorf("invalid day %d", day)
+	}
+	return true, nil
+}
+
 func extractTimeFromFilename(path string) (time.Time, error) {
+	// First try to match the filename
 	base := filepath.Base(path)
 	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`(\d{4})/(\d{2})/(\d{2})`), // YYYY-MM-DD
 		regexp.MustCompile(`(\d{4})-(\d{2})-(\d{2})`), // YYYY-MM-DD
 		regexp.MustCompile(`(\d{4})_(\d{2})_(\d{2})`), // YYYY_MM_DD
 		regexp.MustCompile(`(\d{4})(\d{2})(\d{2})`),   // YYYYMMDD
@@ -272,18 +287,36 @@ func extractTimeFromFilename(path string) (time.Time, error) {
 			month, _ := strconv.Atoi(matches[2])
 			day, _ := strconv.Atoi(matches[3])
 
-			currentYear := time.Now().Year()
-			if year < 1900 || year > currentYear+5 { // Allow a bit into the future for camera clock issues
-				log.Printf("Filename contains an unlikely year %d for file [%s]. Range: 1900-%d. Skipping this pattern match.", year, path, currentYear+5)
-				continue
-			}
-			if month >= 1 && month <= 12 && day >= 1 && day <= 31 {
-				// Basic validation, time.Date will do more thorough checks
+			if valid, err := validateDate(year, month, day, path); valid {
+				// Basic validation passed, time.Date will do more thorough checks
 				return time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local), nil
+			} else {
+				log.Printf("Date validation failed in filename: %v", err)
+				continue
 			}
 		}
 	}
-	return time.Time{}, errors.New("no valid date format found in filename")
+
+	// If no match in filename, try to match directory path components
+	dirPath := filepath.Dir(path)
+	dirComponents := strings.Split(dirPath, string(filepath.Separator))
+
+	// Look for threedddconsecutive components that could be year/month/day
+	if len(dirComponents) >= 3 {
+		start := len(dirComponents) - 3
+		year, yearErr := strconv.Atoi(dirComponents[start])
+		month, monthErr := strconv.Atoi(dirComponents[start+1])
+		day, dayErr := strconv.Atoi(dirComponents[start+2])
+
+		if yearErr == nil && monthErr == nil && dayErr == nil {
+			if valid, err := validateDate(year, month, day, path); valid {
+				return time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local), nil
+			} else {
+				log.Printf("Date validation failed in directory path: %v", err)
+			}
+		}
+	}
+	return time.Time{}, errors.New("no valid date format found in filename or directory path")
 }
 
 // getCreateTime tries to get file creation time.
