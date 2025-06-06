@@ -599,7 +599,8 @@ func handleImport(dbPath string, destDir string) {
 }
 
 func updateHashes(db *sql.DB) error {
-	// Select files where mmh3_hash is empty AND their size appears more than once
+	// 1. 查询所有需要更新的文件路径
+	var paths []string
 	rows, err := db.Query(`
 		SELECT p.source_path
 		FROM photos p
@@ -610,17 +611,26 @@ func updateHashes(db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("failed to query for files needing hash update: %w", err)
 	}
-	defer rows.Close()
 
-	count := 0
-	log.Println("Processing files for hash calculation...")
+	// 2. 将路径存入内存
 	for rows.Next() {
 		var path string
 		if err := rows.Scan(&path); err != nil {
 			log.Printf("Failed to scan path for hash update: %v", err)
 			continue
 		}
+		paths = append(paths, path)
+	}
+	rows.Close()
 
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error during path collection: %w", err)
+	}
+
+	// 3. 对收集到的路径进行哈希更新
+	count := 0
+	log.Println("Processing files for hash calculation...")
+	for _, path := range paths {
 		hash, errCalc := calculateHash(path)
 		if errCalc != nil {
 			log.Printf("Hash calculation failed for [%s]: %v. Skipping hash update for this file.", path, errCalc)
@@ -635,9 +645,6 @@ func updateHashes(db *sql.DB) error {
 		if count%batchSize == 0 {
 			log.Printf("Updated hashes for %d files...", count)
 		}
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("Error iterating rows for hash update: %v", err)
 	}
 
 	log.Printf("Finished updating hashes for %d files", count)
@@ -667,22 +674,33 @@ func assignGroupIDs(db *sql.DB) error {
 		return fmt.Errorf("failed to reset group_id for empty hashes: %w", err)
 	}
 
-	// Query distinct, non-empty hashes to assign group IDs
+	// 1. 查询所有不同的哈希值
+	var hashes []string
 	rows, err := db.Query(`SELECT DISTINCT mmh3_hash FROM photos WHERE mmh3_hash != '' ORDER BY mmh3_hash`)
 	if err != nil {
 		return fmt.Errorf("failed to query distinct hashes for group ID assignment: %w", err)
 	}
-	defer rows.Close()
 
-	groupID := 1
-	count := 0
-	log.Println("Processing distinct hashes for group ID assignment...")
+	// 2. 将哈希值存入内存
 	for rows.Next() {
 		var hash string
 		if err := rows.Scan(&hash); err != nil {
 			log.Printf("Failed to scan hash for group ID assignment: %v", err)
 			continue
 		}
+		hashes = append(hashes, hash)
+	}
+	rows.Close()
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error during hash collection: %w", err)
+	}
+
+	// 3. 为每个哈希值分配组ID
+	groupID := 1
+	count := 0
+	log.Println("Processing distinct hashes for group ID assignment...")
+	for _, hash := range hashes {
 		if _, err = db.Exec(`UPDATE photos SET group_id = ? WHERE mmh3_hash = ?`, groupID, hash); err != nil {
 			log.Printf("Failed to update group_id for hash [%s]: %v", hash, err)
 			continue
@@ -692,10 +710,6 @@ func assignGroupIDs(db *sql.DB) error {
 		if count%batchSize == 0 {
 			log.Printf("Assigned group IDs for %d unique hashes...", count)
 		}
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("Error iterating rows for group ID assignment: %v", err)
-		return fmt.Errorf("error during group ID assignment iteration: %w", err)
 	}
 
 	log.Printf("Finished assigning group IDs for %d groups", count)
