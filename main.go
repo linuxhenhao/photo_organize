@@ -249,7 +249,10 @@ func insertData(db *sql.DB, insertChan <-chan Insert, wg *sync.WaitGroup) {
 func extractTimeFromFilename(path string) (time.Time, error) {
 	base := filepath.Base(path)
 	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`(\d{4})[-_]?(\d{2})[-_]?(\d{2})`), // YYYY-MM-DD, YYYY_MM_DD, YYYYMMDD
+		regexp.MustCompile(`(\d{4})/(\d{2})/(\d{2})`), // YYYY-MM-DD
+		regexp.MustCompile(`(\d{4})-(\d{2})-(\d{2})`), // YYYY-MM-DD
+		regexp.MustCompile(`(\d{4})_(\d{2})_(\d{2})`), // YYYY_MM_DD
+		regexp.MustCompile(`(\d{4})(\d{2})(\d{2})`),   // YYYYMMDD
 		// Add more patterns if needed, e.g., with time components
 		// regexp.MustCompile(`(\d{4})(\d{2})(\d{2})[-_]?(\d{2})(\d{2})(\d{2})`), // YYYYMMDD-HHMMSS
 	}
