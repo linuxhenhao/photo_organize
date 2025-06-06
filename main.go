@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/twmb/murmur3"
@@ -174,7 +175,7 @@ func handleScan(dbPath string, dirs []string) {
 	}
 	insertWg.Add(1)
 	go insertData(db, insertChan, &insertWg)
-
+	var skipCnt int32
 	for _, dir := range dirs {
 		log.Printf("Scanning directory: %s", dir)
 		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
@@ -185,6 +186,7 @@ func handleScan(dbPath string, dirs []string) {
 			if !info.IsDir() {
 				// 检查文件是否已在数据库中
 				if _, exists := existingPaths[path]; exists {
+					atomic.AddInt32(&skipCnt, 1)
 					return nil // 跳过此文件，因为它已在数据库中
 				}
 				files <- path
@@ -200,7 +202,7 @@ func handleScan(dbPath string, dirs []string) {
 	wg.Wait()
 	close(insertChan)
 	insertWg.Wait()
-	log.Println("File metadata scanning complete.")
+	log.Printf("File metadata scanning complete, %d files skipped\n", skipCnt)
 
 	log.Println("Calculating and updating mmh3_hash for files with identical sizes...")
 	if err := updateHashes(db); err != nil {
@@ -358,7 +360,7 @@ func handleImport(dbPath string, destDir string) {
 
 	// Load already processed files from stats.txt to avoid re-processing
 	// This makes the import somewhat resumable by skipping already handled files.
-	alreadyProcessed := make(map[string]bool)
+	var alreadyProcessed sync.Map
 	statsContent, err := os.ReadFile(statsFilePath)
 	if err == nil {
 		lines := strings.Split(string(statsContent), "\n")
@@ -368,11 +370,16 @@ func handleImport(dbPath string, destDir string) {
 				// Lines are like "/path/to/target/file.jpg" or "/path/to/target/file.jpg (skipped)"
 				parts := strings.Split(trimmedLine, " ")
 				if len(parts) > 0 {
-					alreadyProcessed[parts[0]] = true
+					alreadyProcessed.Store(parts[0], true)
 				}
 			}
 		}
-		log.Printf("Loaded %d entries from existing stats.txt. These will be skipped if encountered again.", len(alreadyProcessed))
+		count := 0
+		alreadyProcessed.Range(func(k, v any) bool {
+			count++
+			return false
+		})
+		log.Printf("Loaded %d entries from existing stats.txt. These will be skipped if encountered again.", count)
 	}
 
 	tasks := make(chan importTask, copyWorkers*2)
@@ -427,13 +434,10 @@ func handleImport(dbPath string, destDir string) {
 				currentTargetFilePath := filepath.Join(targetSubDir, originalFileName)
 
 				// Check if this exact target path was already processed (from stats.txt)
-				statsMux.Lock()
-				if alreadyProcessed[currentTargetFilePath] {
-					log.Printf("Already processed (from stats.txt): %s. Skipping.", currentTargetFilePath)
-					statsMux.Unlock()
+				if _, ok := alreadyProcessed.Load(task.SourcePath); ok {
+					log.Printf("Already processed (from stats.txt): %s. Skipping.", task.SourcePath)
 					continue
 				}
-				statsMux.Unlock()
 
 				finalTargetFilePath := currentTargetFilePath
 				fileNameToUse := originalFileName
@@ -462,8 +466,8 @@ func handleImport(dbPath string, destDir string) {
 							if sourceHashForComparison == existingTargetFileHash {
 								log.Printf("Target file [%s] exists and content matches source [%s] (hash: %s). Skipping copy.", finalTargetFilePath, task.SourcePath, sourceHashForComparison)
 								statsMux.Lock()
-								if _, err := statsFile.WriteString(fmt.Sprintf("%s (skipped - content matched)\n", finalTargetFilePath)); err != nil {
-									log.Printf("Failed to write skip (content matched) to stats.txt for [%s]: %v", finalTargetFilePath, err)
+								if _, err := statsFile.WriteString(fmt.Sprintf("%s (skipped - content matched)\n", task.SourcePath)); err != nil {
+									log.Printf("Failed to write skip (content matched) to stats.txt for [%s]: %v", task.SourcePath, err)
 								}
 								processedInImportCount++
 								if processedInImportCount%batchSize == 0 {
@@ -471,7 +475,7 @@ func handleImport(dbPath string, destDir string) {
 										log.Printf("stats.txt sync failed after skip: %v", err)
 									}
 								}
-								alreadyProcessed[finalTargetFilePath] = true // Mark as processed for this run
+								alreadyProcessed.Store(task.SourcePath, true) // Mark as processed for this run
 								statsMux.Unlock()
 								continue // Skip to next task
 							}
@@ -492,21 +496,6 @@ func handleImport(dbPath string, destDir string) {
 						fileNameToUse = fmt.Sprintf("%s-%d%s", nameWithoutExt, counter, ext)
 						finalTargetFilePath = filepath.Join(targetSubDir, fileNameToUse)
 
-						// Check if this new -N path was already processed (from stats.txt)
-						// This is an edge case, but good to check.
-						statsMux.Lock()
-						skipRenamedFromStats := alreadyProcessed[finalTargetFilePath]
-						statsMux.Unlock()
-						if skipRenamedFromStats {
-							log.Printf("Renamed target path [%s] was already processed (from stats.txt). Incrementing suffix again.", finalTargetFilePath)
-							counter++
-							if counter > 1000 { // Safety break
-								log.Printf("Could not find a unique filename for [%s] in [%s] after 1000 attempts (renamed path collision with stats.txt). Skipping this file.", originalFileName, targetSubDir)
-								goto nextTask // Using goto to break out of outer loop for this task.
-							}
-							continue // Try next counter for renaming
-						}
-
 						if _, err := os.Stat(finalTargetFilePath); os.IsNotExist(err) {
 							break // Found a unique name
 						}
@@ -525,8 +514,8 @@ func handleImport(dbPath string, destDir string) {
 				log.Printf("Successfully imported: [%s] -> [%s]", task.SourcePath, finalTargetFilePath)
 
 				statsMux.Lock()
-				if _, err := statsFile.WriteString(finalTargetFilePath + "\n"); err != nil {
-					log.Printf("Failed to write to stats.txt for [%s]: %v", finalTargetFilePath, err)
+				if _, err := statsFile.WriteString(task.SourcePath + "\n"); err != nil {
+					log.Printf("Failed to write to stats.txt for [%s]: %v", task.SourcePath, err)
 				}
 				processedInImportCount++
 				if processedInImportCount%batchSize == 0 {
@@ -535,7 +524,7 @@ func handleImport(dbPath string, destDir string) {
 					}
 				}
 				statsMux.Unlock()
-				alreadyProcessed[finalTargetFilePath] = true // Mark as processed for this run
+				alreadyProcessed.Store(task.SourcePath, true) // Mark as processed for this run
 
 			nextTask: // Label for the goto statement
 			}
