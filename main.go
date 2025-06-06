@@ -112,6 +112,33 @@ func initDB(db *sql.DB) error {
 	return nil
 }
 
+// loadExistingPaths reads all source_path entries from the database into a map for quick lookups.
+func loadExistingPaths(db *sql.DB) (map[string]bool, error) {
+	log.Println("Loading existing file paths from the database to prevent re-scanning...")
+	rows, err := db.Query("SELECT source_path FROM photos")
+	if err != nil {
+		return nil, fmt.Errorf("failed to query existing paths: %w", err)
+	}
+	defer rows.Close()
+
+	existingPaths := make(map[string]bool)
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			log.Printf("Warning: failed to scan an existing path from the database: %v", err)
+			continue
+		}
+		existingPaths[path] = true
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error during iteration of existing paths: %w", err)
+	}
+
+	log.Printf("Loaded %d existing file paths. These will be skipped.", len(existingPaths))
+	return existingPaths, nil
+}
+
 func handleScan(dbPath string, dirs []string) {
 	log.Printf("scan dirs<%v> into db<%s>\n", dirs, dbPath)
 	db, err := sql.Open("sqlite", dbPath)
@@ -122,6 +149,11 @@ func handleScan(dbPath string, dirs []string) {
 
 	if err := initDB(db); err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
+	}
+	// NEW CODE BLOCK STARTS HERE
+	existingPaths, err := loadExistingPaths(db)
+	if err != nil {
+		log.Fatalf("Failed to load existing paths from database: %v", err)
 	}
 
 	files := make(chan string, dbWorkers*2) // Buffered channel
@@ -151,6 +183,10 @@ func handleScan(dbPath string, dirs []string) {
 				return filepath.SkipDir // If dir itself is inaccessible, skip it
 			}
 			if !info.IsDir() {
+				// 检查文件是否已在数据库中
+				if _, exists := existingPaths[path]; exists {
+					return nil // 跳过此文件，因为它已在数据库中
+				}
 				files <- path
 			}
 			return nil
