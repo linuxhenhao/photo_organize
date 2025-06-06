@@ -288,7 +288,6 @@ func getCreateTime(path string, fi os.FileInfo) (time.Time, error) {
 	if err == nil {
 		fields := strings.Fields(string(bytes.TrimSpace(output))) // exiftool -T outputs tab-separated, Fields handles multiple spaces/tabs
 		for _, field := range fields {
-			log.Println(path, fields)
 			if field == "-" { // exiftool uses "-" for missing tags
 				continue
 			}
