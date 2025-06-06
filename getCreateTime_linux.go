@@ -14,5 +14,5 @@ func getStatBirthTime(fi os.FileInfo) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	// Btim is birth time on Linux
-	return time.Unix(stat.Btim.Sec, stat.Btim.Nsec), true
+	return time.Unix(stat.Ctim.Sec, stat.Ctim.Nsec), true
 }

@@ -42,6 +42,13 @@ func (s *stringArrayFlag) Set(value string) error {
 	return nil
 }
 
+type Insert struct {
+	SQL        string
+	Path       string
+	Size       int64
+	CreateTime time.Time
+}
+
 func main() {
 	var dbPath string  // SQLite database path
 	var destDir string // Target directory for import
@@ -106,6 +113,7 @@ func initDB(db *sql.DB) error {
 }
 
 func handleScan(dbPath string, dirs []string) {
+	log.Printf("scan dirs<%v> into db<%s>\n", dirs, dbPath)
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		log.Fatalf("Failed to open database '%s': %v", dbPath, err)
@@ -118,19 +126,22 @@ func handleScan(dbPath string, dirs []string) {
 
 	files := make(chan string, dbWorkers*2) // Buffered channel
 	var wg sync.WaitGroup
-
+	var insertWg sync.WaitGroup
 	log.Printf("Starting %d worker goroutines for scanning...", dbWorkers)
+	insertChan := make(chan Insert, 100)
 	for i := 0; i < dbWorkers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 			// log.Printf("Worker %d started", workerID)
 			for file := range files {
-				processFile(db, file)
+				processFile(file, insertChan)
 			}
 			// log.Printf("Worker %d finished", workerID)
 		}(i)
 	}
+	insertWg.Add(1)
+	go insertData(db, insertChan, &insertWg)
 
 	for _, dir := range dirs {
 		log.Printf("Scanning directory: %s", dir)
@@ -151,6 +162,8 @@ func handleScan(dbPath string, dirs []string) {
 
 	close(files)
 	wg.Wait()
+	close(insertChan)
+	insertWg.Wait()
 	log.Println("File metadata scanning complete.")
 
 	log.Println("Calculating and updating mmh3_hash for files with identical sizes...")
@@ -164,7 +177,7 @@ func handleScan(dbPath string, dirs []string) {
 	log.Println("Scan command finished successfully.")
 }
 
-func processFile(db *sql.DB, path string) {
+func processFile(path string, insertChan chan<- Insert) {
 	stat, err := os.Stat(path)
 	if err != nil {
 		log.Printf("Failed to get stat for file [%s]: %v", path, err)
@@ -177,10 +190,21 @@ func processFile(db *sql.DB, path string) {
 		createTime = stat.ModTime() // Fallback to modification time
 	}
 
-	_, err = db.Exec(`INSERT OR IGNORE INTO photos(source_path, size, create_time) VALUES(?, ?, ?)`,
-		path, stat.Size(), createTime.Format(time.RFC3339))
-	if err != nil {
-		log.Printf("Database write failed for [%s]: %v", path, err)
+	insertChan <- Insert{
+		SQL:        `INSERT OR IGNORE INTO photos(source_path, size, create_time) VALUES(?, ?, ?)`,
+		Path:       path,
+		Size:       stat.Size(),
+		CreateTime: createTime,
+	}
+}
+
+func insertData(db *sql.DB, insertChan <-chan Insert, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for i := range insertChan {
+		_, err := db.Exec(i.SQL, i.Path, i.Size, i.CreateTime.Format(time.RFC3339))
+		if err != nil {
+			log.Printf("write db line failed: %s\n", i.Path)
+		}
 	}
 }
 
@@ -217,7 +241,7 @@ func extractTimeFromFilename(path string) (time.Time, error) {
 // Priority: exiftool, filename, stat birth time, stat mod time.
 func getCreateTime(path string, fi os.FileInfo) (time.Time, error) {
 	// 1. Try exiftool
-	cmd := exec.Command("exiftool", "-m", "-d", "%Y-%m-%dT%H:%M:%S%z", // RFC3339 format
+	cmd := exec.Command("exiftool", "-m", "-d", "%Y-%m-%dT%H:%M:%S", // RFC3339 format
 		"-CreateDate", "-DateTimeOriginal", "-MediaCreateDate", "-TrackCreateDate",
 		"-SubSecCreateDate", "-SubSecDateTimeOriginal", // Include sub-second precision tags
 		"-T", "-fast", path) // -fast for performance
@@ -226,17 +250,14 @@ func getCreateTime(path string, fi os.FileInfo) (time.Time, error) {
 	if err == nil {
 		fields := strings.Fields(string(bytes.TrimSpace(output))) // exiftool -T outputs tab-separated, Fields handles multiple spaces/tabs
 		for _, field := range fields {
+			log.Println(path, fields)
 			if field == "-" { // exiftool uses "-" for missing tags
 				continue
-			}
-			if t, errParse := time.Parse(time.RFC3339, field); errParse == nil {
-				return t, nil
 			}
 			// Try parsing without timezone if RFC3339 fails (some tools might output local time without tz)
 			// Example: 2023:01:01 10:00:00
 			layouts := []string{
-				"2006:01:02 15:04:05",
-				"2006-01-02 15:04:05",
+				"2006-01-02T15:04:05",
 			}
 			for _, layout := range layouts {
 				if t, errParseLocal := time.ParseInLocation(layout, field, time.Local); errParseLocal == nil {
@@ -278,6 +299,7 @@ type importTask struct {
 }
 
 func handleImport(dbPath string, destDir string) {
+	log.Printf("import using db<%s> to destDir<%s>\n", dbPath, destDir)
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		log.Fatalf("Failed to open database '%s': %v", dbPath, err)
@@ -494,11 +516,11 @@ func handleImport(dbPath string, destDir string) {
 		SELECT p1.source_path, p1.create_time, p1.mmh3_hash, p1.group_id
 		FROM photos p1
 		INNER JOIN (
-			SELECT group_id, MIN(mmh3_hash) AS min_hash
+			SELECT group_id, MIN(source_path) AS min_path
 			FROM photos
 			WHERE group_id != 0 AND mmh3_hash != '' /* Ensure hash is not empty for grouped items */
 			GROUP BY group_id
-		) AS p2 ON p1.group_id = p2.group_id AND p1.mmh3_hash = p2.min_hash
+		) AS p2 ON p1.group_id = p2.group_id AND p1.source_path = p2.min_path
 		ORDER BY create_time ASC; 
 	`) // Order by create_time for potentially more sequential disk access pattern.
 	if err != nil {
