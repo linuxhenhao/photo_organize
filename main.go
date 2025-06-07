@@ -702,50 +702,44 @@ func calculateHash(path string) (string, error) {
 }
 
 func assignGroupIDs(db *sql.DB) error {
-	// Set group_id = 0 for files with empty mmh3_hash (includes those that failed hashing)
-	if _, err := db.Exec(`UPDATE photos SET group_id = 0 WHERE mmh3_hash = '' OR mmh3_hash IS NULL`); err != nil {
-		return fmt.Errorf("failed to reset group_id for empty hashes: %w", err)
-	}
+	log.Println("Starting group ID assignment...")
 
-	// 1. 查询所有不同的哈希值
-	var hashes []string
-	rows, err := db.Query(`SELECT DISTINCT mmh3_hash FROM photos WHERE mmh3_hash != '' ORDER BY mmh3_hash`)
+	// 使用单个 SQL 语句完成所有更新
+	// 1. 首先将空哈希值的记录设置为 group_id = 0
+	// 2. 然后使用窗口函数为每个不同的哈希值分配连续的 group_id
+	updateSQL := `
+	WITH numbered_hashes AS (
+		SELECT DISTINCT mmh3_hash,
+			ROW_NUMBER() OVER (ORDER BY mmh3_hash) as new_group_id
+		FROM photos
+		WHERE mmh3_hash != '' AND mmh3_hash IS NOT NULL
+	)
+	UPDATE photos SET group_id = CASE
+		WHEN mmh3_hash = '' OR mmh3_hash IS NULL THEN 0
+		ELSE (SELECT new_group_id FROM numbered_hashes WHERE numbered_hashes.mmh3_hash = photos.mmh3_hash)
+	END`
+
+	result, err := db.Exec(updateSQL)
 	if err != nil {
-		return fmt.Errorf("failed to query distinct hashes for group ID assignment: %w", err)
+		return fmt.Errorf("failed to update group IDs: %w", err)
 	}
 
-	// 2. 将哈希值存入内存
-	for rows.Next() {
-		var hash string
-		if err := rows.Scan(&hash); err != nil {
-			log.Printf("Failed to scan hash for group ID assignment: %v", err)
-			continue
-		}
-		hashes = append(hashes, hash)
-	}
-	rows.Close()
-
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("error during hash collection: %w", err)
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Warning: couldn't get number of affected rows: %v", err)
+	} else {
+		log.Printf("Updated group IDs for %d photos", rowsAffected)
 	}
 
-	// 3. 为每个哈希值分配组ID
-	groupID := 1
-	count := 0
-	log.Println("Processing distinct hashes for group ID assignment...")
-	for _, hash := range hashes {
-		if _, err = db.Exec(`UPDATE photos SET group_id = ? WHERE mmh3_hash = ?`, groupID, hash); err != nil {
-			log.Printf("Failed to update group_id for hash [%s]: %v", hash, err)
-			continue
-		}
-		groupID++
-		count++
-		if count%batchSize == 0 {
-			log.Printf("Assigned group IDs for %d unique hashes...", count)
-		}
+	// 获取分配的组数量
+	var groupCount int
+	err = db.QueryRow("SELECT COUNT(DISTINCT group_id) - 1 FROM photos").Scan(&groupCount) // -1 to exclude group 0
+	if err != nil {
+		log.Printf("Warning: couldn't get group count: %v", err)
+	} else {
+		log.Printf("Created %d distinct groups (excluding group 0 for empty hashes)", groupCount)
 	}
 
-	log.Printf("Finished assigning group IDs for %d groups", count)
 	return nil
 }
 
