@@ -25,6 +25,7 @@ import (
 const (
 	dbWorkers   = 10  // Number of goroutines for file processing during scan
 	copyWorkers = 10  // Number of goroutines for file copying during import
+	hashWorkers = 10  // Number of goroutines for hashing during import
 	batchSize   = 200 // Database transaction batch size / stats.txt flush interval
 )
 
@@ -63,13 +64,18 @@ func main() {
 	importCmd.StringVar(&dbPath, "db", "photos.db", "SQLite database path")
 	importCmd.StringVar(&destDir, "dest", "", "Target directory for import (e.g., /path/to/organized_photos)")
 
+	initCacheCmd := flag.NewFlagSet("init_cache", flag.ExitOnError)
+	initCacheCmd.StringVar(&destDir, "dest", "", "Target directory for import (e.g., /path/to/organized_photos)")
+
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: photo-organizer <command> [options]")
-		fmt.Println("Commands: scan, import")
+		fmt.Println("Commands: scan, import, initcache")
 		fmt.Println("\nScan command options:")
 		scanCmd.PrintDefaults()
 		fmt.Println("\nImport command options:")
 		importCmd.PrintDefaults()
+		fmt.Println("\nInitCache command options:")
+		initCacheCmd.PrintDefaults()
 		os.Exit(1)
 	}
 
@@ -86,6 +92,12 @@ func main() {
 			log.Fatal("Import command requires a target directory specified with -dest.")
 		}
 		handleImport(dbPath, destDir)
+	case "initcache":
+		initCacheCmd.Parse(os.Args[2:])
+		if destDir == "" {
+			log.Fatal("InitCache command requires a target directory specified with -dest.")
+		}
+		handleInitCache(destDir)
 	default:
 		log.Fatalf("Invalid command: %s\nUsage: photo-organizer <command> [options]", os.Args[1])
 	}
@@ -146,6 +158,17 @@ func loadExistingPaths(db *sql.DB) (map[string]bool, error) {
 
 	log.Printf("Loaded %d existing file paths. These will be skipped.", len(existingPaths))
 	return existingPaths, nil
+}
+
+func handlerInitCache(destDir string) {
+	// Initialize theCacheManager for the MMH3 hash cache file.
+	hashCacheFilePath := filepath.Join(destDir, "mmh3_hash_cache.txt")
+	cacheManager, err := NewCacheManager(hashCacheFilePath, batchSize)
+	if err != nil {
+		log.Printf("Error: CacheManager init failed, err=%v", err)
+		return
+	}
+	InitTargetDirCache(destDir, cacheManager)
 }
 
 func handleScan(dbPath string, dirs []string) {
@@ -379,77 +402,45 @@ type importTask struct {
 	MMH3Hash   string // mmh3_hash from DB, used to compare with existing target file
 }
 
+// handleImport manages the photo import process from a SQLite database
+// to a destination directory, using an MMH3 hash cache file for efficiency.
 func handleImport(dbPath string, destDir string) {
-	log.Printf("import using db<%s> to destDir<%s>\n", dbPath, destDir)
-	db, err := sql.Open("sqlite", dbPath)
+	log.Printf("Importing using db<%s> to destDir<%s>\n", dbPath, destDir)
+	db, err := sql.Open("sqlite3", dbPath) // Use "sqlite3" if you are using github.com/mattn/go-sqlite3
 	if err != nil {
 		log.Fatalf("Failed to open database '%s': %v", dbPath, err)
 	}
-	defer db.Close()
+	defer db.Close() // Ensure database connection is closed when the function exits
 
+	// Create the destination directory if it doesn't exist.
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		log.Fatalf("Failed to create destination directory [%s]: %v", destDir, err)
 	}
 
-	statsFilePath := filepath.Join(destDir, "stats.txt") // Place stats.txt inside the destination
-	statsFile, err := os.OpenFile(statsFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// Initialize theCacheManager for the MMH3 hash cache file.
+	hashCacheFilePath := filepath.Join(destDir, "mmh3_hash_cache.txt")
+	cacheManager, err := NewCacheManager(hashCacheFilePath, batchSize)
 	if err != nil {
-		log.Fatalf("Failed to open stats.txt file [%s]: %v", statsFilePath, err)
+		log.Fatalf("Failed to initialize hash cache: %v", err)
 	}
-	defer statsFile.Close()
-
-	var statsMux sync.Mutex
-	processedInImportCount := 0 // Counts successful copies and skips for flushing stats.txt
-
-	// Load already processed files from stats.txt to avoid re-processing
-	// This makes the import somewhat resumable by skipping already handled files.
-	var alreadyProcessed sync.Map
-	statsContent, err := os.ReadFile(statsFilePath)
-	if err == nil {
-		lines := strings.Split(string(statsContent), "\n")
-		for _, line := range lines {
-			trimmedLine := strings.TrimSpace(line)
-			if trimmedLine != "" {
-				// Lines are like "/path/to/target/file.jpg" or "/path/to/target/file.jpg (skipped)"
-				parts := strings.Split(trimmedLine, " ")
-				if len(parts) > 0 {
-					alreadyProcessed.Store(parts[0], true)
-				}
-			}
+	// Ensure the CacheManager is properly closed on function exit.
+	defer func() {
+		if closeErr := cacheManager.Close(); closeErr != nil {
+			log.Printf("Error closing hash cache manager: %v", closeErr)
 		}
-		count := 0
-		alreadyProcessed.Range(func(k, v any) bool {
-			count++
-			return false
-		})
-		log.Printf("Loaded %d entries from existing stats.txt. These will be skipped if encountered again.", count)
-	}
+	}()
 
+	// Channel to send import tasks to worker goroutines.
 	tasks := make(chan importTask, copyWorkers*2)
-	var wg sync.WaitGroup
+	var wg sync.WaitGroup // WaitGroup to wait for all workers to finish.
 
 	log.Printf("Starting %d worker goroutines for importing files...", copyWorkers)
 	for i := 0; i < copyWorkers; i++ {
-		wg.Add(1)
+		wg.Add(1) // Increment WaitGroup counter for each worker
 		go func(workerID int) {
-			defer wg.Done()
+			defer wg.Done() // Decrement WaitGroup counter when worker exits
 			for task := range tasks {
-				year, month, day := "", "", ""
-				// The task struct needs the create_time for path generation, not just mmh3_hash for comparison
-				// For now, let's assume we will query it again or add it to the task struct.
-				// This part needs to be fixed by adding CreateTime to importTask.
-				// For a quick fix, we re-query based on SourcePath for CreateTime if not passed.
-				// Better: add CreateTime to importTask struct and populate it in the main query loop.
-				// Let's assume createTime is part of the task or re-fetched for now.
-				// For the purpose of this example, we'll use a dummy time if not provided.
-				//
-				// Correct approach: Add CreateTime to importTask
-				// var createTimeForPath time.Time
-				// query create_time from db using task.SourcePath if not available in task
-				// For this example, let's just log a warning.
-				// log.Printf("Warning: CreateTime for path determination is not directly in task. Needs fix.")
-
-				// Construct target path based on CreateTime from DB
+				// Re-fetch create_time from DB if not already present in task.
 				var createTime time.Time
 				row := db.QueryRow("SELECT create_time FROM photos WHERE source_path = ?", task.SourcePath)
 				var createTimeStr string
@@ -463,11 +454,13 @@ func handleImport(dbPath string, destDir string) {
 					continue
 				}
 
-				year = createTime.Format("2006")
-				month = createTime.Format("01")
-				day = createTime.Format("02")
+				// Construct the target subdirectory based on create_time (Year/Month/Day).
+				year := createTime.Format("2006")
+				month := createTime.Format("01")
+				day := createTime.Format("02")
 				targetSubDir := filepath.Join(destDir, year, month, day)
 
+				// Create the target subdirectory if it doesn't exist.
 				if err := os.MkdirAll(targetSubDir, 0755); err != nil {
 					log.Printf("Failed to create target subdirectory [%s] for [%s]: %v", targetSubDir, task.SourcePath, err)
 					continue
@@ -476,62 +469,75 @@ func handleImport(dbPath string, destDir string) {
 				originalFileName := task.FileName
 				currentTargetFilePath := filepath.Join(targetSubDir, originalFileName)
 
-				// Check if this exact target path was already processed (from stats.txt)
-				if _, ok := alreadyProcessed.Load(task.SourcePath); ok {
-					log.Printf("Already processed (from stats.txt): %s. Skipping.", task.SourcePath)
-					continue
+				// **Optimization 1: Check if source file's hash already exists in cache.**
+				// If the source file has an MMH3 hash (from the DB) and that hash is found
+				// in our in-memory cache, it means a file with identical content might
+				// already exist in the destination.
+				if task.MMH3Hash != "" {
+					if cachedPath, ok := cacheManager.cache.Load(task.MMH3Hash); ok {
+						if cachedPathStr, isString := cachedPath.(string); isString {
+							// Double-check if the cached target file path actually exists on disk.
+							// This handles cases where the cache might be stale (e.g., file deleted manually).
+							if _, statErr := os.Stat(cachedPathStr); !os.IsNotExist(statErr) {
+								log.Printf("Source file hash [%s] already exists in cache and target file [%s] exists on disk. Skipping copy for source [%s].", task.MMH3Hash, cachedPathStr, task.SourcePath)
+								// Add to cache again (no actual write unless batch is full) to ensure it's counted for `processedCount`.
+								cacheManager.AddEntry(task.MMH3Hash, cachedPathStr)
+								continue // Skip to the next task
+							} else {
+								// Cache entry exists but the file itself is missing. Remove from cache (best-effort cleanup).
+								cacheManager.cache.Delete(task.MMH3Hash)
+								log.Printf("Cached file [%s] with hash [%s] not found on disk. Removing from cache and proceeding with import.", cachedPathStr, task.MMH3Hash)
+							}
+						}
+					}
 				}
 
-				finalTargetFilePath := currentTargetFilePath
+				finalTargetFilePath := currentTargetFilePath // Initial assumption for the target path
 				fileNameToUse := originalFileName
 
+				// **Handle existing files at the target path.**
 				if _, statErr := os.Stat(finalTargetFilePath); !os.IsNotExist(statErr) {
+					// File already exists at the intended target path. We need to compare hashes.
 					var sourceHashForComparison string
 					var errSourceHash error
 
-					if task.MMH3Hash != "" { // Use pre-computed hash from DB if available
-						sourceHashForComparison = task.MMH3Hash
-					} else { // Source hash not in DB (e.g., unique size file), calculate it now
+					if task.MMH3Hash != "" {
+						sourceHashForComparison = task.MMH3Hash // Use pre-computed hash from DB
+					} else {
+						// Source hash not in DB, calculate it on-the-fly for comparison.
 						log.Printf("Source file [%s] hash not in DB. Calculating now for comparison with existing target [%s].", task.SourcePath, finalTargetFilePath)
 						sourceHashForComparison, errSourceHash = calculateHash(task.SourcePath)
 						if errSourceHash != nil {
 							log.Printf("Failed to calculate hash for source file [%s] during import comparison: %v. Will proceed with rename.", task.SourcePath, errSourceHash)
-							// Proceed to renaming as we can't confirm sameness
+							// If we can't get the source hash, we can't compare content, so proceed with renaming.
 						}
 					}
 
-					if errSourceHash == nil { // Only proceed if we have a source hash (either from DB or calculated now)
-						existingTargetFileHash, errTargetHash := calculateHash(finalTargetFilePath)
+					if errSourceHash == nil { // Proceed only if we have a valid source hash
+						var existingTargetFileHash string
+						// Calculate the hash of the existing target file.
+						var errTargetHash error
+						existingTargetFileHash, errTargetHash = calculateHash(finalTargetFilePath)
 						if errTargetHash != nil {
 							log.Printf("Failed to calculate hash for existing target file [%s]: %v. Will proceed with rename.", finalTargetFilePath, errTargetHash)
-							// Proceed to renaming as we can't confirm sameness
 						} else {
-							if sourceHashForComparison == existingTargetFileHash {
-								log.Printf("Target file [%s] exists and content matches source [%s] (hash: %s). Skipping copy.", finalTargetFilePath, task.SourcePath, sourceHashForComparison)
-								statsMux.Lock()
-								if _, err := statsFile.WriteString(fmt.Sprintf("%s (skipped - content matched)\n", task.SourcePath)); err != nil {
-									log.Printf("Failed to write skip (content matched) to stats.txt for [%s]: %v", task.SourcePath, err)
-								}
-								processedInImportCount++
-								if processedInImportCount%batchSize == 0 {
-									if err := statsFile.Sync(); err != nil { // Check error for Sync
-										log.Printf("stats.txt sync failed after skip: %v", err)
-									}
-								}
-								alreadyProcessed.Store(task.SourcePath, true) // Mark as processed for this run
-								statsMux.Unlock()
-								continue // Skip to next task
-							}
-							log.Printf("Target file [%s] exists but content differs from source [%s]. Proceeding with rename.", finalTargetFilePath, task.SourcePath)
+							// Add the newly calculated target hash to the cache for future lookups.
+							cacheManager.AddEntry(existingTargetFileHash, finalTargetFilePath)
 						}
-					}
-					// If we reach here, it means:
-					// 1. errSourceHash was not nil (failed to get source hash on-the-fly) OR
-					// 2. errTargetHash was not nil (failed to get target hash) OR
-					// 3. Hashes were successfully calculated but are different.
-					// All these cases lead to renaming.
 
-					// Renaming logic:
+						// If hashes match, the existing file is identical; skip copying.
+						if existingTargetFileHash != "" && sourceHashForComparison == existingTargetFileHash {
+							log.Printf("Target file [%s] exists and content matches source [%s] (hash: %s). Skipping copy.", finalTargetFilePath, task.SourcePath, sourceHashForComparison)
+							cacheManager.AddEntry(task.MMH3Hash, finalTargetFilePath) // Mark as processed for this run
+							continue                                                  // Skip to the next task in the channel
+						}
+						log.Printf("Target file [%s] exists but content differs from source [%s]. Proceeding with rename to a unique name.", finalTargetFilePath, task.SourcePath)
+					}
+
+					// If we reach here, it means the file exists and either:
+					// 1. Hashes differ.
+					// 2. We couldn't calculate one of the hashes for comparison.
+					// In either case, we proceed with the renaming strategy to find a unique target name.
 					counter := 1
 					for {
 						ext := filepath.Ext(originalFileName)
@@ -540,61 +546,69 @@ func handleImport(dbPath string, destDir string) {
 						finalTargetFilePath = filepath.Join(targetSubDir, fileNameToUse)
 
 						if _, err := os.Stat(finalTargetFilePath); os.IsNotExist(err) {
-							break // Found a unique name
+							break // Found a unique name that doesn't exist
 						}
 						counter++
-						if counter > 1000 { // Safety break
+						if counter > 1000 { // Safety break to prevent infinite loops for extremely common names
 							log.Printf("Could not find a unique filename for [%s] in [%s] after 1000 attempts. Skipping this file.", originalFileName, targetSubDir)
-							goto nextTask // Using goto to break out of outer loop for this task.
+							goto nextTask // Use goto to jump to the label below and process the next task
 						}
 					}
 				}
 
+				// Perform the file copy.
 				if err := copyFile(task.SourcePath, finalTargetFilePath); err != nil {
 					log.Printf("Failed to copy file [%s] to [%s]: %v", task.SourcePath, finalTargetFilePath, err)
 					continue
 				}
-				log.Printf("Successfully imported: [%s] -> [%s]", task.SourcePath, finalTargetFilePath)
 
-				statsMux.Lock()
-				if _, err := statsFile.WriteString(task.SourcePath + "\n"); err != nil {
-					log.Printf("Failed to write to stats.txt for [%s]: %v", task.SourcePath, err)
-				}
-				processedInImportCount++
-				if processedInImportCount%batchSize == 0 {
-					if err := statsFile.Sync(); err != nil {
-						log.Printf("stats.txt sync failed: %v", err)
+				// Calculate the hash of the newly copied file if it wasn't already known (i.e., from task.MMH3Hash).
+				copiedFileHash := task.MMH3Hash
+				if copiedFileHash == "" {
+					var errHash error
+					copiedFileHash, errHash = calculateHash(finalTargetFilePath)
+					if errHash != nil {
+						log.Printf("Failed to calculate hash for newly copied file [%s]: %v. Cache will not include its hash.", finalTargetFilePath, errHash)
 					}
 				}
-				statsMux.Unlock()
-				alreadyProcessed.Store(task.SourcePath, true) // Mark as processed for this run
 
-			nextTask: // Label for the goto statement
+				// If a valid hash is available for the copied file, add it to the cache.
+				if copiedFileHash != "" {
+					cacheManager.AddEntry(copiedFileHash, finalTargetFilePath)
+				}
+
+				log.Printf("Successfully imported: [%s] -> [%s]", task.SourcePath, finalTargetFilePath)
+
+			nextTask: // Label for the goto statement, allows skipping to the next task in the loop.
 			}
 		}(i)
 	}
 
-	// Query for files to import
-	// group_id = 0 OR (group_id != 0 AND it's the one with MIN(mmh3_hash) for that group_id)
+	// Query the database for files to import.
+	// This query selects:
+	// 1. Files with group_id = 0 (likely unique files).
+	// 2. For files with group_id != 0, it selects the one with the minimum source_path
+	//    among those having the same group_id and a non-empty mmh3_hash.
+	// This approach ensures that only one representative from each group (duplicates) is considered.
 	rows, err := db.Query(`
-		SELECT source_path, create_time, mmh3_hash, group_id
-		FROM photos
-		WHERE group_id = 0
-		UNION ALL
-		SELECT p1.source_path, p1.create_time, p1.mmh3_hash, p1.group_id
-		FROM photos p1
-		INNER JOIN (
-			SELECT group_id, MIN(source_path) AS min_path
-			FROM photos
-			WHERE group_id != 0 AND mmh3_hash != '' /* Ensure hash is not empty for grouped items */
-			GROUP BY group_id
-		) AS p2 ON p1.group_id = p2.group_id AND p1.source_path = p2.min_path
-		ORDER BY create_time ASC; 
-	`) // Order by create_time for potentially more sequential disk access pattern.
+        SELECT source_path, create_time, mmh3_hash, group_id
+        FROM photos
+        WHERE group_id = 0
+        UNION ALL
+        SELECT p1.source_path, p1.create_time, p1.mmh3_hash, p1.group_id
+        FROM photos p1
+        INNER JOIN (
+            SELECT group_id, MIN(source_path) AS min_path
+            FROM photos
+            WHERE group_id != 0 AND mmh3_hash != '' /* Ensure hash is not empty for grouped items */
+            GROUP BY group_id
+        ) AS p2 ON p1.group_id = p2.group_id AND p1.source_path = p2.min_path
+        ORDER BY create_time ASC;
+    `)
 	if err != nil {
 		log.Fatalf("Failed to query photos for import: %v", err)
 	}
-	defer rows.Close()
+	defer rows.Close() // Close the database rows when done
 
 	log.Printf("Querying database and sending import tasks to workers...")
 	filesToImportCount := 0
@@ -606,13 +620,11 @@ func handleImport(dbPath string, destDir string) {
 			continue
 		}
 		filesToImportCount++
+		// Send the import task to the channel.
 		tasks <- importTask{
 			SourcePath: sourcePath,
-			// TargetDir will be constructed by worker using createTimeStr
-			FileName: filepath.Base(sourcePath),
-			MMH3Hash: mmh3Hash,
-			// IMPORTANT: CreateTimeStr should be passed to task to avoid re-query.
-			// The current worker re-queries it. For full optimization, add CreateTimeStr to importTask.
+			FileName:   filepath.Base(sourcePath),
+			MMH3Hash:   mmh3Hash, // Pass the MMH3 hash directly from the database
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -620,32 +632,38 @@ func handleImport(dbPath string, destDir string) {
 	}
 	log.Printf("Found %d files to potentially import. Processing...", filesToImportCount)
 
-	close(tasks)
-	wg.Wait()
+	close(tasks) // Close the tasks channel to signal workers that no more tasks will be sent.
+	wg.Wait()    // Wait for all worker goroutines to finish their tasks.
 
-	statsMux.Lock() // Final sync
-	if err := statsFile.Sync(); err != nil {
-		log.Printf("stats.txt final sync failed: %v", err)
-	}
-	statsMux.Unlock()
 	log.Println("Import command finished.")
 }
 
+// hashResult holds the outcome of a hash calculation for a single file.
+type hashResult struct {
+	path string
+	hash string
+	err  error
+}
+
+// updateHashes calculates and updates hashes for files concurrently.
+// It uses a worker pool pattern to parallelize the hash calculation, which is
+// often the most time-consuming part of the operation.
 func updateHashes(db *sql.DB) error {
-	// 1. 查询所有需要更新的文件路径
-	var paths []string
+	// 1. Query for all file paths that need updating.
+	// This part remains sequential as it's fetching the initial dataset.
 	rows, err := db.Query(`
-		SELECT p.source_path
-		FROM photos p
-		JOIN (SELECT size FROM photos GROUP BY size HAVING COUNT(*) > 1) AS samesize
-		ON p.size = samesize.size
-		WHERE p.mmh3_hash = '';
-	`)
+        SELECT p.source_path
+        FROM photos p
+        JOIN (SELECT size FROM photos GROUP BY size HAVING COUNT(*) > 1) AS samesize
+        ON p.size = samesize.size
+        WHERE p.mmh3_hash = '';
+    `)
 	if err != nil {
 		return fmt.Errorf("failed to query for files needing hash update: %w", err)
 	}
 
-	// 2. 将路径存入内存
+	// 2. Collect all paths into memory first.
+	var paths []string
 	for rows.Next() {
 		var path string
 		if err := rows.Scan(&path); err != nil {
@@ -654,33 +672,84 @@ func updateHashes(db *sql.DB) error {
 		}
 		paths = append(paths, path)
 	}
-	rows.Close()
-
+	rows.Close() // It's important to close rows before checking rows.Err().
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("error during path collection: %w", err)
 	}
 
-	// 3. 对收集到的路径进行哈希更新
-	count := 0
-	log.Println("Processing files for hash calculation...")
-	for _, path := range paths {
-		hash, errCalc := calculateHash(path)
-		if errCalc != nil {
-			log.Printf("Hash calculation failed for [%s]: %v. Skipping hash update for this file.", path, errCalc)
-			continue
-		}
-
-		if _, err = db.Exec(`UPDATE photos SET mmh3_hash = ? WHERE source_path = ?`, hash, path); err != nil {
-			log.Printf("Failed to update hash for [%s]: %v", path, err)
-			continue
-		}
-		count++
-		if count%batchSize == 0 {
-			log.Printf("Updated hashes for %d files...", count)
-		}
+	if len(paths) == 0 {
+		log.Println("No files found needing a hash update.")
+		return nil
 	}
 
-	log.Printf("Finished updating hashes for %d files", count)
+	log.Printf("Found %d files to process for hash calculation...", len(paths))
+
+	// 3. Set up the worker pool.
+	// We'll use a number of workers equal to the number of available CPU cores.
+	// This is a good default for CPU-bound tasks and is also effective for I/O-bound tasks.
+	jobs := make(chan string, len(paths))
+	results := make(chan hashResult, len(paths))
+
+	// 4. Start the worker goroutines.
+	// These workers will receive file paths from the 'jobs' channel,
+	// calculate the hash, and send the result to the 'results' channel.
+	var workerWg sync.WaitGroup
+	for w := 1; w <= hashWorkers; w++ {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			for path := range jobs {
+				hash, err := calculateHash(path)
+				results <- hashResult{path: path, hash: hash, err: err}
+			}
+		}()
+	}
+
+	// 5. Start a separate goroutine to handle database updates.
+	// This prevents the update logic from blocking the main loop. It collects
+	// results from the 'results' channel and executes the database updates.
+	var updaterWg sync.WaitGroup
+	updaterWg.Add(1)
+	go func() {
+		defer updaterWg.Done()
+		updatedCount := 0
+		// We know exactly how many results to expect, so we loop that many times.
+		for i := 0; i < len(paths); i++ {
+			result := <-results
+
+			if result.err != nil {
+				log.Printf("Hash calculation failed for [%s]: %v. Skipping update.", result.path, result.err)
+				continue
+			}
+
+			if _, errDB := db.Exec(`UPDATE photos SET mmh3_hash = ? WHERE source_path = ?`, result.hash, result.path); errDB != nil {
+				log.Printf("Failed to update hash for [%s]: %v", result.path, errDB)
+				continue
+			}
+
+			updatedCount++
+			if updatedCount%batchSize == 0 {
+				log.Printf("Updated hashes for %d files...", updatedCount)
+			}
+		}
+		log.Printf("Finished updating hashes for %d files.", updatedCount)
+	}()
+
+	// 6. Send all jobs (file paths) to the workers.
+	for _, path := range paths {
+		jobs <- path
+	}
+	close(jobs) // Close the 'jobs' channel to signal workers that no more jobs are coming.
+
+	// 7. Wait for all work to be done.
+	// First, wait for all worker goroutines to finish their hash calculations.
+	workerWg.Wait()
+
+	// All hashes are now calculated and have been sent to the 'results' channel.
+	// We can now wait for the updater goroutine to finish writing all results to the database.
+	updaterWg.Wait()
+
+	log.Println("All hash update operations completed successfully.")
 	return nil
 }
 
