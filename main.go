@@ -160,7 +160,7 @@ func loadExistingPaths(db *sql.DB) (map[string]bool, error) {
 	return existingPaths, nil
 }
 
-func handlerInitCache(destDir string) {
+func handleInitCache(destDir string) {
 	// Initialize theCacheManager for the MMH3 hash cache file.
 	hashCacheFilePath := filepath.Join(destDir, "mmh3_hash_cache.txt")
 	cacheManager, err := NewCacheManager(hashCacheFilePath, batchSize)
@@ -406,7 +406,7 @@ type importTask struct {
 // to a destination directory, using an MMH3 hash cache file for efficiency.
 func handleImport(dbPath string, destDir string) {
 	log.Printf("Importing using db<%s> to destDir<%s>\n", dbPath, destDir)
-	db, err := sql.Open("sqlite3", dbPath) // Use "sqlite3" if you are using github.com/mattn/go-sqlite3
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		log.Fatalf("Failed to open database '%s': %v", dbPath, err)
 	}
@@ -440,6 +440,7 @@ func handleImport(dbPath string, destDir string) {
 		go func(workerID int) {
 			defer wg.Done() // Decrement WaitGroup counter when worker exits
 			for task := range tasks {
+
 				// Re-fetch create_time from DB if not already present in task.
 				var createTime time.Time
 				row := db.QueryRow("SELECT create_time FROM photos WHERE source_path = ?", task.SourcePath)
@@ -494,6 +495,8 @@ func handleImport(dbPath string, destDir string) {
 
 				finalTargetFilePath := currentTargetFilePath // Initial assumption for the target path
 				fileNameToUse := originalFileName
+				// Calculate the hash of the newly copied file if it wasn't already known (i.e., from task.MMH3Hash).
+				copiedFileHash := task.MMH3Hash
 
 				// **Handle existing files at the target path.**
 				if _, statErr := os.Stat(finalTargetFilePath); !os.IsNotExist(statErr) {
@@ -562,8 +565,6 @@ func handleImport(dbPath string, destDir string) {
 					continue
 				}
 
-				// Calculate the hash of the newly copied file if it wasn't already known (i.e., from task.MMH3Hash).
-				copiedFileHash := task.MMH3Hash
 				if copiedFileHash == "" {
 					var errHash error
 					copiedFileHash, errHash = calculateHash(finalTargetFilePath)
@@ -578,7 +579,6 @@ func handleImport(dbPath string, destDir string) {
 				}
 
 				log.Printf("Successfully imported: [%s] -> [%s]", task.SourcePath, finalTargetFilePath)
-
 			nextTask: // Label for the goto statement, allows skipping to the next task in the loop.
 			}
 		}(i)
