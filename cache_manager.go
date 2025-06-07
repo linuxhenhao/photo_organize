@@ -12,12 +12,13 @@ import (
 // CacheManager handles the MMH3 hash cache operations, managing the
 // in-memory map and appending to the persistent cache file.
 type CacheManager struct {
-	file      *os.File      // The opened cache file (mmh3_hash_cache.txt)
-	writer    *bufio.Writer // Buffered writer for appending to the file
-	mutex     sync.Mutex    // Mutex to protect concurrent access to file and cache map
-	cache     sync.Map      // In-memory cache: mmh3_hash -> targetFilePath
-	count     int           // Counter for triggering batch writes/syncs
-	batchSize int           // Configurable batch size for flushing/syncing
+	file        *os.File      // The opened cache file (mmh3_hash_cache.txt)
+	writer      *bufio.Writer // Buffered writer for appending to the file
+	mutex       sync.Mutex    // Mutex to protect concurrent access to file and cache map
+	cache       sync.Map      // In-memory cache: mmh3_hash -> targetFilePath
+	revertCache sync.Map      // In-memory cache: path -> mmh3_hash
+	count       int           // Counter for triggering batch writes/syncs
+	batchSize   int           // Configurable batch size for flushing/syncing
 }
 
 // NewCacheManager initializes and returns a new CacheManager instance.
@@ -43,6 +44,7 @@ func NewCacheManager(cacheFilePath string, batchSize int) (*CacheManager, error)
 			parts := strings.SplitN(line, ",", 2) // Split only on the first comma
 			if len(parts) == 2 {
 				cm.cache.Store(parts[0], parts[1]) // Store hash -> target path
+				cm.revertCache.Store(parts[1], parts[0])
 				loadedCount++
 			} else {
 				// Log a warning for any lines that don't conform to the expected format.
@@ -69,6 +71,11 @@ func NewCacheManager(cacheFilePath string, batchSize int) (*CacheManager, error)
 	return cm, nil
 }
 
+func (cm *CacheManager) IsCached(targetPath string) bool {
+	_, ok := cm.revertCache.Load(targetPath)
+	return ok
+}
+
 // AddEntry adds a new entry to the in-memory cache and appends it to the buffered writer.
 // It also triggers a flush of the buffer and a sync to disk if the processed count
 // reaches the configured batch size. This method is safe for concurrent use.
@@ -78,6 +85,7 @@ func (cm *CacheManager) AddEntry(hash, targetPath string) {
 
 	// Store the new entry in the in-memory hashCache.
 	cm.cache.Store(hash, targetPath)
+	cm.revertCache.Store(targetPath, hash)
 
 	// Format the entry as "hash,target_path\n" and write it to the buffered writer.
 	line := fmt.Sprintf("%s,%s\n", hash, targetPath)

@@ -53,6 +53,9 @@ func InitTargetDirCache(targetDir string, cm *CacheManager) {
 		go func(workerID int) {
 			defer wg.Done()
 			for path := range pathsToHash {
+				if cm.IsCached(path) {
+					continue
+				}
 				// Optimization: Check the in-memory cache before calculating the hash
 				// to avoid redundant hash computations for files already known.
 				fileHash, hashErr := calculateHash(path)
