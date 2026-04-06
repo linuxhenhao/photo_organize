@@ -1,50 +1,74 @@
 # Photo Organizer
 
 ## Overview
-A command-line tool that scans source directories into an SQLite database and organizes files into a target directory based on database metadata, supporting deduplication and structured organization.
+`photo_organize` is a high-performance Go-based command-line tool for organizing large collections of photos and videos. It scans source directories, extracts metadata into an SQLite database, and organizes files into a structured target directory with advanced deduplication capabilities, including **perceptual image matching**.
 
 ## Features
-- **Scan Command**: Traverse directories to collect file metadata (path, size, creation time) into SQLite.
-  - Uses 10 goroutines for parallel processing.
-  - Creation time priority: EXIF data > filename date patterns > file metadata.
-  - Computes MMH3 hashes for files with the same size.
-  - Assigns group IDs to files with identical hashes.
-- **Import Command**: Copies files from the database to the target directory.
-  - Deduplication: Only copies the first file per group ID.
-  - Organization: Generates `[target_dir]/year/month/day/filename` path based on creation time.
-  - Conflict resolution: Appends `-n` suffix (incrementing n) for different content with the same filename.
-  - Progress tracking: Appends to `stats.txt` with forced flush every 200 entries.
+- **Parallel Scanning**: Uses a worker pool of 10 goroutines for concurrent metadata extraction.
+- **Intelligent Metadata Extraction**: 
+    - Prioritizes EXIF data (via `exiftool`) for accurate creation dates.
+    - Fallback to filename date patterns and filesystem birth times.
+- **Advanced Deduplication**:
+    - **Binary Match**: Uses MMH3 hashing for exact file duplicates.
+    - **Perceptual Match**: Uses **dHash** and a custom **BK-Tree** to identify visually similar images (e.g., thumbnails or different resolutions).
+- **High-Performance Web UI Caching**: 
+    - Full metadata and thumbnail relationships are cached in SQLite as native **JSON** objects.
+    - Eliminates disk I/O when browsing duplicate groups in the Web UI.
+- **Optimized Storage**: 
+    - Database uses **WAL (Write-Ahead Logging)** mode for high-concurrency safety.
+    - Transaction-based batch updates for performance.
+    - Actor-pattern **CacheManager** for background persistence of target state using atomic SQLite JSON operations.
+- **Structured Organization**: 
+    - Imports files into a `[target_dir]/YYYY/MM/DD/` hierarchy.
+    - Automatic conflict resolution with suffixing (e.g., `-1`, `-2`).
 
 ## Installation
-1. Install Go 1.18 or higher.
-2. Install exiftool (for EXIF metadata extraction).
-3. Clone the repository: `git clone https://github.com/your-repo/photo-organize.git`
-4. Build: `go build -o photo-organizer`
+
+### Prerequisites
+- **Go**: 1.24 or higher.
+- **Exiftool**: Must be installed and available in your system `PATH`.
+
+### Building
+```bash
+go build -o photo-organizer ./cmd/photo-organizer
+```
 
 ## Usage
-### Scan
-`./photo-organizer scan -db photos.db -src /path/to/photos1,/path/to/photos2`
-- `-db`: SQLite database path (default: photos.db)
-- `-src`: Comma-separated source directories
 
-### Import
-`./photo-organizer import -db photos.db -dest /path/to/organized_photos`
+### 1. Scan Source Directories
+Scan your source folders to populate the metadata database.
+```bash
+./photo-organizer scan -db photos.db -src /path/to/source1,/path/to/source2
+```
+- `-db`: Path to the SQLite database (defaults to `photos.db`).
+- `-src`: Comma-separated list of source directories.
 
-### Initialize Cache (initcache)
-`./photo-organizer initcache -dest /path/to/organized_photos`
-- `-dest`: Path to the target directory (existing organized directory)
-- Purpose: Pre-generate the MMH3 hash cache file `mmh3_hash_cache.txt` for the target directory, avoiding recalculating hashes for existing files during repeated imports. Improves efficiency of the `import` command for scenarios where the target directory already contains some files.
-- `-db`: SQLite database path
-- `-dest`: Target directory for organized photos
+### 2. Import into Target Directory
+Copy files from the database to your organized photo gallery with deduplication.
+```bash
+./photo-organizer import -db photos.db -dest /path/to/organized_photos
+```
+
+### 3. Initialize Target Cache
+Pre-index an existing organized directory to avoid re-calculating hashes during future imports.
+```bash
+./photo-organizer initcache -dest /path/to/organized_photos
+```
+
+### 4. Serve Web UI for Deduplication
+Launch the interactive web interface to resolve visual duplicates.
+```bash
+./photo-organizer serve -dest /path/to/organized_photos -port 8080
+```
+
+## Development
+- **Test Data**: Use `test_data/` for local experimentation.
+- **Integration Tests**: Run `./integration_test.sh` to verify build and functionality.
 
 ## Database Schema
-| Column         | Type    | Description                          |
-|----------------|---------|--------------------------------------|
-| source_path    | TEXT    | Absolute source file path (primary key) |
-| size           | INTEGER | File size in bytes                   |
-| create_time    | TEXT    | Creation time in RFC3339 format      |
-| mmh3_hash      | TEXT    | MMH3 hash (empty for unique sizes)   |
-| group_id       | INTEGER | Group ID (0 for unique, >0 for duplicates) |
+The tool uses two primary tables across its SQLite databases:
+- `photos` (in `photo.db`): `source_path`, `size`, `create_time`, `mmh3_hash`, `phash`, `group_id`, `mime_type`.
+- `file_cache` (in `cache.db`): `target_path`, `mmh3_hash`, `phash`, `size`, `metadata` (JSON), `thumbnails` (JSON Array).
 
 ## License
 MIT

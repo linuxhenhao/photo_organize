@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS photos (
     size INTEGER NOT NULL,
     create_time DATETIME NOT NULL,
     mmh3_hash TEXT DEFAULT '',
+    phash TEXT DEFAULT '',
     group_id INTEGER DEFAULT 0
 );
 

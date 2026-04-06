@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deduplicate • Photo Organizer</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header class="glass-nav">
+        <div class="nav-content">
+            <div class="logo">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="17 8 12 3 7 8"></polyline>
+                    <line x1="12" y1="3" x2="12" y2="15"></line>
+                </svg>
+                <h1>Photo Cleanup</h1>
+            </div>
+            
+            <div class="nav-controls">
+                <div class="shortcut-hint">
+                    <kbd>←</kbd> <kbd>→</kbd> Select Option &bull; <kbd>Enter</kbd> Resolve Group
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="app-container">
+        <div id="stats-banner" class="stats-banner glass-panel">
+            <div class="stat">
+                <span class="stat-value" id="total-groups">0</span>
+                <span class="stat-label">Duplicate Groups</span>
+            </div>
+            <div class="stat">
+                <span class="stat-value" id="pot-space">0 MB</span>
+                <span class="stat-label">Potential Savings</span>
+            </div>
+        </div>
+
+        <div id="groups-container" class="groups-container">
+            <!-- Dynamic duplicate groups will be injected here -->
+            <div class="loading-state" id="loading-indicator">
+                <div class="spinner"></div>
+                <p>Analyzing duplicate clusters...</p>
+            </div>
+        </div>
+
+        <div class="pagination-controls glass-panel" id="pagination">
+            <button id="prev-page" disabled>Previous Page</button>
+            <span id="page-info">Page 1</span>
+            <button id="next-page" disabled>Next Page</button>
+        </div>
+    </main>
+
+    <template id="group-template">
+        <div class="duplicate-group glass-panel">
+            <div class="group-header">
+                <h3>Visual Cluster</h3>
+                <button class="resolve-btn primary-btn">Resolve & Destroy Others</button>
+            </div>
+            <div class="images-grid">
+                <!-- Images injected here -->
+            </div>
+        </div>
+    </template>
+
+    <template id="image-card-template">
+        <div class="image-card" tabindex="0">
+            <div class="image-wrapper">
+                <img loading="lazy" src="" alt="Duplicate image">
+                <div class="selection-overlay">
+                    <div class="check-icon">✓ KEEP</div>
+                </div>
+                <div class="badge-container">
+                    <span class="badge master-badge">MASTER</span>
+                    <span class="badge auto-badge">AUTO-SELECTED</span>
+                </div>
+            </div>
+            <div class="meta-pill">
+                <div class="meta-row main-meta">
+                    <span class="resolution"></span>
+                    <span class="dot">&bull;</span>
+                    <span class="size"></span>
+                </div>
+                <div class="meta-row sub-meta">
+                    <span class="path"></span>
+                </div>
+                <div class="meta-row sub-meta">
+                    <span class="date"></span>
+                </div>
+            </div>
+        </div>
+    </template>
+
+    <script src="app.js"></script>
+</body>
+</html>
