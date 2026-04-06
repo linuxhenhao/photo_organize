@@ -134,6 +134,10 @@ func InitTargetDirCache(targetDir string, cm *CacheManager) {
 							cm.AppendThumbnailToMaster(path, thumbPath, thumbMeta) // Record old as thumbnail of new
 						}
 					}
+				} else if phashErr == nil {
+					// Unique image found during scan, record with metadata
+					masterMeta := metadata.ExtractImageMetaJson(path)
+					cm.AddEntry(path, fileHash, phash, size, masterMeta)
 				} else if phashErr != nil {
 					// If not an image (no phash), just add it to normal cache as master
 					masterMeta := metadata.ExtractImageMetaJson(path)

@@ -30,19 +30,19 @@ func ExtractImageMeta(fullPath string) MediaMeta {
 		meta.Size = stat.Size()
 	}
 
-	// 1. Try native Go image decoding (fast for JPEG/PNG/GIF)
+	// 1. Try native Go image decoding (fast for JPEG/PNG/GIF) for dimensions
 	if file, err := os.Open(fullPath); err == nil {
 		config, _, err := image.DecodeConfig(file)
 		file.Close()
 		if err == nil {
 			meta.Width = config.Width
 			meta.Height = config.Height
-			return meta
 		}
 	}
 
-	// 2. Fallback to exiftool for videos (MP4, MOV, etc.) or complex image formats (RAW, HEIC)
-	cmd := exec.Command("exiftool", "-s", "-s", "-s", 
+	// 2. Fallback or augment with exiftool for videos, complex image formats, or metadata
+	// Use -s instead of -s -s -s to keep the "Key : Value" format for parsing.
+	cmd := exec.Command("exiftool", "-s", 
 		"-ImageWidth", "-ImageHeight", "-VideoSize", 
 		"-CreateDate", "-DateTimeOriginal", "-MediaCreateDate",
 		"-fast", fullPath)
@@ -59,28 +59,29 @@ func ExtractImageMeta(fullPath string) MediaMeta {
 
 			switch key {
 			case "ImageWidth":
-				if w, err := strconv.Atoi(val); err == nil {
+				if w, err := strconv.Atoi(val); err == nil && meta.Width == 0 {
 					meta.Width = w
 				}
 			case "ImageHeight":
-				if h, err := strconv.Atoi(val); err == nil {
+				if h, err := strconv.Atoi(val); err == nil && meta.Height == 0 {
 					meta.Height = h
 				}
 			case "VideoSize":
 				// Often in format "1920x1080"
 				dims := strings.Split(val, "x")
 				if len(dims) == 2 {
-					if w, err := strconv.Atoi(dims[0]); err == nil {
+					if w, err := strconv.Atoi(dims[0]); err == nil && meta.Width == 0 {
 						meta.Width = w
 					}
-					if h, err := strconv.Atoi(dims[1]); err == nil {
+					if h, err := strconv.Atoi(dims[1]); err == nil && meta.Height == 0 {
 						meta.Height = h
 					}
 				}
 			case "CreateDate", "DateTimeOriginal", "MediaCreateDate":
 				// Exiftool often returns "2023:01:01 12:00:00". Normalize to "2023-01-01 12:00:00"
 				normalized := strings.Replace(val, ":", "-", 2)
-				if meta.CreateTime == "" || !strings.Contains(val, "0000:00:00") {
+				// Prefer non-zero exif dates over the filesystem modtime
+				if !strings.Contains(val, "0000:00:00") && val != "" {
 					meta.CreateTime = normalized
 				}
 			}

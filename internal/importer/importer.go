@@ -110,7 +110,10 @@ func importWorker(tasks <-chan ImportTask, wg *sync.WaitGroup, successCount *int
 					thumbPath := moveFileToThumbnails(destDir, match.Path)
 					thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
 					
-					// Since we replaced it, add the new one as the primary.
+					// Since we replaced it, clear the old path from cache
+					cacheManager.DeleteEntry(match.Path, "")
+
+					// Add the new one as the primary.
 					pv, _ := hasher.StringToPHash(task.PHash)
 					masterMeta := metadata.ExtractImageMetaJson(task.SourcePath)
 					cacheManager.AddEntry(finalTargetPath, task.MMH3Hash, pv, task.Size, masterMeta)

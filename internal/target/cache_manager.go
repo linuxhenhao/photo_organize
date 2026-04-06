@@ -139,39 +139,50 @@ func NewCacheManager(destDir string, batchSize int) (*CacheManager, error) {
 func (cm *CacheManager) runWorker() {
 	defer cm.workerWg.Done()
 
-	tx, err := cm.db.Begin()
-	if err != nil {
-		log.Printf("Critical: CacheManager worker failed to start transaction: %v", err)
-		return
-	}
-
-	txCount := 0
-	for entry := range cm.entries {
-		if entry.isDelete {
-			_, err = tx.Exec(`DELETE FROM file_cache WHERE target_path = ?`, entry.path)
-		} else if entry.isAppend {
-			_, err = tx.Exec(`UPDATE file_cache SET thumbnails = json_insert(CASE WHEN thumbnails = '' OR thumbnails IS NULL THEN '[]' ELSE thumbnails END, '$[#]', json(?)) WHERE target_path = ?`,
-				entry.thumbJson, entry.path)
-		} else {
-			_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, phash, size, metadata) VALUES (?, ?, ?, ?, ?)`,
-				entry.path, entry.mmh3, entry.phash, entry.size, entry.metadata)
-		}
-
+	// Helper to start/commit transactions on the DB directly for simplicity in this worker
+	// since we want to handle errors and retries if needed.
+	
+	executeBatch := func(batch []cacheEntry) {
+		tx, err := cm.db.Begin()
 		if err != nil {
-			log.Printf("CacheManager worker DB error: %v", err)
+			log.Printf("CacheManager worker failed to begin transaction: %v", err)
+			return
+		}
+		defer tx.Rollback()
+
+		for _, entry := range batch {
+			var err error
+			if entry.isDelete {
+				_, err = tx.Exec(`DELETE FROM file_cache WHERE target_path = ?`, entry.path)
+			} else if entry.isAppend {
+				_, err = tx.Exec(`UPDATE file_cache SET thumbnails = json_insert(CASE WHEN thumbnails = '' OR thumbnails IS NULL THEN '[]' ELSE thumbnails END, '$[#]', json(?)) WHERE target_path = ?`,
+					entry.thumbJson, entry.path)
+			} else {
+				_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, phash, size, metadata) VALUES (?, ?, ?, ?, ?)`,
+					entry.path, entry.mmh3, entry.phash, entry.size, entry.metadata)
+			}
+
+			if err != nil {
+				log.Printf("CacheManager worker DB error for path %s: %v", entry.path, err)
+			}
 		}
 
-		txCount++
-		if txCount >= cm.batchSize {
-			tx.Commit()
-			tx, _ = cm.db.Begin()
-			txCount = 0
+		if err := tx.Commit(); err != nil {
+			log.Printf("CacheManager worker commit error: %v", err)
 		}
 	}
 
-	err = tx.Commit()
-	if err != nil {
-		log.Printf("CacheManager worker final commit error: %v", err)
+	var batch []cacheEntry
+	for entry := range cm.entries {
+		batch = append(batch, entry)
+		if len(batch) >= cm.batchSize {
+			executeBatch(batch)
+			batch = nil
+		}
+	}
+
+	if len(batch) > 0 {
+		executeBatch(batch)
 	}
 }
 
@@ -208,10 +219,9 @@ func (cm *CacheManager) SearchPHash(phash uint64, maxDistance int) []hasher.Matc
 // Returns the match if found, or nil if the entry was added as unique.
 func (cm *CacheManager) CheckAndAddPerceptualMatch(phash uint64, path string, size int64, mmh3 string) *hasher.MatchResult {
 	cm.mutex.Lock()
-	defer cm.mutex.Unlock()
-
 	matches := cm.PHashTree.Search(phash, 5)
 	if len(matches) > 0 {
+		cm.mutex.Unlock()
 		return &matches[0]
 	}
 
@@ -224,7 +234,7 @@ func (cm *CacheManager) CheckAndAddPerceptualMatch(phash uint64, path string, si
 		MMH3:    mmh3,
 		PHash:   phashStr,
 		Size:    size,
-		HasMeta: false, // CheckAndAddPerceptualMatch doesn't take meta
+		HasMeta: false, 
 	})
 	if mmh3 != "" {
 		cm.mmh3Cache.Store(mmh3, path)
@@ -232,14 +242,15 @@ func (cm *CacheManager) CheckAndAddPerceptualMatch(phash uint64, path string, si
 	if phash != 0 {
 		cm.PHashTree.Add(phash, path, size)
 	}
+	cm.mutex.Unlock()
 
-	// Queue for DB
+	// Queue for DB outside lock
 	cm.entries <- cacheEntry{
 		path:     path,
 		mmh3:     mmh3,
 		phash:    phashStr,
 		size:     size,
-		metadata: "{}", // Default for CheckAndAddPerceptualMatch
+		metadata: "{}", 
 	}
 
 	return nil
@@ -248,9 +259,6 @@ func (cm *CacheManager) CheckAndAddPerceptualMatch(phash uint64, path string, si
 // AddEntry adds a new entry to the in-memory state and triggers an asynchronous DB write.
 func (cm *CacheManager) AddEntry(path string, mmh3 string, phash uint64, size int64, metadata string) {
 	cm.mutex.Lock()
-	defer cm.mutex.Unlock()
-
-	// Update memory state synchronously
 	phashStr := ""
 	if phash != 0 {
 		phashStr = hasher.PHashToString(phash)
@@ -267,8 +275,9 @@ func (cm *CacheManager) AddEntry(path string, mmh3 string, phash uint64, size in
 	if phash != 0 {
 		cm.PHashTree.Add(phash, path, size)
 	}
+	cm.mutex.Unlock()
 
-	// Trigger asynchronous DB update
+	// Trigger asynchronous DB update outside lock
 	cm.entries <- cacheEntry{
 		path:     path,
 		mmh3:     mmh3,
@@ -291,13 +300,11 @@ func (cm *CacheManager) AppendThumbnailToMaster(masterPath, thumbPath, thumbMeta
 // DeleteEntry clears an entry from the memory state and triggers an asynchronous DB delete.
 func (cm *CacheManager) DeleteEntry(path string, mmh3 string) {
 	cm.mutex.Lock()
-	defer cm.mutex.Unlock()
-
 	cm.paths.Delete(path)
 	if mmh3 != "" {
 		cm.mmh3Cache.Delete(mmh3)
 	}
-	// Note: We don't remove from BKTree since it acts mostly as an append-only structure.
+	cm.mutex.Unlock()
 
 	cm.entries <- cacheEntry{
 		path:     path,
