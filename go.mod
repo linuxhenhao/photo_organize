@@ -3,6 +3,8 @@ module github.com/linuxhenhao/photo_organize
 go 1.24.1
 
 require (
+	github.com/corona10/goimagehash v1.1.0
+	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646
 	github.com/stretchr/testify v1.10.0
 	github.com/twmb/murmur3 v1.1.8
 	modernc.org/sqlite v1.37.1

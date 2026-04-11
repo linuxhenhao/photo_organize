@@ -1,50 +1,74 @@
-# 照片整理工具
+# 照片整理工具 (Photo Organizer)
 
 ## 概述
-一个命令行工具，通过扫描源文件夹到SQLite数据库，并根据数据库信息将文件整理到目标目录，支持去重和结构化组织。
+`photo_organize` 是一款基于 Go 语言的高性能命令行工具，用于整理海量照片和视频。它将源文件夹扫描到 SQLite 数据库中，并根据元数据将文件整理到结构化目标目录，支持**感知图像匹配**等高级去重功能。
 
 ## 功能特性
-- **扫描命令（scan）**: 遍历目录收集文件元数据（路径、大小、创建时间）到SQLite数据库。
-  - 使用10个goroutine并行处理。
-  - 创建时间优先级：EXIF数据 > 文件名日期模式 > 文件元信息。
-  - 为相同大小的文件计算MMH3哈希值。
-  - 为相同哈希的文件分配组ID。
-- **导入命令（import）**: 从数据库复制文件到目标目录。
-  - 去重策略：每个组ID仅复制第一个文件。
-  - 组织规则：按创建时间生成`[目标目录]/年/月/日/文件名`路径。
-  - 冲突解决：同名文件内容不同时添加`-n`后缀（n递增）。
-  - 进度跟踪：追加写入`stats.txt`，每200行强制刷盘。
+- **并行扫描**: 使用 10 个 goroutine 工作池进行并发元数据提取。
+- **智能元数据提取**: 
+    - 优先使用 EXIF 数据（通过 `exiftool`）以获取准确的创建日期。
+    - 备选方案包括文件名日期模式匹配和文件系统出生时间。
+- **高级去重**:
+    - **二进制匹配**: 使用 MMH3 哈希值识别完全相同的文件。
+    - **感知匹配**: 使用 **dHash** 和自定义 **BK-Tree** (BK树) 识别视觉相似的图像（例如缩略图或不同分辨率的相同图片）。
+- **高性能 Web UI 缓存**:
+    - 完整的元数据和缩略图关联以原生 **JSON** 格式缓存在 SQLite 中。
+    - 在 Web UI 中浏览重复组时，实现零磁盘 I/O。
+- **优化存储**: 
+    - 数据库采用 **WAL (预写日志)** 模式，确保高并发下的稳定性。
+    - 采用事务批处理更新，提升大规模扫描性能。
+    - **Actor 模式缓存管理**: 使用 SQLite 的原子 JSON 操作在后台异步持久化目标状态。
+- **结构化组织**: 
+    - 将文件导入到 `[目标目录]/年/月/日/` 层次结构中。
+    - 自动冲突解决，通过添加后缀（如 `-1`, `-2`）处理重名不同内容的文件。
 
-## 安装
-1. 安装Go 1.18及以上版本
-2. 安装exiftool（用于提取EXIF元数据）
-3. 克隆仓库：`git clone https://github.com/your-repo/photo-organize.git`
-4. 构建：`go build -o photo-organizer`
+## 安装说明
 
-## 使用说明
-### 扫描
-`./photo-organizer scan -db photos.db -src /路径/到/照片1,/路径/到/照片2`
-- `-db`: SQLite数据库路径（默认：photos.db）
-- `-src`: 逗号分隔的源目录
+### 前提条件
+- **Go**: 1.24 或更高版本。
+- **Exiftool**: 必须已安装并在系统的 `PATH` 路径中可用。
 
-### 导入
-`./photo-organizer import -db photos.db -dest /路径/到/整理后的照片`
+### 构建
+```bash
+go build -o photo-organizer ./cmd/photo-organizer
+```
 
-### 初始化缓存（initcache）
-`./photo-organizer initcache -dest /路径/到/整理后的照片`
-- `-dest`: 目标目录路径（已存在的整理目录）
-- 作用：预先生成目标目录的MMH3哈希缓存文件`mmh3_hash_cache.txt`，避免重复导入时重新计算已有文件的哈希值，提升`import`命令效率。适用于目标目录已存在部分文件的场景。
-- `-db`: SQLite数据库路径
-- `-dest`: 整理后照片的目标目录
+## 使用方法
+
+### 1. 扫描源文件夹
+扫描您的源文件夹以填充元数据数据库。
+```bash
+./photo-organizer scan -db photos.db -src /路径/到/照片1,/路径/到/照片2
+```
+- `-db`: SQLite 数据库路径（默认为 `photos.db`）。
+- `-src`: 逗号分隔的源文件夹列表。
+
+### 2. 导入到目标目录
+将数据库中的文件复制到已整理的照片库中，并自动执行去重。
+```bash
+./photo-organizer import -db photos.db -dest /路径/到/整理后的文件夹
+```
+
+### 3. 初始化目标缓存
+预先索引现有的已整理目录，以避免在未来的导入中重复计算哈希值。
+```bash
+./photo-organizer initcache -dest /路径/到/整理后的文件夹
+```
+
+### 4. 启动 Web UI 进行去重
+启动交互式 Web 界面来解决视觉重复项。
+```bash
+./photo-organizer serve -dest /路径/到/整理后的文件夹 -port 8080
+```
+
+## 开发相关
+- **测试数据**: 使用 `test_data/` 进行本地实验。
+- **集成测试**: 运行 `./integration_test.sh` 验证构建和核心功能。
 
 ## 数据库结构
-| 列名           | 类型    | 描述                               |
-|----------------|---------|------------------------------------|
-| source_path    | TEXT    | 源文件绝对路径（主键）             |
-| size           | INTEGER | 文件大小（字节）                   |
-| create_time    | TEXT    | RFC3339格式的创建时间              |
-| mmh3_hash      | TEXT    | MMH3哈希值（唯一大小文件为空）     |
-| group_id       | INTEGER | 组ID（0表示唯一，>0表示重复组）    |
+该工具在其 SQLite 数据库中使用两个主要表：
+- `photos` (存放在 `photo.db`): 包含 `source_path`, `size`, `create_time`, `mmh3_hash`, `phash`, `group_id`, `mime_type`。
+- `file_cache` (存放在 `cache.db`): 包含 `target_path`, `mmh3_hash`, `phash`, `size`, `metadata` (JSON), `thumbnails` (JSON 数组)。
 
-## 许可
+## 许可协议
 MIT
