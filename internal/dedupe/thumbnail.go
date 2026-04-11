@@ -9,7 +9,12 @@ import (
 )
 
 const (
-	CandidateSearchDistance = 12
+	// CandidateSearchDistance is intentionally looser than the old 12-bit cutoff.
+	// Repo mock thumbnails currently reach dHash distance 14 after JPEG re-encode
+	// and resize, while ARW preview-derived thumbnails stay near 0-1. Using 16
+	// keeps a small recall margin above the worst known thumbnail fixture without
+	// pushing BK-tree candidate volume into the much noisier 18+ range.
+	CandidateSearchDistance = 16
 	maxConfirmPHashDistance = 16
 	aspectRatioTolerance    = 0.03
 	maxColorSignatureDelta  = 12
