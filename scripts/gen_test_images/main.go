@@ -10,12 +10,12 @@ import (
 	"log"
 	"math/rand"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	projectexiftool "github.com/linuxhenhao/photo_organize/internal/exiftool"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
 	"github.com/nfnt/resize"
 )
@@ -86,14 +86,36 @@ func createThumbnail(srcPath, destPath string) error {
 }
 
 func extractPreviewImage(srcPath string) ([]byte, error) {
-	tags := []string{"-PreviewImage", "-JpgFromRaw", "-ThumbnailImage"}
-	for _, tag := range tags {
-		cmd := exec.Command("exiftool", "-b", tag, "-q", srcPath)
-		out, err := cmd.Output()
-		if err == nil && len(out) > 0 {
-			return out, nil
+	pool, err := projectexiftool.SharedPool()
+	if err != nil {
+		return nil, err
+	}
+
+	results, err := pool.Extract([]string{srcPath}, []string{
+		"PreviewImage",
+		"JpgFromRaw",
+		"ThumbnailImage",
+	}, projectexiftool.QueryOptions{
+		Binary:            true,
+		IgnoreMinorErrors: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(results) != 1 {
+		return nil, fmt.Errorf("unexpected exiftool result count for %s: %d", srcPath, len(results))
+	}
+
+	for _, key := range []string{"PreviewImage", "JpgFromRaw", "ThumbnailImage"} {
+		data, ok, err := results[0].GetBytes(key)
+		if err != nil {
+			return nil, err
+		}
+		if ok && len(data) > 0 {
+			return data, nil
 		}
 	}
+
 	return nil, fmt.Errorf("no extractable preview image found in %s", srcPath)
 }
 
