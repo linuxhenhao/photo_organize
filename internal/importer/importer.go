@@ -78,10 +78,34 @@ func copyFile(src, dst string) error {
 	return err
 }
 
+func resolveAvailableTargetPath(targetDir, fileName string, cacheManager *target.CacheManager) string {
+	candidate := filepath.Join(targetDir, fileName)
+	if !cacheManager.IsCached(candidate) {
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			return candidate
+		}
+	}
+
+	ext := filepath.Ext(fileName)
+	nameWithoutExt := strings.TrimSuffix(fileName, ext)
+	suffix := 1
+	for {
+		candidate = filepath.Join(targetDir, fmt.Sprintf("%s-%d%s", nameWithoutExt, suffix, ext))
+		if cacheManager.IsCached(candidate) {
+			suffix++
+			continue
+		}
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			return candidate
+		}
+		suffix++
+	}
+}
+
 func importWorker(tasks <-chan ImportTask, wg *sync.WaitGroup, successCount *int32, failCount *int32, cacheManager *target.CacheManager) {
 	defer wg.Done()
 	for task := range tasks {
-		finalTargetPath := filepath.Join(task.TargetDir, task.FileName)
+		finalTargetPath := resolveAvailableTargetPath(task.TargetDir, task.FileName, cacheManager)
 
 		if cacheManager.IsCached(finalTargetPath) {
 			continue // Perfect name match cached
@@ -93,10 +117,21 @@ func importWorker(tasks <-chan ImportTask, wg *sync.WaitGroup, successCount *int
 
 		// Optimization 2: Perceptual Deduplication using PHash
 		// If we encounter a visually similar image, we need to decide what to do.
+		var phashValue uint64
+		var hasPHash bool
 		var match *hasher.MatchResult
 		if task.PHash != "" && task.PHash != "UNSUPPORTED" && task.PHash != "NOT_IMAGE" {
 			if pv, parseErr := hasher.StringToPHash(task.PHash); parseErr == nil && pv != 0 {
+				phashValue = pv
+				hasPHash = true
 				match = cacheManager.CheckAndAddPerceptualMatch(pv, finalTargetPath, task.Size, task.MMH3Hash)
+				if match != nil {
+					if _, err := os.Stat(match.Path); err != nil {
+						log.Printf("Removing stale perceptual match entry for missing path [%s]", match.Path)
+						cacheManager.DeleteEntry(match.Path)
+						match = cacheManager.CheckAndAddPerceptualMatch(pv, finalTargetPath, task.Size, task.MMH3Hash)
+					}
+				}
 			}
 		}
 
@@ -105,20 +140,27 @@ func importWorker(tasks <-chan ImportTask, wg *sync.WaitGroup, successCount *int
 			existingStat, err := os.Stat(match.Path)
 			if err == nil {
 				if task.Size > existingStat.Size() {
+					cacheManager.AddEntry(finalTargetPath, task.MMH3Hash, phashValue, task.Size, "{}")
+					if err := copyFile(task.SourcePath, finalTargetPath); err != nil {
+						cacheManager.DeleteEntry(finalTargetPath)
+						log.Printf("Failed to import [%s]: %v", task.SourcePath, err)
+						atomic.AddInt32(failCount, 1)
+						continue
+					}
+
 					log.Printf("Found superior visual duplicate. Source is larger. Moving old [%s] to thumbnails and replacing...", match.Path)
 					destDir := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(match.Path))))
 					thumbPath := moveFileToThumbnails(destDir, match.Path)
-					thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
-					
-					// Since we replaced it, clear the old path from cache
-					cacheManager.DeleteEntry(match.Path, "")
-
-					// Add the new one as the primary.
-					pv, _ := hasher.StringToPHash(task.PHash)
 					masterMeta := metadata.ExtractImageMetaJson(task.SourcePath)
-					cacheManager.AddEntry(finalTargetPath, task.MMH3Hash, pv, task.Size, masterMeta)
-					// Additionally, link the old thumbnail to this new primary
-					cacheManager.AppendThumbnailToMaster(finalTargetPath, thumbPath, thumbMeta)
+					cacheManager.AddEntry(finalTargetPath, task.MMH3Hash, phashValue, task.Size, masterMeta)
+
+					if thumbPath == match.Path {
+						log.Printf("Keeping both files because old master [%s] could not be moved to thumbnails", match.Path)
+					} else {
+						thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
+						cacheManager.DeleteEntry(match.Path)
+						cacheManager.AppendThumbnailToMaster(finalTargetPath, thumbPath, thumbMeta)
+					}
 				} else {
 					// new coming file is smaller or equal -> it is the thumbnail. Move it immediately to thumbnails structure locally.
 					log.Printf("Found visual duplicate. Source [%s] is smaller. Rerouting to thumbnails dir...", task.SourcePath)
@@ -127,42 +169,42 @@ func importWorker(tasks <-chan ImportTask, wg *sync.WaitGroup, successCount *int
 						log.Printf("Failed to create thumb dir: %v", err)
 						continue
 					}
-					finalTargetPath = filepath.Join(thumbDir, task.FileName)
-					
-					// Record thumbnail in cache via append to original
+					finalTargetPath = resolveAvailableTargetPath(thumbDir, task.FileName, cacheManager)
+
+					if err := copyFile(task.SourcePath, finalTargetPath); err != nil {
+						log.Printf("Failed to import [%s]: %v", task.SourcePath, err)
+						atomic.AddInt32(failCount, 1)
+						continue
+					}
+
 					thumbMeta := metadata.ExtractImageMetaJson(task.SourcePath)
 					cacheManager.AppendThumbnailToMaster(match.Path, finalTargetPath, thumbMeta)
 				}
+			} else {
+				log.Printf("Failed to stat perceptual match [%s]: %v", match.Path, err)
+				atomic.AddInt32(failCount, 1)
+				continue
 			}
 		} else {
-			// No perceptual match, handle standard naming conflict if path already exists from other worker
-			if _, err := os.Stat(finalTargetPath); err == nil {
-				ext := filepath.Ext(task.FileName)
-				nameWithoutExt := strings.TrimSuffix(task.FileName, ext)
-				suffix := 1
-				for {
-					newFileName := fmt.Sprintf("%s-%d%s", nameWithoutExt, suffix, ext)
-					finalTargetPath = filepath.Join(task.TargetDir, newFileName)
-					if _, err := os.Stat(finalTargetPath); os.IsNotExist(err) {
-						if !cacheManager.IsCached(finalTargetPath) {
-							break
-						}
-					}
-					suffix++
-				}
+			if finalTargetPath != filepath.Join(task.TargetDir, task.FileName) {
 				log.Printf("Conflict resolved for [%s], using new name [%s]", task.SourcePath, filepath.Base(finalTargetPath))
 			}
-			
-			// Different perceptual hash -> keep as unique file
-			pv, _ := hasher.StringToPHash(task.PHash)
-			masterMeta := metadata.ExtractImageMetaJson(task.SourcePath)
-			cacheManager.AddEntry(finalTargetPath, task.MMH3Hash, pv, task.Size, masterMeta)
+
+			if !hasPHash {
+				cacheManager.AddEntry(finalTargetPath, task.MMH3Hash, 0, task.Size, "{}")
+			}
 		}
 
-		if err := copyFile(task.SourcePath, finalTargetPath); err != nil {
-			log.Printf("Failed to import [%s]: %v", task.SourcePath, err)
-			atomic.AddInt32(failCount, 1)
-			continue
+		if match == nil {
+			if err := copyFile(task.SourcePath, finalTargetPath); err != nil {
+				cacheManager.DeleteEntry(finalTargetPath)
+				log.Printf("Failed to import [%s]: %v", task.SourcePath, err)
+				atomic.AddInt32(failCount, 1)
+				continue
+			}
+
+			masterMeta := metadata.ExtractImageMetaJson(task.SourcePath)
+			cacheManager.AddEntry(finalTargetPath, task.MMH3Hash, phashValue, task.Size, masterMeta)
 		}
 
 		log.Printf("Successfully imported: [%s] -> [%s]", task.SourcePath, finalTargetPath)

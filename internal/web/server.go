@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
 	"github.com/linuxhenhao/photo_organize/internal/target"
 )
@@ -50,6 +52,58 @@ func NewWebServer(cm *target.CacheManager, destDir string) *WebServer {
 	}
 }
 
+func listenAddr(port int) string {
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+}
+
+func pathWithinRoot(root string, candidate string) bool {
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
+}
+
+func (ws *WebServer) resolveWithinDest(requestPath string) (string, error) {
+	if requestPath == "" {
+		return "", fmt.Errorf("path is required")
+	}
+
+	candidate := requestPath
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(ws.destDir, requestPath)
+	}
+
+	absPath, err := filepath.Abs(candidate)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve path: %w", err)
+	}
+
+	absDest, err := filepath.Abs(ws.destDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve destination: %w", err)
+	}
+	if !pathWithinRoot(absDest, absPath) {
+		return "", fmt.Errorf("path escapes destination")
+	}
+
+	return absPath, nil
+}
+
+func hashFileForCache(path string) (string, uint64, error) {
+	mmh3, err := hasher.CalculateHash(path)
+	if err != nil {
+		return "", 0, err
+	}
+
+	phash, err := hasher.CalculatePHash(path)
+	if err != nil {
+		return mmh3, 0, nil
+	}
+
+	return mmh3, phash, nil
+}
+
 // Start API server on the given port
 func (ws *WebServer) Start(port int, db *sql.DB) error {
 	ws.db = db
@@ -63,8 +117,8 @@ func (ws *WebServer) Start(port int, db *sql.DB) error {
 	mux.HandleFunc("/api/resolve", ws.handleResolveGroup)
 	mux.HandleFunc("/image", ws.handleImageServe)
 
-	addr := fmt.Sprintf(":%d", port)
-	log.Printf("🚀 Web UI for Deduplication is running at: http://localhost%s/static/", addr)
+	addr := listenAddr(port)
+	log.Printf("Web UI for Deduplication is running at: http://%s/static/", addr)
 	return http.ListenAndServe(addr, mux)
 }
 
@@ -125,7 +179,7 @@ func (ws *WebServer) handleGetDuplicates(w http.ResponseWriter, r *http.Request)
 		if masterMeta.Size > 0 {
 			finalMasterSize = masterMeta.Size
 		}
-		
+
 		group := DuplicateGroup{
 			Master: ImageInfo{
 				Path:       masterPath,
@@ -149,7 +203,7 @@ func (ws *WebServer) handleGetDuplicates(w http.ResponseWriter, r *http.Request)
 				if thumb.Path == "" {
 					continue
 				}
-				
+
 				group.Duplicates = append(group.Duplicates, ImageInfo{
 					Path:       thumb.Path,
 					Size:       thumb.Metadata.Size,
@@ -189,54 +243,98 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	keepAbs, err := ws.resolveWithinDest(req.KeepPath)
+	if err != nil {
+		http.Error(w, "Invalid keepPath", http.StatusBadRequest)
+		return
+	}
+	masterAbs, err := ws.resolveWithinDest(req.MasterPath)
+	if err != nil {
+		http.Error(w, "Invalid masterPath", http.StatusBadRequest)
+		return
+	}
+
+	type deleteTarget struct {
+		raw string
+		abs string
+	}
+	deleteTargets := make([]deleteTarget, 0, len(req.DeletePaths))
+	for _, delPath := range req.DeletePaths {
+		delAbs, err := ws.resolveWithinDest(delPath)
+		if err != nil {
+			http.Error(w, "Invalid deletePaths entry", http.StatusBadRequest)
+			return
+		}
+		if filepath.Clean(delAbs) == filepath.Clean(keepAbs) {
+			http.Error(w, "keepPath cannot be deleted", http.StatusBadRequest)
+			return
+		}
+		deleteTargets = append(deleteTargets, deleteTarget{raw: delPath, abs: delAbs})
+	}
+
+	keepMaster := filepath.Clean(keepAbs) == filepath.Clean(masterAbs)
+
 	tx, err := ws.db.Begin()
 	if err != nil {
 		http.Error(w, "Failed to begin transaction", http.StatusInternalServerError)
 		return
 	}
+	defer tx.Rollback()
 
 	// 1. Delete physical files and DB cache references
-	for _, delPath := range req.DeletePaths {
-		fullDelPath := filepath.Join(ws.destDir, delPath)
+	for _, delTarget := range deleteTargets {
 		// Try to delete physical file
-		if err := os.Remove(fullDelPath); err != nil && !os.IsNotExist(err) {
-			log.Printf("Warning: failed to delete file %s: %v", fullDelPath, err)
+		if err := os.Remove(delTarget.abs); err != nil && !os.IsNotExist(err) {
+			log.Printf("Warning: failed to delete file %s: %v", delTarget.abs, err)
 		}
-		
+
 		// If the file was a master, delete its row from DB
-		if delPath == req.MasterPath {
-			_, err = tx.Exec(`DELETE FROM file_cache WHERE target_path = ?`, delPath)
+		if filepath.Clean(delTarget.abs) == filepath.Clean(masterAbs) {
+			_, err = tx.Exec(`DELETE FROM file_cache WHERE target_path = ?`, delTarget.raw)
 			if err != nil {
-				log.Printf("Warning: failed to delete master row %s: %v", delPath, err)
+				http.Error(w, "Failed to delete master row", http.StatusInternalServerError)
+				return
 			}
-			// In-memory cleanup
-			ws.cm.DeleteEntry(delPath, "")
 		}
 	}
 
 	// 2. Promote kept thumbnail to master if needed
-	if req.KeepPath != req.MasterPath {
-		// KeepPath is a thumbnail being promoted
-		// Get old thumbnail info if possible, or just insert it as a new master
-		stat, err := os.Stat(filepath.Join(ws.destDir, req.KeepPath))
-		var size int64 = 0
-		if err == nil {
-			size = stat.Size()
+	var updatedMasterMeta string
+	var updatedMasterSize int64
+	var updatedMasterHash string
+	var updatedMasterPHash uint64
+	if !keepMaster {
+		if err := os.Rename(keepAbs, masterAbs); err != nil {
+			http.Error(w, "Failed to promote kept file", http.StatusInternalServerError)
+			return
 		}
-		
-		masterMeta := metadata.ExtractImageMetaJson(filepath.Join(ws.destDir, req.KeepPath))
 
-		// Insert the new master into the root level without any thumbnails
-		_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, '', '', ?, ?, '[]')`, req.KeepPath, size, masterMeta)
+		stat, err := os.Stat(masterAbs)
 		if err != nil {
-			log.Printf("Failed to promote thumbnail to master: %v", err)
+			http.Error(w, "Failed to stat promoted file", http.StatusInternalServerError)
+			return
 		}
-		ws.cm.AddEntry(req.KeepPath, "", 0, size, masterMeta)
+
+		updatedMasterSize = stat.Size()
+		updatedMasterMeta = metadata.ExtractImageMetaJson(masterAbs)
+		updatedMasterHash, updatedMasterPHash, err = hashFileForCache(masterAbs)
+		if err != nil {
+			http.Error(w, "Failed to hash promoted file", http.StatusInternalServerError)
+			return
+		}
+
+		_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, '[]')`,
+			req.MasterPath, updatedMasterHash, hasher.PHashToString(updatedMasterPHash), updatedMasterSize, updatedMasterMeta)
+		if err != nil {
+			http.Error(w, "Failed to promote thumbnail to master", http.StatusInternalServerError)
+			return
+		}
 	} else {
 		// If kept path is the original master, we just clear its thumbnails column
 		_, err = tx.Exec(`UPDATE file_cache SET thumbnails = '[]' WHERE target_path = ?`, req.KeepPath)
 		if err != nil {
-			log.Printf("Failed to clear thumbnails for master %s: %v", req.KeepPath, err)
+			http.Error(w, "Failed to clear thumbnails", http.StatusInternalServerError)
+			return
 		}
 	}
 
@@ -245,30 +343,20 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	if !keepMaster {
+		ws.cm.SetEntryMemory(req.MasterPath, updatedMasterHash, updatedMasterPHash, updatedMasterSize, updatedMasterMeta)
+	}
+
 	w.WriteHeader(http.StatusOK)
 }
 
 func (ws *WebServer) handleImageServe(w http.ResponseWriter, r *http.Request) {
-	relPath := r.URL.Query().Get("path")
-	if relPath == "" || strings.Contains(relPath, "..") {
+	fullPath, err := ws.resolveWithinDest(r.URL.Query().Get("path"))
+	if err != nil {
 		http.Error(w, "Invalid path", http.StatusBadRequest)
 		return
 	}
 
-	fullPath := filepath.Join(ws.destDir, relPath)
-	
-	// Ensure the file stays inside destDir boundaries for security
-	absPath, err := filepath.Abs(fullPath)
-	if err != nil {
-		http.Error(w, "Resolved path error", http.StatusBadRequest)
-		return
-	}
-	absDest, _ := filepath.Abs(ws.destDir)
-	if !strings.HasPrefix(absPath, absDest) {
-		http.Error(w, "Access Denied", http.StatusForbidden)
-		return
-	}
-
 	w.Header().Set("Cache-Control", "public, max-age=31536000") // Cache heavily
-	http.ServeFile(w, r, absPath)
+	http.ServeFile(w, r, fullPath)
 }

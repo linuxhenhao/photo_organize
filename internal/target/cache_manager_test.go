@@ -42,7 +42,7 @@ func TestCacheManager_Basic(t *testing.T) {
 	require.Equal(t, path, match.Path)
 
 	// Test Delete
-	cm.DeleteEntry(path, hash)
+	cm.DeleteEntry(path)
 	// Note: Delete is async for DB, but sync for memory state in our new logic
 	require.False(t, cm.IsCached(path))
 	_, found = cm.FindExactMatch(hash)
@@ -76,7 +76,7 @@ func TestCacheManager_Persistence(t *testing.T) {
 	foundPath, found := cm2.FindExactMatch(hash)
 	require.True(t, found)
 	require.Equal(t, path, foundPath)
-	
+
 	matches := cm2.SearchPHash(phash, 0)
 	require.Len(t, matches, 1)
 	require.Equal(t, path, matches[0].Path)
@@ -108,7 +108,7 @@ func TestInitTargetDirCache_Migration(t *testing.T) {
 	// 2. Pre-populate DB with an incomplete entry (missing phash and metadata)
 	cm, err := NewCacheManager(tempDir, 1)
 	require.NoError(t, err)
-	
+
 	_, err = cm.db.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, 'abc', '', 100, '{}', '[]')`, path)
 	require.NoError(t, err)
 	cm.Close()
@@ -119,11 +119,47 @@ func TestInitTargetDirCache_Migration(t *testing.T) {
 	defer cm2.Close()
 
 	InitTargetDirCache(tempDir, cm2)
-	
+
 	// Give background worker a moment
 	require.Eventually(t, func() bool {
 		var phash, metadata string
 		err := cm2.db.QueryRow("SELECT phash, metadata FROM file_cache WHERE target_path = ?", path).Scan(&phash, &metadata)
 		return err == nil && metadata != "{}"
 	}, 2*time.Second, 100*time.Millisecond, "Incomplete entry should be auto-migrated")
+}
+
+func TestCacheManager_DeleteEntryFiltersStaleHashesAndPHashes(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cache_manager_stale_match_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	cm, err := NewCacheManager(tempDir, 1)
+	require.NoError(t, err)
+	defer cm.Close()
+
+	path := filepath.Join(tempDir, "master.jpg")
+	oldHash := "old-hash"
+	newHash := "new-hash"
+	oldPHash := uint64(0x1010)
+	newPHash := uint64(0x2020)
+
+	cm.AddEntry(path, oldHash, oldPHash, 100, `{"width":1}`)
+	cm.DeleteEntry(path)
+
+	_, found := cm.FindExactMatch(oldHash)
+	require.False(t, found)
+	require.Empty(t, cm.SearchPHash(oldPHash, 0))
+
+	cm.AddEntry(path, newHash, newPHash, 120, `{"width":2}`)
+
+	_, found = cm.FindExactMatch(oldHash)
+	require.False(t, found)
+	foundPath, found := cm.FindExactMatch(newHash)
+	require.True(t, found)
+	require.Equal(t, path, foundPath)
+	require.Empty(t, cm.SearchPHash(oldPHash, 0))
+
+	matches := cm.SearchPHash(newPHash, 0)
+	require.Len(t, matches, 1)
+	require.Equal(t, path, matches[0].Path)
 }

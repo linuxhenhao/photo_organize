@@ -16,22 +16,22 @@ import (
 
 // CacheInfo tracks the completion state of a cached file entry
 type CacheInfo struct {
-	MMH3     string
-	PHash    string
-	Size     int64
-	HasMeta  bool
+	MMH3    string
+	PHash   string
+	Size    int64
+	HasMeta bool
 }
 
 // cacheEntry represents a database update task for the CacheManager background worker.
 type cacheEntry struct {
-	path       string
-	mmh3       string
-	phash      string // String representation for the DB
-	size       int64
-	metadata   string
-	thumbJson  string
-	isAppend   bool
-	isDelete   bool
+	path      string
+	mmh3      string
+	phash     string // String representation for the DB
+	size      int64
+	metadata  string
+	thumbJson string
+	isAppend  bool
+	isDelete  bool
 }
 
 // CacheManager handles the MMH3 Hash and PHash cache operations,
@@ -45,8 +45,8 @@ type CacheManager struct {
 	PHashTree *hasher.BKTree
 	batchSize int
 
-	entries   chan cacheEntry
-	workerWg  sync.WaitGroup
+	entries  chan cacheEntry
+	workerWg sync.WaitGroup
 }
 
 // NewCacheManager initializes and returns a new CacheManager instance.
@@ -136,12 +136,77 @@ func NewCacheManager(destDir string, batchSize int) (*CacheManager, error) {
 	return cm, nil
 }
 
+func (cm *CacheManager) setEntryLocked(path string, mmh3 string, phash uint64, size int64, hasMeta bool) string {
+	phashStr := ""
+	if phash != 0 {
+		phashStr = hasher.PHashToString(phash)
+	}
+
+	if prevVal, ok := cm.paths.Load(path); ok {
+		prev := prevVal.(CacheInfo)
+		if prev.MMH3 != "" && prev.MMH3 != mmh3 {
+			if mappedPath, ok := cm.mmh3Cache.Load(prev.MMH3); ok && mappedPath.(string) == path {
+				cm.mmh3Cache.Delete(prev.MMH3)
+			}
+		}
+	}
+
+	cm.paths.Store(path, CacheInfo{
+		MMH3:    mmh3,
+		PHash:   phashStr,
+		Size:    size,
+		HasMeta: hasMeta,
+	})
+	if mmh3 != "" {
+		cm.mmh3Cache.Store(mmh3, path)
+	}
+	if phash != 0 {
+		cm.PHashTree.Add(phash, path, size)
+	}
+
+	return phashStr
+}
+
+func (cm *CacheManager) removeEntryLocked(path string) {
+	val, ok := cm.paths.Load(path)
+	if !ok {
+		return
+	}
+
+	info := val.(CacheInfo)
+	cm.paths.Delete(path)
+	if info.MMH3 != "" {
+		if mappedPath, ok := cm.mmh3Cache.Load(info.MMH3); ok && mappedPath.(string) == path {
+			cm.mmh3Cache.Delete(info.MMH3)
+		}
+	}
+}
+
+func (cm *CacheManager) filterLiveMatchesLocked(matches []hasher.MatchResult) []hasher.MatchResult {
+	liveMatches := make([]hasher.MatchResult, 0, len(matches))
+	for _, match := range matches {
+		val, ok := cm.paths.Load(match.Path)
+		if !ok {
+			continue
+		}
+
+		info := val.(CacheInfo)
+		if info.PHash == "" || info.PHash != hasher.PHashToString(match.Hash) {
+			continue
+		}
+
+		liveMatches = append(liveMatches, match)
+	}
+
+	return liveMatches
+}
+
 func (cm *CacheManager) runWorker() {
 	defer cm.workerWg.Done()
 
 	// Helper to start/commit transactions on the DB directly for simplicity in this worker
 	// since we want to handle errors and retries if needed.
-	
+
 	executeBatch := func(batch []cacheEntry) {
 		tx, err := cm.db.Begin()
 		if err != nil {
@@ -201,9 +266,23 @@ func (cm *CacheManager) GetCachedInfo(targetPath string) (CacheInfo, bool) {
 }
 
 func (cm *CacheManager) FindExactMatch(mmh3 string) (string, bool) {
+	if mmh3 == "" {
+		return "", false
+	}
+
 	val, ok := cm.mmh3Cache.Load(mmh3)
 	if ok {
-		return val.(string), true
+		path := val.(string)
+		infoVal, exists := cm.paths.Load(path)
+		if !exists {
+			cm.mmh3Cache.Delete(mmh3)
+			return "", false
+		}
+		if infoVal.(CacheInfo).MMH3 != mmh3 {
+			cm.mmh3Cache.Delete(mmh3)
+			return "", false
+		}
+		return path, true
 	}
 	return "", false
 }
@@ -212,36 +291,22 @@ func (cm *CacheManager) FindExactMatch(mmh3 string) (string, bool) {
 func (cm *CacheManager) SearchPHash(phash uint64, maxDistance int) []hasher.MatchResult {
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
-	return cm.PHashTree.Search(phash, maxDistance)
+	return cm.filterLiveMatchesLocked(cm.PHashTree.Search(phash, maxDistance))
 }
 
 // CheckAndAddPerceptualMatch atomically searches for a match and adds the entry if no match is found.
 // Returns the match if found, or nil if the entry was added as unique.
 func (cm *CacheManager) CheckAndAddPerceptualMatch(phash uint64, path string, size int64, mmh3 string) *hasher.MatchResult {
 	cm.mutex.Lock()
-	matches := cm.PHashTree.Search(phash, 5)
+	matches := cm.filterLiveMatchesLocked(cm.PHashTree.Search(phash, 5))
 	if len(matches) > 0 {
+		match := matches[0]
 		cm.mutex.Unlock()
-		return &matches[0]
+		return &match
 	}
 
 	// No match, add to memory state immediately
-	phashStr := ""
-	if phash != 0 {
-		phashStr = hasher.PHashToString(phash)
-	}
-	cm.paths.Store(path, CacheInfo{
-		MMH3:    mmh3,
-		PHash:   phashStr,
-		Size:    size,
-		HasMeta: false, 
-	})
-	if mmh3 != "" {
-		cm.mmh3Cache.Store(mmh3, path)
-	}
-	if phash != 0 {
-		cm.PHashTree.Add(phash, path, size)
-	}
+	phashStr := cm.setEntryLocked(path, mmh3, phash, size, false)
 	cm.mutex.Unlock()
 
 	// Queue for DB outside lock
@@ -250,7 +315,7 @@ func (cm *CacheManager) CheckAndAddPerceptualMatch(phash uint64, path string, si
 		mmh3:     mmh3,
 		phash:    phashStr,
 		size:     size,
-		metadata: "{}", 
+		metadata: "{}",
 	}
 
 	return nil
@@ -259,22 +324,7 @@ func (cm *CacheManager) CheckAndAddPerceptualMatch(phash uint64, path string, si
 // AddEntry adds a new entry to the in-memory state and triggers an asynchronous DB write.
 func (cm *CacheManager) AddEntry(path string, mmh3 string, phash uint64, size int64, metadata string) {
 	cm.mutex.Lock()
-	phashStr := ""
-	if phash != 0 {
-		phashStr = hasher.PHashToString(phash)
-	}
-	cm.paths.Store(path, CacheInfo{
-		MMH3:    mmh3,
-		PHash:   phashStr,
-		Size:    size,
-		HasMeta: metadata != "" && metadata != "{}",
-	})
-	if mmh3 != "" {
-		cm.mmh3Cache.Store(mmh3, path)
-	}
-	if phash != 0 {
-		cm.PHashTree.Add(phash, path, size)
-	}
+	phashStr := cm.setEntryLocked(path, mmh3, phash, size, metadata != "" && metadata != "{}")
 	cm.mutex.Unlock()
 
 	// Trigger asynchronous DB update outside lock
@@ -285,6 +335,13 @@ func (cm *CacheManager) AddEntry(path string, mmh3 string, phash uint64, size in
 		size:     size,
 		metadata: metadata,
 	}
+}
+
+// SetEntryMemory updates the in-memory cache without scheduling a database write.
+func (cm *CacheManager) SetEntryMemory(path string, mmh3 string, phash uint64, size int64, metadata string) {
+	cm.mutex.Lock()
+	cm.setEntryLocked(path, mmh3, phash, size, metadata != "" && metadata != "{}")
+	cm.mutex.Unlock()
 }
 
 // AppendThumbnailToMaster sends an append instruction to the background DB worker.
@@ -298,18 +355,22 @@ func (cm *CacheManager) AppendThumbnailToMaster(masterPath, thumbPath, thumbMeta
 }
 
 // DeleteEntry clears an entry from the memory state and triggers an asynchronous DB delete.
-func (cm *CacheManager) DeleteEntry(path string, mmh3 string) {
+func (cm *CacheManager) DeleteEntry(path string) {
 	cm.mutex.Lock()
-	cm.paths.Delete(path)
-	if mmh3 != "" {
-		cm.mmh3Cache.Delete(mmh3)
-	}
+	cm.removeEntryLocked(path)
 	cm.mutex.Unlock()
 
 	cm.entries <- cacheEntry{
 		path:     path,
 		isDelete: true,
 	}
+}
+
+// DeleteEntryMemory clears an entry from the in-memory cache without scheduling a database write.
+func (cm *CacheManager) DeleteEntryMemory(path string) {
+	cm.mutex.Lock()
+	cm.removeEntryLocked(path)
+	cm.mutex.Unlock()
 }
 
 func (cm *CacheManager) Close() error {

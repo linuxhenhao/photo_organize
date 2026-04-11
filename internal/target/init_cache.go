@@ -24,7 +24,7 @@ func moveFileToThumbnails(baseDir, filePath string) string {
 	}
 	thumbTarget := filepath.Join(baseDir, "thumbnails", rel)
 	os.MkdirAll(filepath.Dir(thumbTarget), 0755)
-	
+
 	err = os.Rename(filePath, thumbTarget)
 	if err != nil {
 		log.Printf("Failed to move %s to thumbnails: %v", filePath, err)
@@ -75,13 +75,13 @@ func InitTargetDirCache(targetDir string, cm *CacheManager) {
 			defer wg.Done()
 			for path := range pathsToHash {
 				info, exists := cm.GetCachedInfo(path)
-				
+
 				// Migration check:
 				// 1. If it's an image but has no phash -> it's an old entry, re-hash it.
 				// 2. If it has no metadata -> it's an old entry, re-extract it.
 				needsPHash := exists && info.PHash == "" && hasher.IsImageForPHash(path)
 				needsMeta := exists && !info.HasMeta
-				
+
 				if exists && !needsPHash && !needsMeta {
 					continue
 				}
@@ -96,7 +96,7 @@ func InitTargetDirCache(targetDir string, cm *CacheManager) {
 				if fileHash == "" {
 					fileHash, _ = hasher.CalculateHash(path)
 				}
-				
+
 				var phash uint64
 				var phashErr error = errors.New("not an image")
 				if hasher.IsImageForPHash(path) {
@@ -128,9 +128,9 @@ func InitTargetDirCache(targetDir string, cm *CacheManager) {
 							thumbPath := moveFileToThumbnails(targetDir, match.Path)
 							thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
 							// Update old from cache to be a thumbnail linking to the new master
-							cm.DeleteEntry(match.Path, "")
+							cm.DeleteEntry(match.Path)
 							masterMeta := metadata.ExtractImageMetaJson(path)
-							cm.AddEntry(path, fileHash, phash, size, masterMeta) // Record new as master
+							cm.AddEntry(path, fileHash, phash, size, masterMeta)   // Record new as master
 							cm.AppendThumbnailToMaster(path, thumbPath, thumbMeta) // Record old as thumbnail of new
 						}
 					}
