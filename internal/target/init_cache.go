@@ -9,11 +9,14 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/linuxhenhao/photo_organize/internal/dedupe"
 	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
 )
+
+const initCacheWorkers = 10
 
 // InitCacheOptions controls how initcache reconciles the target directory.
 type InitCacheOptions struct {
@@ -46,6 +49,14 @@ type thumbnailEntry struct {
 type confirmedDuplicateMatch struct {
 	Match           hasher.MatchResult
 	PreferCandidate bool
+}
+
+type preparedTargetFile struct {
+	Path string
+	Row  fileCacheRow
+	File targetFile
+	Skip bool
+	Err  error
 }
 
 // InitTargetDirCache defaults to read-only cache refresh.
@@ -223,36 +234,87 @@ func buildTargetFile(path string, stat os.FileInfo, row fileCacheRow, exists boo
 	return file, nil
 }
 
+func prepareTargetFiles(paths []string, rows map[string]fileCacheRow, refreshOnly bool) []preparedTargetFile {
+	results := make([]preparedTargetFile, len(paths))
+	if len(paths) == 0 {
+		return results
+	}
+
+	jobs := make(chan int, len(paths))
+	workerCount := initCacheWorkers
+	if workerCount > len(paths) {
+		workerCount = len(paths)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				path := paths[idx]
+				prepared := preparedTargetFile{Path: path}
+
+				stat, err := os.Stat(path)
+				if err != nil {
+					prepared.Err = err
+					results[idx] = prepared
+					continue
+				}
+
+				row, exists := rows[path]
+				prepared.Row = row
+				if refreshOnly && !shouldRefreshPath(path, row, exists, stat) {
+					prepared.Skip = true
+					results[idx] = prepared
+					continue
+				}
+
+				file, err := buildTargetFile(path, stat, row, exists)
+				if err != nil {
+					prepared.Err = err
+					results[idx] = prepared
+					continue
+				}
+
+				prepared.File = file
+				results[idx] = prepared
+			}
+		}()
+	}
+
+	for idx := range paths {
+		jobs <- idx
+	}
+	close(jobs)
+	wg.Wait()
+	return results
+}
+
 func initTargetDirCacheReadOnly(paths []string, thumbnailPaths []string, rows map[string]fileCacheRow, cm *CacheManager) {
 	var refreshed int
-	for _, path := range paths {
-		stat, err := os.Stat(path)
-		if err != nil {
+	prepared := prepareTargetFiles(paths, rows, true)
+	for _, entry := range prepared {
+		if entry.Skip {
+			continue
+		}
+		if entry.Err != nil {
+			log.Printf("Failed to refresh cache entry for %s: %v", entry.Path, entry.Err)
 			continue
 		}
 
-		row, exists := rows[path]
-		if !shouldRefreshPath(path, row, exists, stat) {
-			continue
-		}
-
-		file, err := buildTargetFile(path, stat, row, exists)
-		if err != nil {
-			log.Printf("Failed to refresh cache entry for %s: %v", path, err)
-			continue
-		}
-
+		file := entry.File
 		if err := upsertMasterPreservingThumbnails(cm.db, file); err != nil {
-			log.Printf("Failed to upsert cache entry for %s: %v", path, err)
+			log.Printf("Failed to upsert cache entry for %s: %v", file.Path, err)
 			continue
 		}
 		cm.SetEntryMemoryWithPresence(file.Path, file.MMH3, file.PHash, file.HasPHash, file.Size, file.Metadata)
-		rows[path] = fileCacheRow{
+		rows[file.Path] = fileCacheRow{
 			MMH3:       file.MMH3,
 			PHash:      file.PHashStr,
 			Size:       file.Size,
 			Metadata:   file.Metadata,
-			Thumbnails: row.Thumbnails,
+			Thumbnails: entry.Row.Thumbnails,
 		}
 		refreshed++
 	}
@@ -266,16 +328,15 @@ func initTargetDirCacheReadOnly(paths []string, thumbnailPaths []string, rows ma
 
 func initTargetDirCacheMove(targetDir string, paths []string, thumbnailPaths []string, rows map[string]fileCacheRow, cm *CacheManager) {
 	var processed int
-	for _, path := range paths {
-		stat, err := os.Stat(path)
-		if err != nil {
+	prepared := prepareTargetFiles(paths, rows, false)
+	for _, entry := range prepared {
+		if entry.Err != nil {
+			log.Printf("Failed to build cache entry for %s: %v", entry.Path, entry.Err)
 			continue
 		}
 
-		row, exists := rows[path]
-		file, err := buildTargetFile(path, stat, row, exists)
-		if err != nil {
-			log.Printf("Failed to build cache entry for %s: %v", path, err)
+		file := entry.File
+		if _, err := os.Stat(file.Path); err != nil {
 			continue
 		}
 
@@ -288,15 +349,15 @@ func initTargetDirCacheMove(targetDir string, paths []string, thumbnailPaths []s
 
 		if match == nil {
 			if err := upsertMasterPreservingThumbnails(cm.db, file); err != nil {
-				log.Printf("Failed to upsert master entry for %s: %v", path, err)
+				log.Printf("Failed to upsert master entry for %s: %v", file.Path, err)
 				continue
 			}
-			rows[path] = fileCacheRow{
+			rows[file.Path] = fileCacheRow{
 				MMH3:       file.MMH3,
 				PHash:      file.PHashStr,
 				Size:       file.Size,
 				Metadata:   file.Metadata,
-				Thumbnails: row.Thumbnails,
+				Thumbnails: entry.Row.Thumbnails,
 			}
 			processed++
 			continue
@@ -304,7 +365,7 @@ func initTargetDirCacheMove(targetDir string, paths []string, thumbnailPaths []s
 
 		if !match.PreferCandidate {
 			if err := demoteCurrentFile(targetDir, file, match.Match, rows, cm); err != nil {
-				log.Printf("Failed to move duplicate %s to thumbnails: %v", path, err)
+				log.Printf("Failed to move duplicate %s to thumbnails: %v", file.Path, err)
 				continue
 			}
 			processed++
@@ -312,7 +373,7 @@ func initTargetDirCacheMove(targetDir string, paths []string, thumbnailPaths []s
 		}
 
 		if err := promoteCurrentFile(targetDir, file, match.Match, rows, cm); err != nil {
-			log.Printf("Failed to promote superior duplicate %s: %v", path, err)
+			log.Printf("Failed to promote superior duplicate %s: %v", file.Path, err)
 			continue
 		}
 		processed++
@@ -512,26 +573,22 @@ func rebuildThumbnailLinks(thumbnailPaths []string, rows map[string]fileCacheRow
 		}
 	}
 
-	for _, thumbPath := range thumbnailPaths {
-		stat, err := os.Stat(thumbPath)
-		if err != nil {
+	preparedThumbs := prepareTargetFiles(thumbnailPaths, nil, false)
+	for _, entry := range preparedThumbs {
+		if entry.Err != nil || !entry.File.HasPHash {
 			continue
 		}
 
-		file, err := buildTargetFile(thumbPath, stat, fileCacheRow{}, false)
-		if err != nil || !file.HasPHash {
-			continue
-		}
-
+		file := entry.File
 		match := findConfirmedDuplicateMatch(file, rows, cm)
 		if match == nil {
 			continue
 		}
 
-		thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
+		thumbMeta := metadata.ExtractImageMetaJson(entry.Path)
 		aggregated[match.Match.Path] = mergeThumbnailEntries(
 			aggregated[match.Match.Path],
-			[]thumbnailEntry{makeThumbnailEntry(thumbPath, thumbMeta)},
+			[]thumbnailEntry{makeThumbnailEntry(entry.Path, thumbMeta)},
 		)
 	}
 
