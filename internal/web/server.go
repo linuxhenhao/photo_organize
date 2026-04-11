@@ -90,18 +90,18 @@ func (ws *WebServer) resolveWithinDest(requestPath string) (string, error) {
 	return absPath, nil
 }
 
-func hashFileForCache(path string) (string, uint64, error) {
+func hashFileForCache(path string) (string, uint64, bool, error) {
 	mmh3, err := hasher.CalculateHash(path)
 	if err != nil {
-		return "", 0, err
+		return "", 0, false, err
 	}
 
 	phash, err := hasher.CalculatePHash(path)
 	if err != nil {
-		return mmh3, 0, nil
+		return mmh3, 0, false, nil
 	}
 
-	return mmh3, phash, nil
+	return mmh3, phash, true, nil
 }
 
 // Start API server on the given port
@@ -303,6 +303,7 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 	var updatedMasterSize int64
 	var updatedMasterHash string
 	var updatedMasterPHash uint64
+	var updatedMasterHasPHash bool
 	if !keepMaster {
 		if err := os.Rename(keepAbs, masterAbs); err != nil {
 			http.Error(w, "Failed to promote kept file", http.StatusInternalServerError)
@@ -317,14 +318,18 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 
 		updatedMasterSize = stat.Size()
 		updatedMasterMeta = metadata.ExtractImageMetaJson(masterAbs)
-		updatedMasterHash, updatedMasterPHash, err = hashFileForCache(masterAbs)
+		updatedMasterHash, updatedMasterPHash, updatedMasterHasPHash, err = hashFileForCache(masterAbs)
 		if err != nil {
 			http.Error(w, "Failed to hash promoted file", http.StatusInternalServerError)
 			return
 		}
 
+		updatedMasterPHashStr := ""
+		if updatedMasterHasPHash {
+			updatedMasterPHashStr = hasher.PHashToString(updatedMasterPHash)
+		}
 		_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, '[]')`,
-			req.MasterPath, updatedMasterHash, hasher.PHashToString(updatedMasterPHash), updatedMasterSize, updatedMasterMeta)
+			req.MasterPath, updatedMasterHash, updatedMasterPHashStr, updatedMasterSize, updatedMasterMeta)
 		if err != nil {
 			http.Error(w, "Failed to promote thumbnail to master", http.StatusInternalServerError)
 			return
@@ -344,7 +349,7 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if !keepMaster {
-		ws.cm.SetEntryMemory(req.MasterPath, updatedMasterHash, updatedMasterPHash, updatedMasterSize, updatedMasterMeta)
+		ws.cm.SetEntryMemoryWithPresence(req.MasterPath, updatedMasterHash, updatedMasterPHash, updatedMasterHasPHash, updatedMasterSize, updatedMasterMeta)
 	}
 
 	w.WriteHeader(http.StatusOK)

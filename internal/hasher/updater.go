@@ -79,14 +79,7 @@ func UpdateHashes(db *sql.DB) error {
 					res.mmh3 = h
 				}
 				if job.calcPhash && res.err == nil {
-					isImg := false
-					if job.mimeType != "" {
-						isImg = strings.HasPrefix(job.mimeType, "image/")
-					} else {
-						isImg = IsImageForPHash(job.path)
-					}
-
-					if isImg {
+					if CanVisualHash(job.path, job.mimeType) {
 						p, err := CalculatePHash(job.path)
 						if err != nil {
 							res.phash = "UNSUPPORTED"

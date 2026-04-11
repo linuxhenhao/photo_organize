@@ -7,6 +7,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png" // Basic support for now, can extend to others if needed
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"strconv"
@@ -16,15 +17,38 @@ import (
 	"github.com/twmb/murmur3"
 )
 
-// IsImageForPHash checks if the file is an image using exiftool's MIME type detection.
-func IsImageForPHash(path string) bool {
+func mimeTypeWithExiftool(path string) (string, error) {
 	cmd := exec.Command("exiftool", "-MIMEType", "-s3", "-fast", path)
 	out, err := cmd.Output()
 	if err != nil {
+		return "", err
+	}
+	return strings.ToLower(strings.TrimSpace(string(out))), nil
+}
+
+// CanVisualHash reports whether a file should participate in image-only visual hashing.
+func CanVisualHash(path string, mimeType string) bool {
+	if mimeType != "" {
+		return strings.HasPrefix(strings.ToLower(strings.TrimSpace(mimeType)), "image/")
+	}
+
+	if detectedMime, err := mimeTypeWithExiftool(path); err == nil && detectedMime != "" {
+		return strings.HasPrefix(detectedMime, "image/")
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
 		return false
 	}
-	mime := strings.ToLower(strings.TrimSpace(string(out)))
-	return strings.HasPrefix(mime, "image/")
+	defer file.Close()
+
+	_, _, err = image.DecodeConfig(file)
+	return err == nil
+}
+
+// IsImageForPHash checks if the file should participate in visual hashing.
+func IsImageForPHash(path string) bool {
+	return CanVisualHash(path, "")
 }
 
 // extractThumbnail attempts to extract the embedded thumbnail using exiftool.
@@ -33,8 +57,7 @@ func extractThumbnail(path string) ([]byte, error) {
 	return cmd.Output()
 }
 
-// calculatePHash computes the dHash for an image, preferring its fast-to-extract thumbnail.
-func CalculatePHash(path string) (uint64, error) {
+func decodeImageForHash(path string) (image.Image, error) {
 	var img image.Image
 	var err error
 
@@ -48,13 +71,23 @@ func CalculatePHash(path string) (uint64, error) {
 	if img == nil {
 		file, openErr := os.Open(path)
 		if openErr != nil {
-			return 0, fmt.Errorf("failed to open file for phash [%s]: %w", path, openErr)
+			return nil, fmt.Errorf("failed to open file for phash [%s]: %w", path, openErr)
 		}
 		defer file.Close()
 		img, _, err = image.Decode(file)
 		if err != nil {
-			return 0, fmt.Errorf("failed to decode image for phash [%s]: %w", path, err)
+			return nil, fmt.Errorf("failed to decode image for phash [%s]: %w", path, err)
 		}
+	}
+
+	return img, nil
+}
+
+// CalculatePHash computes the fast dHash used for BK-tree candidate lookup.
+func CalculatePHash(path string) (uint64, error) {
+	img, err := decodeImageForHash(path)
+	if err != nil {
+		return 0, err
 	}
 
 	hash, err := goimagehash.DifferenceHash(img)
@@ -62,6 +95,82 @@ func CalculatePHash(path string) (uint64, error) {
 		return 0, err
 	}
 	return hash.GetHash(), nil
+}
+
+// CalculatePerceptionHash computes a stronger perceptual hash for duplicate confirmation.
+func CalculatePerceptionHash(path string) (uint64, error) {
+	img, err := decodeImageForHash(path)
+	if err != nil {
+		return 0, err
+	}
+
+	hash, err := goimagehash.PerceptionHash(img)
+	if err != nil {
+		return 0, err
+	}
+	return hash.GetHash(), nil
+}
+
+// CalculateColorSignature samples a coarse RGB grid for color-aware duplicate confirmation.
+func CalculateColorSignature(path string) ([]uint8, error) {
+	img, err := decodeImageForHash(path)
+	if err != nil {
+		return nil, err
+	}
+
+	bounds := img.Bounds()
+	if bounds.Dx() == 0 || bounds.Dy() == 0 {
+		return nil, fmt.Errorf("invalid image bounds for %s", path)
+	}
+
+	const gridSize = 4
+	signature := make([]uint8, 0, gridSize*gridSize*3)
+	for gy := 0; gy < gridSize; gy++ {
+		y0 := bounds.Min.Y + gy*bounds.Dy()/gridSize
+		y1 := bounds.Min.Y + (gy+1)*bounds.Dy()/gridSize
+		if y1 <= y0 {
+			y1 = y0 + 1
+		}
+		for gx := 0; gx < gridSize; gx++ {
+			x0 := bounds.Min.X + gx*bounds.Dx()/gridSize
+			x1 := bounds.Min.X + (gx+1)*bounds.Dx()/gridSize
+			if x1 <= x0 {
+				x1 = x0 + 1
+			}
+
+			var rSum, gSum, bSum, count uint64
+			for y := y0; y < y1; y++ {
+				for x := x0; x < x1; x++ {
+					r, g, b, _ := img.At(x, y).RGBA()
+					rSum += uint64(r >> 8)
+					gSum += uint64(g >> 8)
+					bSum += uint64(b >> 8)
+					count++
+				}
+			}
+
+			signature = append(signature,
+				uint8(rSum/count),
+				uint8(gSum/count),
+				uint8(bSum/count),
+			)
+		}
+	}
+
+	return signature, nil
+}
+
+// ColorSignatureDistance reports the mean absolute channel difference between two signatures.
+func ColorSignatureDistance(a []uint8, b []uint8) float64 {
+	if len(a) == 0 || len(a) != len(b) {
+		return math.Inf(1)
+	}
+
+	var sum float64
+	for i := range a {
+		sum += math.Abs(float64(a[i]) - float64(b[i]))
+	}
+	return sum / float64(len(a))
 }
 
 // PHashToString formats a uint64 phash as a 16-character hex string.

@@ -163,3 +163,24 @@ func TestCacheManager_DeleteEntryFiltersStaleHashesAndPHashes(t *testing.T) {
 	require.Len(t, matches, 1)
 	require.Equal(t, path, matches[0].Path)
 }
+
+func TestCacheManager_ZeroValuedPHashIsSearchable(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cache_manager_zero_phash_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	cm, err := NewCacheManager(tempDir, 1)
+	require.NoError(t, err)
+	defer cm.Close()
+
+	path := filepath.Join(tempDir, "flat.jpg")
+	cm.AddEntryWithPresence(path, "zero-hash", 0, true, 64, `{"width":32}`)
+
+	matches := cm.SearchPHash(0, 0)
+	require.Len(t, matches, 1)
+	require.Equal(t, path, matches[0].Path)
+
+	info, ok := cm.GetCachedInfo(path)
+	require.True(t, ok)
+	require.Equal(t, "0000000000000000", info.PHash)
+}

@@ -42,8 +42,8 @@ func ExtractImageMeta(fullPath string) MediaMeta {
 
 	// 2. Fallback or augment with exiftool for videos, complex image formats, or metadata
 	// Use -s instead of -s -s -s to keep the "Key : Value" format for parsing.
-	cmd := exec.Command("exiftool", "-s", 
-		"-ImageWidth", "-ImageHeight", "-VideoSize", 
+	cmd := exec.Command("exiftool", "-s",
+		"-ImageWidth", "-ImageHeight", "-VideoSize",
 		"-CreateDate", "-DateTimeOriginal", "-MediaCreateDate",
 		"-fast", fullPath)
 	output, err := cmd.Output()
@@ -99,4 +99,17 @@ func ExtractImageMetaJson(fullPath string) string {
 		return "{}"
 	}
 	return string(b)
+}
+
+// ParseMediaMetaJSON decodes cached metadata JSON. Invalid input returns zero values.
+func ParseMediaMetaJSON(raw string) MediaMeta {
+	if raw == "" {
+		return MediaMeta{}
+	}
+
+	var meta MediaMeta
+	if err := json.Unmarshal([]byte(raw), &meta); err != nil {
+		return MediaMeta{}
+	}
+	return meta
 }

@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	_ "modernc.org/sqlite" // Ensure sqlite driver is loaded
-	
+
 	"github.com/linuxhenhao/photo_organize/internal/importer"
 	"github.com/linuxhenhao/photo_organize/internal/scanner"
 	"github.com/linuxhenhao/photo_organize/internal/target"
@@ -48,6 +48,8 @@ func main() {
 
 	initCacheCmd := flag.NewFlagSet("initcache", flag.ExitOnError)
 	initCacheCmd.StringVar(&destDir, "dest", "", "Target directory for import (e.g., /path/to/organized_photos)")
+	var moveDuplicates bool
+	initCacheCmd.BoolVar(&moveDuplicates, "move-duplicates", false, "Move perceptual duplicates into thumbnails; default is read-only cache refresh")
 
 	serveCmd := flag.NewFlagSet("serve", flag.ExitOnError)
 	serveCmd.StringVar(&destDir, "dest", "", "Target directory containing deduplicated items and cache.db")
@@ -88,13 +90,15 @@ func main() {
 		if destDir == "" {
 			log.Fatal("InitCache command requires a target directory specified with -dest.")
 		}
-		
+
 		cacheManager, err := target.NewCacheManager(destDir, 100)
 		if err != nil {
 			log.Fatalf("Failed to initialize target directory cache: %v", err)
 		}
 		defer cacheManager.Close()
-		target.InitTargetDirCache(destDir, cacheManager)
+		target.InitTargetDirCacheWithOptions(destDir, cacheManager, target.InitCacheOptions{
+			MoveDuplicates: moveDuplicates,
+		})
 	case "serve":
 		serveCmd.Parse(os.Args[2:])
 		if destDir == "" {

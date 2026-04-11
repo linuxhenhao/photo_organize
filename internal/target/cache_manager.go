@@ -7,9 +7,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
+	"github.com/linuxhenhao/photo_organize/internal/dedupe"
 	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	_ "modernc.org/sqlite"
 )
@@ -136,9 +138,9 @@ func NewCacheManager(destDir string, batchSize int) (*CacheManager, error) {
 	return cm, nil
 }
 
-func (cm *CacheManager) setEntryLocked(path string, mmh3 string, phash uint64, size int64, hasMeta bool) string {
+func (cm *CacheManager) setEntryLocked(path string, mmh3 string, phash uint64, hasPHash bool, size int64, hasMeta bool) string {
 	phashStr := ""
-	if phash != 0 {
+	if hasPHash {
 		phashStr = hasher.PHashToString(phash)
 	}
 
@@ -160,7 +162,7 @@ func (cm *CacheManager) setEntryLocked(path string, mmh3 string, phash uint64, s
 	if mmh3 != "" {
 		cm.mmh3Cache.Store(mmh3, path)
 	}
-	if phash != 0 {
+	if hasPHash {
 		cm.PHashTree.Add(phash, path, size)
 	}
 
@@ -201,6 +203,18 @@ func (cm *CacheManager) filterLiveMatchesLocked(matches []hasher.MatchResult) []
 	return liveMatches
 }
 
+func rankMatches(matches []hasher.MatchResult) {
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].Distance != matches[j].Distance {
+			return matches[i].Distance < matches[j].Distance
+		}
+		if matches[i].Size != matches[j].Size {
+			return matches[i].Size > matches[j].Size
+		}
+		return matches[i].Path < matches[j].Path
+	})
+}
+
 func (cm *CacheManager) runWorker() {
 	defer cm.workerWg.Done()
 
@@ -223,7 +237,15 @@ func (cm *CacheManager) runWorker() {
 				_, err = tx.Exec(`UPDATE file_cache SET thumbnails = json_insert(CASE WHEN thumbnails = '' OR thumbnails IS NULL THEN '[]' ELSE thumbnails END, '$[#]', json(?)) WHERE target_path = ?`,
 					entry.thumbJson, entry.path)
 			} else {
-				_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, phash, size, metadata) VALUES (?, ?, ?, ?, ?)`,
+				_, err = tx.Exec(`
+					INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata)
+					VALUES (?, ?, ?, ?, ?)
+					ON CONFLICT(target_path) DO UPDATE SET
+						mmh3_hash = excluded.mmh3_hash,
+						phash = excluded.phash,
+						size = excluded.size,
+						metadata = excluded.metadata
+				`,
 					entry.path, entry.mmh3, entry.phash, entry.size, entry.metadata)
 			}
 
@@ -291,14 +313,22 @@ func (cm *CacheManager) FindExactMatch(mmh3 string) (string, bool) {
 func (cm *CacheManager) SearchPHash(phash uint64, maxDistance int) []hasher.MatchResult {
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
-	return cm.filterLiveMatchesLocked(cm.PHashTree.Search(phash, maxDistance))
+	matches := cm.filterLiveMatchesLocked(cm.PHashTree.Search(phash, maxDistance))
+	rankMatches(matches)
+	return matches
 }
 
 // CheckAndAddPerceptualMatch atomically searches for a match and adds the entry if no match is found.
 // Returns the match if found, or nil if the entry was added as unique.
 func (cm *CacheManager) CheckAndAddPerceptualMatch(phash uint64, path string, size int64, mmh3 string) *hasher.MatchResult {
+	return cm.CheckAndAddPerceptualMatchWithPresence(phash, phash != 0, path, size, mmh3)
+}
+
+// CheckAndAddPerceptualMatchWithPresence behaves like CheckAndAddPerceptualMatch but allows zero-valued hashes.
+func (cm *CacheManager) CheckAndAddPerceptualMatchWithPresence(phash uint64, hasPHash bool, path string, size int64, mmh3 string) *hasher.MatchResult {
 	cm.mutex.Lock()
-	matches := cm.filterLiveMatchesLocked(cm.PHashTree.Search(phash, 5))
+	matches := cm.filterLiveMatchesLocked(cm.PHashTree.Search(phash, dedupe.CandidateSearchDistance))
+	rankMatches(matches)
 	if len(matches) > 0 {
 		match := matches[0]
 		cm.mutex.Unlock()
@@ -306,7 +336,7 @@ func (cm *CacheManager) CheckAndAddPerceptualMatch(phash uint64, path string, si
 	}
 
 	// No match, add to memory state immediately
-	phashStr := cm.setEntryLocked(path, mmh3, phash, size, false)
+	phashStr := cm.setEntryLocked(path, mmh3, phash, hasPHash, size, false)
 	cm.mutex.Unlock()
 
 	// Queue for DB outside lock
@@ -323,8 +353,13 @@ func (cm *CacheManager) CheckAndAddPerceptualMatch(phash uint64, path string, si
 
 // AddEntry adds a new entry to the in-memory state and triggers an asynchronous DB write.
 func (cm *CacheManager) AddEntry(path string, mmh3 string, phash uint64, size int64, metadata string) {
+	cm.AddEntryWithPresence(path, mmh3, phash, phash != 0, size, metadata)
+}
+
+// AddEntryWithPresence behaves like AddEntry but allows zero-valued hashes.
+func (cm *CacheManager) AddEntryWithPresence(path string, mmh3 string, phash uint64, hasPHash bool, size int64, metadata string) {
 	cm.mutex.Lock()
-	phashStr := cm.setEntryLocked(path, mmh3, phash, size, metadata != "" && metadata != "{}")
+	phashStr := cm.setEntryLocked(path, mmh3, phash, hasPHash, size, metadata != "" && metadata != "{}")
 	cm.mutex.Unlock()
 
 	// Trigger asynchronous DB update outside lock
@@ -339,8 +374,13 @@ func (cm *CacheManager) AddEntry(path string, mmh3 string, phash uint64, size in
 
 // SetEntryMemory updates the in-memory cache without scheduling a database write.
 func (cm *CacheManager) SetEntryMemory(path string, mmh3 string, phash uint64, size int64, metadata string) {
+	cm.SetEntryMemoryWithPresence(path, mmh3, phash, phash != 0, size, metadata)
+}
+
+// SetEntryMemoryWithPresence behaves like SetEntryMemory but allows zero-valued hashes.
+func (cm *CacheManager) SetEntryMemoryWithPresence(path string, mmh3 string, phash uint64, hasPHash bool, size int64, metadata string) {
 	cm.mutex.Lock()
-	cm.setEntryLocked(path, mmh3, phash, size, metadata != "" && metadata != "{}")
+	cm.setEntryLocked(path, mmh3, phash, hasPHash, size, metadata != "" && metadata != "{}")
 	cm.mutex.Unlock()
 }
 
