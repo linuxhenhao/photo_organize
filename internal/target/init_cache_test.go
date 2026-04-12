@@ -224,3 +224,31 @@ func TestInitTargetDirCacheMoveDuplicatesUsesExistingCache(t *testing.T) {
 	require.Equal(t, hasher.PHashToString(bigPHash), dbPHash)
 	require.Equal(t, bigMeta, dbMeta.String)
 }
+
+func TestInitTargetDirCacheMoveDuplicatesDoesNotPublishMemoryStateOnDBFailure(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "initcache_move_db_failure")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	path := filepath.Join(tempDir, "2024", "01", "01", "only.jpg")
+	writeJPEGWithQuality(t, path, 90)
+
+	cm, err := NewCacheManager(tempDir, 1)
+	require.NoError(t, err)
+	defer cm.Close()
+
+	_, err = cm.db.Exec(`
+		CREATE TRIGGER fail_file_cache_insert
+		BEFORE INSERT ON file_cache
+		BEGIN
+			SELECT RAISE(FAIL, 'blocked');
+		END;
+	`)
+	require.NoError(t, err)
+
+	InitTargetDirCacheWithOptions(tempDir, cm, InitCacheOptions{MoveDuplicates: true})
+
+	require.False(t, cm.IsCached(path))
+	_, err = os.Stat(path)
+	require.NoError(t, err)
+}

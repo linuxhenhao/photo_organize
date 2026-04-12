@@ -340,8 +340,6 @@ func initTargetDirCacheMove(targetDir string, paths []string, thumbnailPaths []s
 			continue
 		}
 
-		cm.SetEntryMemoryWithPresence(file.Path, file.MMH3, file.PHash, file.HasPHash, file.Size, file.Metadata)
-
 		var match *confirmedDuplicateMatch
 		if file.HasPHash {
 			match = findConfirmedDuplicateMatch(file, rows, cm)
@@ -359,6 +357,7 @@ func initTargetDirCacheMove(targetDir string, paths []string, thumbnailPaths []s
 				Metadata:   file.Metadata,
 				Thumbnails: entry.Row.Thumbnails,
 			}
+			cm.SetEntryMemoryWithPresence(file.Path, file.MMH3, file.PHash, file.HasPHash, file.Size, file.Metadata)
 			processed++
 			continue
 		}
