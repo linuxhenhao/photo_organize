@@ -1,6 +1,11 @@
 package importer
 
 import (
+	"database/sql"
+	"encoding/json"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,7 +17,60 @@ import (
 	"github.com/linuxhenhao/photo_organize/internal/target"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	_ "modernc.org/sqlite"
 )
+
+func writeSizedJPEGWithQuality(t *testing.T, path string, width int, height int, quality int) {
+	t.Helper()
+
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0755))
+
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			rx := float64(x) / float64(width)
+			ry := float64(y) / float64(height)
+			img.Set(x, y, color.RGBA{
+				R: uint8(255 * rx),
+				G: uint8(255 * ry),
+				B: uint8(255 * (1 - rx*ry)),
+				A: 255,
+			})
+		}
+	}
+
+	file, err := os.Create(path)
+	require.NoError(t, err)
+	defer file.Close()
+
+	require.NoError(t, jpeg.Encode(file, img, &jpeg.Options{Quality: quality}))
+}
+
+func writeJPEGFixturePair(t *testing.T, masterPath string, thumbPath string) {
+	t.Helper()
+	writeSizedJPEGWithQuality(t, masterPath, 96, 72, 90)
+	writeSizedJPEGWithQuality(t, thumbPath, 48, 36, 70)
+}
+
+func buildTaskFromPath(t *testing.T, sourcePath string, targetDir string) ImportTask {
+	t.Helper()
+
+	stat, err := os.Stat(sourcePath)
+	require.NoError(t, err)
+	mmh3, err := hasher.CalculateHash(sourcePath)
+	require.NoError(t, err)
+	phash, err := hasher.CalculatePHash(sourcePath)
+	require.NoError(t, err)
+
+	return ImportTask{
+		SourcePath: sourcePath,
+		TargetDir:  targetDir,
+		FileName:   filepath.Base(sourcePath),
+		Size:       stat.Size(),
+		MMH3Hash:   mmh3,
+		PHash:      hasher.PHashToString(phash),
+	}
+}
 
 func TestTargetDirRoot(t *testing.T) {
 	tests := []struct {
@@ -31,8 +89,6 @@ func TestTargetDirRoot(t *testing.T) {
 
 	for _, tt := range tests {
 		got := targetDirRoot(tt.target)
-		// On Windows, filepath.Dir will use backslashes.
-		// Normalize to forward slashes for the test logic or use filepath.FromSlash
 		assert.Equal(t, filepath.Clean(tt.expected), filepath.Clean(got))
 	}
 }
@@ -105,9 +161,14 @@ func TestImportCoordinatorWaitsForSimilarInFlightTask(t *testing.T) {
 	require.NoError(t, err)
 	defer cacheManager.Close()
 
+	thumbSource := filepath.Join(tempDir, "source", "thumb.jpg")
+	masterSource := filepath.Join(tempDir, "source", "master.jpg")
+	writeJPEGFixturePair(t, masterSource, thumbSource)
+
 	coordinator := newImportCoordinator(cacheManager)
-	thumbTask := buildFixtureTask(t, filepath.Join("test_data", "source_mock_thumbs", "thumb_2023_05_01.jpg"), tempDir)
-	masterTask := buildFixtureTask(t, filepath.Join("test_data", "source_mock", "img_2023_05_01.jpg"), tempDir)
+	targetDir := filepath.Join(tempDir, "2023", "05", "01")
+	thumbTask := buildTaskFromPath(t, thumbSource, targetDir)
+	masterTask := buildTaskFromPath(t, masterSource, targetDir)
 
 	firstPlan := coordinator.planTask(thumbTask, metadata.ExtractImageMetaJson(thumbTask.SourcePath))
 	require.Equal(t, importPlanCopyMaster, firstPlan.action)
@@ -133,7 +194,9 @@ func TestImportCoordinatorDropsMissingCommittedExactMatch(t *testing.T) {
 	require.NoError(t, err)
 	defer cacheManager.Close()
 
-	task := buildFixtureTask(t, filepath.Join("test_data", "source_mock", "img_2023_05_01.jpg"), tempDir)
+	sourcePath := filepath.Join(tempDir, "source", "img.jpg")
+	writeSizedJPEGWithQuality(t, sourcePath, 96, 72, 90)
+	task := buildTaskFromPath(t, sourcePath, filepath.Join(tempDir, "2023", "05", "01"))
 	cacheManager.AddEntryWithPresence(filepath.Join(tempDir, "missing.jpg"), task.MMH3Hash, 0, false, task.Size, "{}")
 
 	coordinator := newImportCoordinator(cacheManager)
@@ -147,23 +210,98 @@ func TestImportCoordinatorDropsMissingCommittedExactMatch(t *testing.T) {
 	coordinator.cancelReservation(plan.reservation)
 }
 
-func buildFixtureTask(t *testing.T, relPath string, tempDir string) ImportTask {
-	t.Helper()
+func TestImportCoordinatorPromoteCommittedPreservesExistingThumbnails(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "photo_organize_import_promote_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
 
-	sourcePath := filepath.Clean(filepath.Join("..", "..", relPath))
-	stat, err := os.Stat(sourcePath)
-	require.NoError(t, err)
-	mmh3, err := hasher.CalculateHash(sourcePath)
-	require.NoError(t, err)
-	phash, err := hasher.CalculatePHash(sourcePath)
+	cacheManager, err := target.NewCacheManager(tempDir, 1)
 	require.NoError(t, err)
 
-	return ImportTask{
-		SourcePath: sourcePath,
-		TargetDir:  filepath.Join(tempDir, "2023", "05", "01"),
-		FileName:   filepath.Base(sourcePath),
-		Size:       stat.Size(),
-		MMH3Hash:   mmh3,
-		PHash:      hasher.PHashToString(phash),
+	cacheDBPath := filepath.Join(tempDir, "cache.db")
+	sqliteDB, err := sql.Open("sqlite", cacheDBPath+"?_busy_timeout=5000")
+	require.NoError(t, err)
+	defer sqliteDB.Close()
+
+	oldMasterPath := filepath.Join(tempDir, "2024", "01", "02", "old-master.jpg")
+	oldThumbAPath := filepath.Join(tempDir, "thumbnails", "2024", "01", "02", "thumb-a.jpg")
+	oldThumbBPath := filepath.Join(tempDir, "thumbnails", "2024", "01", "02", "thumb-b.jpg")
+	newMasterPath := filepath.Join(tempDir, "2024", "01", "02", "new-master.jpg")
+	movedOldMasterPath := filepath.Join(tempDir, "thumbnails", "2024", "01", "02", "old-master.jpg")
+
+	writeSizedJPEGWithQuality(t, oldMasterPath, 72, 54, 85)
+	writeSizedJPEGWithQuality(t, oldThumbAPath, 48, 36, 65)
+	writeSizedJPEGWithQuality(t, oldThumbBPath, 40, 30, 60)
+	writeSizedJPEGWithQuality(t, newMasterPath, 96, 72, 92)
+
+	oldStat, err := os.Stat(oldMasterPath)
+	require.NoError(t, err)
+	oldHash, err := hasher.CalculateHash(oldMasterPath)
+	require.NoError(t, err)
+	oldPHash, err := hasher.CalculatePHash(oldMasterPath)
+	require.NoError(t, err)
+	oldMeta := metadata.ExtractImageMetaJson(oldMasterPath)
+	thumbAMeta := metadata.ExtractImageMetaJson(oldThumbAPath)
+	thumbBMeta := metadata.ExtractImageMetaJson(oldThumbBPath)
+
+	_, err = sqliteDB.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
+		oldMasterPath,
+		oldHash,
+		hasher.PHashToString(oldPHash),
+		oldStat.Size(),
+		oldMeta,
+		`[{"path":"`+oldThumbAPath+`","metadata":`+thumbAMeta+`},{"path":"`+oldThumbBPath+`","metadata":`+thumbBMeta+`}]`,
+	)
+	require.NoError(t, err)
+	cacheManager.SetEntryMemoryWithPresence(oldMasterPath, oldHash, oldPHash, true, oldStat.Size(), oldMeta)
+
+	newStat, err := os.Stat(newMasterPath)
+	require.NoError(t, err)
+	newHash, err := hasher.CalculateHash(newMasterPath)
+	require.NoError(t, err)
+	newPHash, err := hasher.CalculatePHash(newMasterPath)
+	require.NoError(t, err)
+	newMeta := metadata.ExtractImageMetaJson(newMasterPath)
+
+	coordinator := newImportCoordinator(cacheManager)
+	reservation := &importReservation{
+		seq:                1,
+		task:               ImportTask{SourcePath: newMasterPath, TargetDir: filepath.Dir(newMasterPath), FileName: filepath.Base(newMasterPath), Size: newStat.Size(), MMH3Hash: newHash, PHash: hasher.PHashToString(newPHash)},
+		finalPath:          newMasterPath,
+		hasPHash:           true,
+		phash:              newPHash,
+		sourceMeta:         newMeta,
+		action:             importPlanPromoteCommitted,
+		committedMatchPath: oldMasterPath,
+		done:               make(chan struct{}),
 	}
+
+	coordinator.commitReservation(reservation)
+	require.NoError(t, cacheManager.Close())
+
+	_, err = os.Stat(oldMasterPath)
+	require.True(t, os.IsNotExist(err))
+	_, err = os.Stat(movedOldMasterPath)
+	require.NoError(t, err)
+
+	var deletedCount int
+	err = sqliteDB.QueryRow(`SELECT COUNT(*) FROM file_cache WHERE target_path = ?`, oldMasterPath).Scan(&deletedCount)
+	require.NoError(t, err)
+	require.Equal(t, 0, deletedCount)
+
+	var thumbnailsRaw string
+	err = sqliteDB.QueryRow(`SELECT thumbnails FROM file_cache WHERE target_path = ?`, newMasterPath).Scan(&thumbnailsRaw)
+	require.NoError(t, err)
+
+	var thumbnails []struct {
+		Path string `json:"path"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(thumbnailsRaw), &thumbnails))
+	require.Len(t, thumbnails, 3)
+
+	paths := make([]string, 0, len(thumbnails))
+	for _, thumb := range thumbnails {
+		paths = append(paths, thumb.Path)
+	}
+	require.ElementsMatch(t, []string{oldThumbAPath, oldThumbBPath, movedOldMasterPath}, paths)
 }

@@ -211,8 +211,7 @@ func (c *importCoordinator) commitReservation(reservation *importReservation) {
 				log.Printf("Keeping both files because old master [%s] could not be moved to thumbnails", reservation.committedMatchPath)
 			} else {
 				thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
-				c.cacheManager.DeleteEntry(reservation.committedMatchPath)
-				c.cacheManager.AppendThumbnailToMaster(reservation.finalPath, thumbPath, thumbMeta)
+				c.cacheManager.PromoteMaster(reservation.finalPath, reservation.committedMatchPath, thumbPath, thumbMeta)
 			}
 		}
 	}
