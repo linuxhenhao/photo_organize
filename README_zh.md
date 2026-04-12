@@ -58,8 +58,9 @@ go build -o photo-organizer ./cmd/photo-organizer
 ### 4. 启动 Web UI 进行去重
 启动交互式 Web 界面来解决视觉重复项。
 ```bash
-./photo-organizer serve -dest /路径/到/整理后的文件夹 -port 8080
+./photo-organizer serve -dest /路径/到/整理后的文件夹 -host 0.0.0.0 -port 8080
 ```
+默认绑定到 `127.0.0.1`。如需监听其他网卡，可通过 `-host` 指定具体 IP，例如 `0.0.0.0`。
 
 ## 开发相关
 - **测试数据**: 使用 `test_data/` 进行本地实验。

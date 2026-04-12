@@ -42,8 +42,9 @@ func writeJPEG(t *testing.T, path string, width int, height int, fill color.RGBA
 	return buf.Bytes()
 }
 
-func TestListenAddrUsesLoopback(t *testing.T) {
-	require.Equal(t, "127.0.0.1:8080", listenAddr(8080))
+func TestListenAddrUsesConfiguredHost(t *testing.T) {
+	require.Equal(t, "127.0.0.1:8080", listenAddr("127.0.0.1", 8080))
+	require.Equal(t, "0.0.0.0:9090", listenAddr("0.0.0.0", 9090))
 }
 
 func TestHandleImageServeRejectsPathEscape(t *testing.T) {

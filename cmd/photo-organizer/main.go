@@ -56,7 +56,9 @@ func main() {
 
 	serveCmd := flag.NewFlagSet("serve", flag.ExitOnError)
 	serveCmd.StringVar(&destDir, "dest", "", "Target directory containing deduplicated items and cache.db")
+	var serveHost string
 	var servePort int
+	serveCmd.StringVar(&serveHost, "host", "127.0.0.1", "IP address to bind the web server to")
 	serveCmd.IntVar(&servePort, "port", 8080, "Port for the web server")
 
 	if len(os.Args) < 2 {
@@ -125,7 +127,7 @@ func main() {
 		defer cm.Close()
 
 		server := web.NewWebServer(cm, destDir)
-		if err := server.Start(servePort, sqliteDB); err != nil {
+		if err := server.Start(serveHost, servePort, sqliteDB); err != nil {
 			log.Fatalf("Web Server failed: %v", err)
 		}
 	default:

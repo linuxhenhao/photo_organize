@@ -57,8 +57,8 @@ func NewWebServer(cm *target.CacheManager, destDir string) *WebServer {
 	}
 }
 
-func listenAddr(port int) string {
-	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+func listenAddr(host string, port int) string {
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 func pathWithinRoot(root string, candidate string) bool {
@@ -329,8 +329,8 @@ func extractPreviewForBrowser(path string) ([]byte, string, error) {
 	return nil, "", fmt.Errorf("no embedded preview found for %s", path)
 }
 
-// Start API server on the given port
-func (ws *WebServer) Start(port int, db *sql.DB) error {
+// Start API server on the given host and port.
+func (ws *WebServer) Start(host string, port int, db *sql.DB) error {
 	ws.db = db
 	mux := http.NewServeMux()
 
@@ -342,7 +342,7 @@ func (ws *WebServer) Start(port int, db *sql.DB) error {
 	mux.HandleFunc("/api/resolve", ws.handleResolveGroup)
 	mux.HandleFunc("/image", ws.handleImageServe)
 
-	addr := listenAddr(port)
+	addr := listenAddr(host, port)
 	log.Printf("Web UI for Deduplication is running at: http://%s/static/", addr)
 	return http.ListenAndServe(addr, mux)
 }

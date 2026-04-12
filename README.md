@@ -58,8 +58,9 @@ Pre-index an existing organized directory to avoid re-calculating hashes during 
 ### 4. Serve Web UI for Deduplication
 Launch the interactive web interface to resolve visual duplicates.
 ```bash
-./photo-organizer serve -dest /path/to/organized_photos -port 8080
+./photo-organizer serve -dest /path/to/organized_photos -host 0.0.0.0 -port 8080
 ```
+The server binds to `127.0.0.1` by default. Set `-host` to a specific IP such as `0.0.0.0` to listen on another interface.
 
 ## Development
 - **Test Data**: Use `test_data/` for local experimentation.
