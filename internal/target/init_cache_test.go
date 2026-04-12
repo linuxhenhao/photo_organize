@@ -1,6 +1,7 @@
 package target
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"image"
@@ -248,4 +249,64 @@ func TestInitTargetDirCacheMoveDuplicatesDoesNotPublishMemoryStateOnDBFailure(t 
 	require.False(t, cm.IsCached(path))
 	_, err = os.Stat(path)
 	require.NoError(t, err)
+}
+
+func TestInitTargetDirCacheWithContextStopsBeforeMoveOnCancellation(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "initcache_move_cancel")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	bigPath := filepath.Join(tempDir, "2024", "01", "01", "a-big.jpg")
+	smallPath := filepath.Join(tempDir, "2024", "02", "03", "b-small.jpg")
+	writeJPEGFixturePair(t, bigPath, smallPath)
+
+	bigStat, err := os.Stat(bigPath)
+	require.NoError(t, err)
+	smallStat, err := os.Stat(smallPath)
+	require.NoError(t, err)
+
+	bigHash, err := hasher.CalculateHash(bigPath)
+	require.NoError(t, err)
+	bigPHash, err := hasher.CalculatePHash(bigPath)
+	require.NoError(t, err)
+	bigMeta := metadata.ExtractImageMetaJson(bigPath)
+
+	smallHash, err := hasher.CalculateHash(smallPath)
+	require.NoError(t, err)
+	smallPHash, err := hasher.CalculatePHash(smallPath)
+	require.NoError(t, err)
+	smallMeta := metadata.ExtractImageMetaJson(smallPath)
+
+	cm, err := NewCacheManager(tempDir, 1)
+	require.NoError(t, err)
+	defer cm.Close()
+
+	_, err = cm.db.Exec(`
+		INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails)
+		VALUES (?, ?, ?, ?, ?, '[]'),
+		       (?, ?, ?, ?, ?, '[]')
+	`,
+		bigPath, bigHash, hasher.PHashToString(bigPHash), bigStat.Size(), bigMeta,
+		smallPath, smallHash, hasher.PHashToString(smallPHash), smallStat.Size(), smallMeta,
+	)
+	require.NoError(t, err)
+	cm.SetEntryMemoryWithPresence(bigPath, bigHash, bigPHash, true, bigStat.Size(), bigMeta)
+	cm.SetEntryMemoryWithPresence(smallPath, smallHash, smallPHash, true, smallStat.Size(), smallMeta)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	InitTargetDirCacheWithContext(ctx, tempDir, cm, InitCacheOptions{MoveDuplicates: true})
+
+	_, err = os.Stat(bigPath)
+	require.NoError(t, err)
+	_, err = os.Stat(smallPath)
+	require.NoError(t, err)
+	_, err = os.Stat(filepath.Join(tempDir, "thumbnails"))
+	require.True(t, os.IsNotExist(err))
+
+	var count int
+	err = cm.db.QueryRow(`SELECT COUNT(*) FROM file_cache`).Scan(&count)
+	require.NoError(t, err)
+	require.Equal(t, 2, count)
 }

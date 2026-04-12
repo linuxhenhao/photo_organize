@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	_ "modernc.org/sqlite" // Ensure sqlite driver is loaded
 
@@ -96,7 +99,11 @@ func main() {
 			log.Fatalf("Failed to initialize target directory cache: %v", err)
 		}
 		defer cacheManager.Close()
-		target.InitTargetDirCacheWithOptions(destDir, cacheManager, target.InitCacheOptions{
+
+		ctx, stopSignals := newInitCacheContext()
+		defer stopSignals()
+
+		target.InitTargetDirCacheWithContext(ctx, destDir, cacheManager, target.InitCacheOptions{
 			MoveDuplicates: moveDuplicates,
 		})
 	case "serve":
@@ -123,5 +130,38 @@ func main() {
 		}
 	default:
 		log.Fatalf("Invalid command: %s\nUsage: photo-organizer <command> [options]", os.Args[1])
+	}
+}
+
+func newInitCacheContext() (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	signals := make(chan os.Signal, 2)
+	done := make(chan struct{})
+
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		interrupts := 0
+		for {
+			select {
+			case <-done:
+				return
+			case sig := <-signals:
+				interrupts++
+				if interrupts == 1 {
+					log.Printf("Received %s, stopping initcache at the next safe point. Press Ctrl-C again to force exit.", sig)
+					cancel()
+					continue
+				}
+				log.Printf("Received %s again, forcing exit.", sig)
+				os.Exit(130)
+			}
+		}
+	}()
+
+	return ctx, func() {
+		close(done)
+		signal.Stop(signals)
+		cancel()
 	}
 }

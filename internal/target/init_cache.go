@@ -1,8 +1,10 @@
 package target
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -62,43 +64,61 @@ type preparedTargetFile struct {
 
 // InitTargetDirCache defaults to read-only cache refresh.
 func InitTargetDirCache(targetDir string, cm *CacheManager) {
-	InitTargetDirCacheWithOptions(targetDir, cm, InitCacheOptions{})
+	InitTargetDirCacheWithContext(context.Background(), targetDir, cm, InitCacheOptions{})
 }
 
 // InitTargetDirCacheWithOptions refreshes cache state and optionally moves duplicate files.
 func InitTargetDirCacheWithOptions(targetDir string, cm *CacheManager, options InitCacheOptions) {
+	InitTargetDirCacheWithContext(context.Background(), targetDir, cm, options)
+}
+
+// InitTargetDirCacheWithContext refreshes cache state and optionally moves duplicate files.
+func InitTargetDirCacheWithContext(ctx context.Context, targetDir string, cm *CacheManager, options InitCacheOptions) {
 	mode := "read-only"
 	if options.MoveDuplicates {
 		mode = "move-duplicates"
 	}
 	log.Printf("Initializing cache for target directory: %s (%s mode)", targetDir, mode)
 
-	paths, thumbnailPaths, err := collectTargetPaths(targetDir)
+	paths, thumbnailPaths, err := collectTargetPaths(ctx, targetDir)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		log.Printf("Error walking target directory %s: %v", targetDir, err)
 		return
 	}
 
-	rows, err := loadFileCacheRows(cm.db)
+	rows, err := loadFileCacheRows(ctx, cm.db)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		log.Printf("Failed to load existing cache rows: %v", err)
 		return
 	}
 
 	if options.MoveDuplicates {
-		initTargetDirCacheMove(targetDir, paths, thumbnailPaths, rows, cm)
+		if err := initTargetDirCacheMove(ctx, targetDir, paths, thumbnailPaths, rows, cm); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("Failed duplicate-moving cache initialization: %v", err)
+		}
 		return
 	}
 
-	initTargetDirCacheReadOnly(paths, thumbnailPaths, rows, cm)
+	if err := initTargetDirCacheReadOnly(ctx, paths, thumbnailPaths, rows, cm); err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("Failed read-only cache initialization: %v", err)
+	}
 }
 
-func collectTargetPaths(targetDir string) ([]string, []string, error) {
+func collectTargetPaths(ctx context.Context, targetDir string) ([]string, []string, error) {
 	thumbnailRoot := filepath.Join(targetDir, "thumbnails")
 	paths := make([]string, 0)
 	thumbnailPaths := make([]string, 0)
 
 	err := filepath.Walk(targetDir, func(path string, info os.FileInfo, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
 			return nil
 		}
@@ -121,6 +141,9 @@ func collectTargetPaths(targetDir string) ([]string, []string, error) {
 
 	if stat, err := os.Stat(thumbnailRoot); err == nil && stat.IsDir() {
 		err = filepath.Walk(thumbnailRoot, func(path string, info os.FileInfo, err error) error {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			if err != nil {
 				return nil
 			}
@@ -140,8 +163,8 @@ func collectTargetPaths(targetDir string) ([]string, []string, error) {
 	return paths, thumbnailPaths, nil
 }
 
-func loadFileCacheRows(db *sql.DB) (map[string]fileCacheRow, error) {
-	rows, err := db.Query(`SELECT target_path, mmh3_hash, phash, size, metadata, thumbnails FROM file_cache`)
+func loadFileCacheRows(ctx context.Context, db *sql.DB) (map[string]fileCacheRow, error) {
+	rows, err := db.QueryContext(ctx, `SELECT target_path, mmh3_hash, phash, size, metadata, thumbnails FROM file_cache`)
 	if err != nil {
 		return nil, err
 	}
@@ -149,6 +172,9 @@ func loadFileCacheRows(db *sql.DB) (map[string]fileCacheRow, error) {
 
 	result := make(map[string]fileCacheRow)
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var path, mmh3, phash, metadataStr, thumbnails string
 		var size int64
 		if err := rows.Scan(&path, &mmh3, &phash, &size, &metadataStr, &thumbnails); err != nil {
@@ -235,13 +261,13 @@ func buildTargetFile(path string, stat os.FileInfo, row fileCacheRow, exists boo
 	return file, nil
 }
 
-func prepareTargetFiles(paths []string, rows map[string]fileCacheRow, refreshOnly bool) []preparedTargetFile {
+func prepareTargetFiles(ctx context.Context, paths []string, rows map[string]fileCacheRow, refreshOnly bool) []preparedTargetFile {
 	results := make([]preparedTargetFile, len(paths))
 	if len(paths) == 0 {
 		return results
 	}
 
-	jobs := make(chan int, len(paths))
+	jobs := make(chan int)
 	workerCount := initCacheWorkers
 	if workerCount > len(paths) {
 		workerCount = len(paths)
@@ -252,7 +278,21 @@ func prepareTargetFiles(paths []string, rows map[string]fileCacheRow, refreshOnl
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for idx := range jobs {
+			for {
+				var idx int
+				var ok bool
+				select {
+				case <-ctx.Done():
+					return
+				case idx, ok = <-jobs:
+					if !ok {
+						return
+					}
+					if ctx.Err() != nil {
+						return
+					}
+				}
+
 				path := paths[idx]
 				prepared := preparedTargetFile{Path: path}
 
@@ -285,17 +325,26 @@ func prepareTargetFiles(paths []string, rows map[string]fileCacheRow, refreshOnl
 	}
 
 	for idx := range paths {
-		jobs <- idx
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return results
+		case jobs <- idx:
+		}
 	}
 	close(jobs)
 	wg.Wait()
 	return results
 }
 
-func initTargetDirCacheReadOnly(paths []string, thumbnailPaths []string, rows map[string]fileCacheRow, cm *CacheManager) {
+func initTargetDirCacheReadOnly(ctx context.Context, paths []string, thumbnailPaths []string, rows map[string]fileCacheRow, cm *CacheManager) error {
 	var refreshed int
-	prepared := prepareTargetFiles(paths, rows, true)
+	prepared := prepareTargetFiles(ctx, paths, rows, true)
 	for _, entry := range prepared {
+		if err := stopInitCacheAtSafePoint(ctx, "before refreshing the next cache entry"); err != nil {
+			return err
+		}
 		if entry.Skip {
 			continue
 		}
@@ -320,17 +369,27 @@ func initTargetDirCacheReadOnly(paths []string, thumbnailPaths []string, rows ma
 		refreshed++
 	}
 
-	if err := rebuildThumbnailLinks(thumbnailPaths, rows, cm); err != nil {
+	if err := stopInitCacheAtSafePoint(ctx, "before rebuilding thumbnail links"); err != nil {
+		return err
+	}
+	if err := rebuildThumbnailLinks(ctx, thumbnailPaths, rows, cm); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return err
+		}
 		log.Printf("Failed to rebuild thumbnail links: %v", err)
 	}
 
 	log.Printf("Finished read-only cache initialization. %d entries refreshed.", refreshed)
+	return nil
 }
 
-func initTargetDirCacheMove(targetDir string, paths []string, thumbnailPaths []string, rows map[string]fileCacheRow, cm *CacheManager) {
+func initTargetDirCacheMove(ctx context.Context, targetDir string, paths []string, thumbnailPaths []string, rows map[string]fileCacheRow, cm *CacheManager) error {
 	var processed int
-	prepared := prepareTargetFiles(paths, rows, false)
+	prepared := prepareTargetFiles(ctx, paths, rows, false)
 	for _, entry := range prepared {
+		if err := stopInitCacheAtSafePoint(ctx, "before processing the next duplicate candidate"); err != nil {
+			return err
+		}
 		if entry.Err != nil {
 			log.Printf("Failed to build cache entry for %s: %v", entry.Path, entry.Err)
 			continue
@@ -343,7 +402,15 @@ func initTargetDirCacheMove(targetDir string, paths []string, thumbnailPaths []s
 
 		var match *confirmedDuplicateMatch
 		if file.HasPHash {
-			match = findConfirmedDuplicateMatch(file, rows, cm)
+			var err error
+			match, err = findConfirmedDuplicateMatch(ctx, file, rows, cm)
+			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return err
+				}
+				log.Printf("Failed to confirm duplicates for %s: %v", file.Path, err)
+				continue
+			}
 		}
 
 		if match == nil {
@@ -364,6 +431,9 @@ func initTargetDirCacheMove(targetDir string, paths []string, thumbnailPaths []s
 		}
 
 		if !match.PreferCandidate {
+			if err := stopInitCacheAtSafePoint(ctx, fmt.Sprintf("before moving duplicate %s into thumbnails", file.Path)); err != nil {
+				return err
+			}
 			if err := demoteCurrentFile(targetDir, file, match.Match, rows, cm); err != nil {
 				log.Printf("Failed to move duplicate %s to thumbnails: %v", file.Path, err)
 				continue
@@ -372,6 +442,9 @@ func initTargetDirCacheMove(targetDir string, paths []string, thumbnailPaths []s
 			continue
 		}
 
+		if err := stopInitCacheAtSafePoint(ctx, fmt.Sprintf("before promoting superior duplicate %s", file.Path)); err != nil {
+			return err
+		}
 		if err := promoteCurrentFile(targetDir, file, match.Match, rows, cm); err != nil {
 			log.Printf("Failed to promote superior duplicate %s: %v", file.Path, err)
 			continue
@@ -379,16 +452,26 @@ func initTargetDirCacheMove(targetDir string, paths []string, thumbnailPaths []s
 		processed++
 	}
 
-	if err := rebuildThumbnailLinks(thumbnailPaths, rows, cm); err != nil {
+	if err := stopInitCacheAtSafePoint(ctx, "before rebuilding thumbnail links"); err != nil {
+		return err
+	}
+	if err := rebuildThumbnailLinks(ctx, thumbnailPaths, rows, cm); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return err
+		}
 		log.Printf("Failed to rebuild existing thumbnail links: %v", err)
 	}
 
 	log.Printf("Finished duplicate-moving cache initialization. %d files processed.", processed)
+	return nil
 }
 
-func findConfirmedDuplicateMatch(file targetFile, rows map[string]fileCacheRow, cm *CacheManager) *confirmedDuplicateMatch {
+func findConfirmedDuplicateMatch(ctx context.Context, file targetFile, rows map[string]fileCacheRow, cm *CacheManager) (*confirmedDuplicateMatch, error) {
 	matches := cm.SearchPHash(file.PHash, dedupe.CandidateSearchDistance)
 	for _, candidate := range matches {
+		if err := stopInitCacheAtSafePoint(ctx, fmt.Sprintf("before confirming duplicate candidates for %s", file.Path)); err != nil {
+			return nil, err
+		}
 		if candidate.Path == file.Path {
 			continue
 		}
@@ -414,10 +497,10 @@ func findConfirmedDuplicateMatch(file targetFile, rows map[string]fileCacheRow, 
 			return &confirmedDuplicateMatch{
 				Match:           candidate,
 				PreferCandidate: decision.PreferCandidate,
-			}
+			}, nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 func buildThumbnailPath(baseDir, filePath string) (string, error) {
@@ -561,26 +644,35 @@ func rollbackRename(currentPath, originalPath string) {
 	}
 }
 
-func rebuildThumbnailLinks(thumbnailPaths []string, rows map[string]fileCacheRow, cm *CacheManager) error {
+func rebuildThumbnailLinks(ctx context.Context, thumbnailPaths []string, rows map[string]fileCacheRow, cm *CacheManager) error {
 	if len(thumbnailPaths) == 0 {
 		return nil
 	}
 
 	aggregated := make(map[string][]thumbnailEntry)
 	for masterPath, row := range rows {
+		if err := stopInitCacheAtSafePoint(ctx, "while gathering existing thumbnail links"); err != nil {
+			return err
+		}
 		if row.Thumbnails != "" && row.Thumbnails != "[]" {
 			aggregated[masterPath] = append(aggregated[masterPath], parseThumbnailEntries(row.Thumbnails)...)
 		}
 	}
 
-	preparedThumbs := prepareTargetFiles(thumbnailPaths, nil, false)
+	preparedThumbs := prepareTargetFiles(ctx, thumbnailPaths, nil, false)
 	for _, entry := range preparedThumbs {
+		if err := stopInitCacheAtSafePoint(ctx, "before matching the next thumbnail"); err != nil {
+			return err
+		}
 		if entry.Err != nil || !entry.File.HasPHash {
 			continue
 		}
 
 		file := entry.File
-		match := findConfirmedDuplicateMatch(file, rows, cm)
+		match, err := findConfirmedDuplicateMatch(ctx, file, rows, cm)
+		if err != nil {
+			return err
+		}
 		if match == nil {
 			continue
 		}
@@ -592,6 +684,9 @@ func rebuildThumbnailLinks(thumbnailPaths []string, rows map[string]fileCacheRow
 		)
 	}
 
+	if err := stopInitCacheAtSafePoint(ctx, "before persisting thumbnail links"); err != nil {
+		return err
+	}
 	tx, err := cm.db.Begin()
 	if err != nil {
 		return err
@@ -609,6 +704,14 @@ func rebuildThumbnailLinks(thumbnailPaths []string, rows map[string]fileCacheRow
 	}
 
 	return tx.Commit()
+}
+
+func stopInitCacheAtSafePoint(ctx context.Context, stage string) error {
+	if err := ctx.Err(); err != nil {
+		log.Printf("Stopping initcache at safe point: %s", stage)
+		return err
+	}
+	return nil
 }
 
 func demoteCurrentFile(targetDir string, file targetFile, match hasher.MatchResult, rows map[string]fileCacheRow, cm *CacheManager) error {
