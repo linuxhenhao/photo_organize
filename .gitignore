@@ -3,3 +3,4 @@
 output/
 *.db*
 .comments/
+coverage.out
