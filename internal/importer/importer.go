@@ -7,14 +7,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/linuxhenhao/photo_organize/internal/db"
-	"github.com/linuxhenhao/photo_organize/internal/dedupe"
-	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
 	"github.com/linuxhenhao/photo_organize/internal/target"
 )
@@ -79,180 +76,58 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-func resolveAvailableTargetPath(targetDir, fileName string, cacheManager *target.CacheManager) string {
-	candidate := filepath.Join(targetDir, fileName)
-	if !cacheManager.IsCached(candidate) {
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
-		}
-	}
-
-	ext := filepath.Ext(fileName)
-	nameWithoutExt := strings.TrimSuffix(fileName, ext)
-	suffix := 1
-	for {
-		candidate = filepath.Join(targetDir, fmt.Sprintf("%s-%d%s", nameWithoutExt, suffix, ext))
-		if cacheManager.IsCached(candidate) {
-			suffix++
-			continue
-		}
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
-		}
-		suffix++
-	}
-}
-
-type confirmedImportMatch struct {
-	match           hasher.MatchResult
-	preferCandidate bool
-}
-
-func findConfirmedImportMatch(task ImportTask, sourceMeta string, cacheManager *target.CacheManager, phash uint64) *confirmedImportMatch {
-	matches := cacheManager.SearchPHash(phash, dedupe.CandidateSearchDistance)
-	for _, candidate := range matches {
-		if _, err := os.Stat(candidate.Path); err != nil {
-			log.Printf("Removing stale perceptual match entry for missing path [%s]", candidate.Path)
-			cacheManager.DeleteEntry(candidate.Path)
-			continue
-		}
-
-		existingMeta := metadata.ExtractImageMetaJson(candidate.Path)
-		decision, err := dedupe.EvaluateThumbnailMatch(task.SourcePath, sourceMeta, task.Size, candidate.Path, existingMeta, candidate.Size)
-		if err != nil {
-			if _, statErr := os.Stat(candidate.Path); statErr != nil {
-				log.Printf("Removing stale perceptual match entry for missing path [%s]", candidate.Path)
-				cacheManager.DeleteEntry(candidate.Path)
-				continue
-			}
-			log.Printf("Failed to confirm visual duplicate [%s] against [%s]: %v", task.SourcePath, candidate.Path, err)
-			continue
-		}
-		if decision.Confirmed {
-			return &confirmedImportMatch{
-				match:           candidate,
-				preferCandidate: decision.PreferCandidate,
-			}
-		}
-	}
-
-	return nil
-}
-
-func importWorker(tasks <-chan ImportTask, wg *sync.WaitGroup, successCount *int32, failCount *int32, cacheManager *target.CacheManager) {
+func importWorker(tasks <-chan ImportTask, wg *sync.WaitGroup, successCount *int32, failCount *int32, coordinator *importCoordinator) {
 	defer wg.Done()
 	for task := range tasks {
-		finalTargetPath := resolveAvailableTargetPath(task.TargetDir, task.FileName, cacheManager)
-
-		if cacheManager.IsCached(finalTargetPath) {
-			continue // Perfect name match cached
-		}
-
-		if _, found := cacheManager.FindExactMatch(task.MMH3Hash); found {
-			continue // Perfect file match cached
-		}
-
 		sourceMeta := ""
-		getSourceMeta := func() string {
-			if sourceMeta == "" {
-				sourceMeta = metadata.ExtractImageMetaJson(task.SourcePath)
-			}
-			return sourceMeta
+		if _, hasPHash := parseTaskPHash(task); hasPHash {
+			sourceMeta = metadata.ExtractImageMetaJson(task.SourcePath)
 		}
 
-		var phashValue uint64
-		var hasPHash bool
-		var reservedUnique bool
-		var match *confirmedImportMatch
-		if task.PHash != "" && task.PHash != "UNSUPPORTED" && task.PHash != "NOT_IMAGE" {
-			if pv, parseErr := hasher.StringToPHash(task.PHash); parseErr == nil {
-				phashValue = pv
-				hasPHash = true
-				initialMatch := cacheManager.CheckAndAddPerceptualMatchWithPresence(pv, true, finalTargetPath, task.Size, task.MMH3Hash)
-				if initialMatch == nil {
-					reservedUnique = true
-				} else {
-					match = findConfirmedImportMatch(task, getSourceMeta(), cacheManager, pv)
-					if match == nil {
-						cacheManager.AddEntryWithPresence(finalTargetPath, task.MMH3Hash, phashValue, true, task.Size, "{}")
-						reservedUnique = true
-					}
-				}
-			}
-		}
-
-		if match != nil {
-			_, err := os.Stat(match.match.Path)
-			if err == nil {
-				if match.preferCandidate {
-					cacheManager.AddEntryWithPresence(finalTargetPath, task.MMH3Hash, phashValue, true, task.Size, "{}")
-					if err := copyFile(task.SourcePath, finalTargetPath); err != nil {
-						cacheManager.DeleteEntry(finalTargetPath)
-						log.Printf("Failed to import [%s]: %v", task.SourcePath, err)
-						atomic.AddInt32(failCount, 1)
-						continue
-					}
-
-					log.Printf("Found superior confirmed visual duplicate. Promoting [%s] over [%s].", task.SourcePath, match.match.Path)
-					destDir := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(match.match.Path))))
-					thumbPath := moveFileToThumbnails(destDir, match.match.Path)
-					cacheManager.AddEntryWithPresence(finalTargetPath, task.MMH3Hash, phashValue, true, task.Size, getSourceMeta())
-
-					if thumbPath == match.match.Path {
-						log.Printf("Keeping both files because old master [%s] could not be moved to thumbnails", match.match.Path)
-					} else {
-						thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
-						cacheManager.DeleteEntry(match.match.Path)
-						cacheManager.AppendThumbnailToMaster(finalTargetPath, thumbPath, thumbMeta)
-					}
-				} else {
-					log.Printf("Found confirmed visual duplicate. Rerouting [%s] to thumbnails under [%s].", task.SourcePath, match.match.Path)
-					thumbDir := filepath.Join(targetDirRoot(task.TargetDir), "thumbnails", filepath.Base(filepath.Dir(filepath.Dir(task.TargetDir))), filepath.Base(filepath.Dir(task.TargetDir)), filepath.Base(task.TargetDir))
-					if err := os.MkdirAll(thumbDir, 0755); err != nil {
-						log.Printf("Failed to create thumb dir: %v", err)
-						continue
-					}
-					finalTargetPath = resolveAvailableTargetPath(thumbDir, task.FileName, cacheManager)
-
-					if err := copyFile(task.SourcePath, finalTargetPath); err != nil {
-						log.Printf("Failed to import [%s]: %v", task.SourcePath, err)
-						atomic.AddInt32(failCount, 1)
-						continue
-					}
-
-					cacheManager.AppendThumbnailToMaster(match.match.Path, finalTargetPath, getSourceMeta())
-				}
-			} else {
-				log.Printf("Failed to stat perceptual match [%s]: %v", match.match.Path, err)
-				atomic.AddInt32(failCount, 1)
+		for {
+			plan := coordinator.planTask(task, sourceMeta)
+			switch plan.action {
+			case importPlanSkip:
+				goto nextTask
+			case importPlanWait:
+				<-plan.waitCh
 				continue
 			}
-		} else {
-			if finalTargetPath != filepath.Join(task.TargetDir, task.FileName) {
-				log.Printf("Conflict resolved for [%s], using new name [%s]", task.SourcePath, filepath.Base(finalTargetPath))
+
+			finalTargetPath := plan.reservation.finalPath
+			if err := os.MkdirAll(filepath.Dir(finalTargetPath), 0755); err != nil {
+				coordinator.cancelReservation(plan.reservation)
+				log.Printf("Failed to create directory for [%s]: %v", finalTargetPath, err)
+				atomic.AddInt32(failCount, 1)
+				goto nextTask
 			}
 
-			if !hasPHash {
-				cacheManager.AddEntry(finalTargetPath, task.MMH3Hash, 0, task.Size, "{}")
-				reservedUnique = true
-			}
-		}
-
-		if match == nil {
 			if err := copyFile(task.SourcePath, finalTargetPath); err != nil {
-				if reservedUnique {
-					cacheManager.DeleteEntry(finalTargetPath)
-				}
+				coordinator.cancelReservation(plan.reservation)
 				log.Printf("Failed to import [%s]: %v", task.SourcePath, err)
 				atomic.AddInt32(failCount, 1)
-				continue
+				goto nextTask
 			}
 
-			cacheManager.AddEntryWithPresence(finalTargetPath, task.MMH3Hash, phashValue, hasPHash, task.Size, getSourceMeta())
+			switch plan.action {
+			case importPlanCopyThumbnail:
+				log.Printf("Found confirmed visual duplicate. Rerouting [%s] to thumbnails under [%s].", task.SourcePath, plan.reservation.committedMatchPath)
+			case importPlanPromoteCommitted:
+				log.Printf("Found superior confirmed visual duplicate. Promoting [%s] over [%s].", task.SourcePath, plan.reservation.committedMatchPath)
+			case importPlanCopyMaster:
+				if finalTargetPath != filepath.Join(task.TargetDir, task.FileName) {
+					log.Printf("Conflict resolved for [%s], using new name [%s]", task.SourcePath, filepath.Base(finalTargetPath))
+				}
+			}
+
+			coordinator.commitReservation(plan.reservation)
+			log.Printf("Successfully imported: [%s] -> [%s]", task.SourcePath, finalTargetPath)
+			atomic.AddInt32(successCount, 1)
+			goto nextTask
 		}
 
-		log.Printf("Successfully imported: [%s] -> [%s]", task.SourcePath, finalTargetPath)
-		atomic.AddInt32(successCount, 1)
+	nextTask:
+		continue
 	}
 }
 
@@ -288,10 +163,11 @@ func HandleImport(dbPath string, destDir string) {
 	tasks := make(chan ImportTask, copyWorkers*2)
 	var wg sync.WaitGroup
 	var successCount, failCount int32
+	coordinator := newImportCoordinator(cacheManager)
 
 	for i := 0; i < copyWorkers; i++ {
 		wg.Add(1)
-		go importWorker(tasks, &wg, &successCount, &failCount, cacheManager)
+		go importWorker(tasks, &wg, &successCount, &failCount, coordinator)
 	}
 
 	rows, err := sqliteDB.Query(`

@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/linuxhenhao/photo_organize/internal/hasher"
+	"github.com/linuxhenhao/photo_organize/internal/metadata"
 	"github.com/linuxhenhao/photo_organize/internal/target"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -63,6 +65,7 @@ func TestImportWorkerRollsBackReservedEntryOnCopyFailure(t *testing.T) {
 	cacheManager, err := target.NewCacheManager(tempDir, 1)
 	require.NoError(t, err)
 	defer cacheManager.Close()
+	coordinator := newImportCoordinator(cacheManager)
 
 	tasks := make(chan ImportTask, 1)
 	var wg sync.WaitGroup
@@ -70,7 +73,7 @@ func TestImportWorkerRollsBackReservedEntryOnCopyFailure(t *testing.T) {
 	var failCount int32
 
 	wg.Add(1)
-	go importWorker(tasks, &wg, &successCount, &failCount, cacheManager)
+	go importWorker(tasks, &wg, &successCount, &failCount, coordinator)
 
 	tasks <- ImportTask{
 		SourcePath: filepath.Join(tempDir, "missing.jpg"),
@@ -91,4 +94,76 @@ func TestImportWorkerRollsBackReservedEntryOnCopyFailure(t *testing.T) {
 	_, found := cacheManager.FindExactMatch("missing-hash")
 	require.False(t, found)
 	require.Empty(t, cacheManager.SearchPHash(0xff, 0))
+}
+
+func TestImportCoordinatorWaitsForSimilarInFlightTask(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "photo_organize_import_wait_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	cacheManager, err := target.NewCacheManager(tempDir, 1)
+	require.NoError(t, err)
+	defer cacheManager.Close()
+
+	coordinator := newImportCoordinator(cacheManager)
+	thumbTask := buildFixtureTask(t, filepath.Join("test_data", "source_mock_thumbs", "thumb_2023_05_01.jpg"), tempDir)
+	masterTask := buildFixtureTask(t, filepath.Join("test_data", "source_mock", "img_2023_05_01.jpg"), tempDir)
+
+	firstPlan := coordinator.planTask(thumbTask, metadata.ExtractImageMetaJson(thumbTask.SourcePath))
+	require.Equal(t, importPlanCopyMaster, firstPlan.action)
+
+	secondPlan := coordinator.planTask(masterTask, metadata.ExtractImageMetaJson(masterTask.SourcePath))
+	require.Equal(t, importPlanWait, secondPlan.action)
+	require.NotNil(t, secondPlan.waitCh)
+
+	coordinator.cancelReservation(firstPlan.reservation)
+	select {
+	case <-secondPlan.waitCh:
+	default:
+		t.Fatalf("expected wait channel to be released after cancelling earlier reservation")
+	}
+}
+
+func TestImportCoordinatorDropsMissingCommittedExactMatch(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "photo_organize_import_stale_exact_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	cacheManager, err := target.NewCacheManager(tempDir, 1)
+	require.NoError(t, err)
+	defer cacheManager.Close()
+
+	task := buildFixtureTask(t, filepath.Join("test_data", "source_mock", "img_2023_05_01.jpg"), tempDir)
+	cacheManager.AddEntryWithPresence(filepath.Join(tempDir, "missing.jpg"), task.MMH3Hash, 0, false, task.Size, "{}")
+
+	coordinator := newImportCoordinator(cacheManager)
+	plan := coordinator.planTask(task, metadata.ExtractImageMetaJson(task.SourcePath))
+	require.Equal(t, importPlanCopyMaster, plan.action)
+	require.NotNil(t, plan.reservation)
+
+	_, found := cacheManager.FindExactMatch(task.MMH3Hash)
+	require.False(t, found)
+
+	coordinator.cancelReservation(plan.reservation)
+}
+
+func buildFixtureTask(t *testing.T, relPath string, tempDir string) ImportTask {
+	t.Helper()
+
+	sourcePath := filepath.Clean(filepath.Join("..", "..", relPath))
+	stat, err := os.Stat(sourcePath)
+	require.NoError(t, err)
+	mmh3, err := hasher.CalculateHash(sourcePath)
+	require.NoError(t, err)
+	phash, err := hasher.CalculatePHash(sourcePath)
+	require.NoError(t, err)
+
+	return ImportTask{
+		SourcePath: sourcePath,
+		TargetDir:  filepath.Join(tempDir, "2023", "05", "01"),
+		FileName:   filepath.Base(sourcePath),
+		Size:       stat.Size(),
+		MMH3Hash:   mmh3,
+		PHash:      hasher.PHashToString(phash),
+	}
 }
