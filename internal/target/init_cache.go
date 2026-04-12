@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/linuxhenhao/photo_organize/internal/dedupe"
+	"github.com/linuxhenhao/photo_organize/internal/fsutil"
 	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
 )
@@ -646,6 +647,9 @@ func demoteCurrentFile(targetDir string, file targetFile, match hasher.MatchResu
 
 	cm.DeleteEntryMemory(file.Path)
 	delete(rows, file.Path)
+	if err := fsutil.RemoveEmptyParentDirs(filepath.Dir(file.Path), targetDir); err != nil {
+		log.Printf("Failed to remove empty directory for %s: %v", file.Path, err)
+	}
 	matchRow := rows[match.Path]
 	matchRow.Thumbnails = thumbJSON
 	rows[match.Path] = matchRow
@@ -689,6 +693,9 @@ func promoteCurrentFile(targetDir string, file targetFile, match hasher.MatchRes
 	cm.DeleteEntryMemory(match.Path)
 	cm.SetEntryMemoryWithPresence(file.Path, file.MMH3, file.PHash, file.HasPHash, file.Size, file.Metadata)
 	delete(rows, match.Path)
+	if err := fsutil.RemoveEmptyParentDirs(filepath.Dir(match.Path), targetDir); err != nil {
+		log.Printf("Failed to remove empty directory for %s: %v", match.Path, err)
+	}
 	rows[file.Path] = fileCacheRow{
 		MMH3:       file.MMH3,
 		PHash:      file.PHashStr,

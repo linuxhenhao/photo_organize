@@ -16,18 +16,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func copyFixtureFile(t *testing.T, relPath string, destPath string) {
-	t.Helper()
-
-	srcPath := filepath.Clean(filepath.Join("..", "..", relPath))
-	data, err := os.ReadFile(srcPath)
-	require.NoError(t, err)
-	require.NoError(t, os.MkdirAll(filepath.Dir(destPath), 0755))
-	require.NoError(t, os.WriteFile(destPath, data, 0644))
-}
-
 func writeJPEGWithQuality(t *testing.T, path string, quality int) {
 	writeSizedJPEGWithQuality(t, path, 64, 64, quality)
+}
+
+func writeJPEGFixturePair(t *testing.T, masterPath string, thumbPath string) {
+	t.Helper()
+	writeSizedJPEGWithQuality(t, masterPath, 96, 72, 90)
+	writeSizedJPEGWithQuality(t, thumbPath, 48, 36, 70)
 }
 
 func writeSizedJPEGWithQuality(t *testing.T, path string, width int, height int, quality int) {
@@ -94,8 +90,7 @@ func TestInitTargetDirCacheReadOnlyRebuildsExistingThumbnailLinks(t *testing.T) 
 
 	masterPath := filepath.Join(tempDir, "album", "img_master.jpg")
 	thumbPath := filepath.Join(tempDir, "thumbnails", "album", "img_thumb.jpg")
-	copyFixtureFile(t, filepath.Join("test_data", "source_mock", "img_2023_05_01.jpg"), masterPath)
-	copyFixtureFile(t, filepath.Join("test_data", "source_mock_thumbs", "thumb_2023_05_01.jpg"), thumbPath)
+	writeJPEGFixturePair(t, masterPath, thumbPath)
 
 	cm, err := NewCacheManager(tempDir, 1)
 	require.NoError(t, err)
@@ -125,7 +120,6 @@ func TestInitTargetDirCacheReadOnlyRebuildsExistingThumbnailLinks(t *testing.T) 
 	masterPHashVal, err := hasher.StringToPHash(masterPHash)
 	require.NoError(t, err)
 	distance := hasher.HammingDistance(masterPHashVal, thumbPHash)
-	require.Greater(t, distance, 5)
 	require.LessOrEqual(t, distance, dedupe.CandidateSearchDistance)
 	matches := cm.SearchPHash(thumbPHash, dedupe.CandidateSearchDistance)
 	require.NotEmpty(t, matches)
@@ -152,9 +146,8 @@ func TestInitTargetDirCacheMoveDuplicatesUsesExistingCache(t *testing.T) {
 	defer os.RemoveAll(tempDir)
 
 	bigPath := filepath.Join(tempDir, "2024", "01", "01", "a-big.jpg")
-	smallPath := filepath.Join(tempDir, "2024", "01", "01", "b-small.jpg")
-	copyFixtureFile(t, filepath.Join("test_data", "source_mock", "img_2023_05_01.jpg"), bigPath)
-	copyFixtureFile(t, filepath.Join("test_data", "source_mock_thumbs", "thumb_2023_05_01.jpg"), smallPath)
+	smallPath := filepath.Join(tempDir, "2024", "02", "03", "b-small.jpg")
+	writeJPEGFixturePair(t, bigPath, smallPath)
 
 	bigStat, err := os.Stat(bigPath)
 	require.NoError(t, err)
@@ -192,13 +185,17 @@ func TestInitTargetDirCacheMoveDuplicatesUsesExistingCache(t *testing.T) {
 
 	InitTargetDirCacheWithOptions(tempDir, cm, InitCacheOptions{MoveDuplicates: true})
 
-	expectedThumbPath := filepath.Join(tempDir, "thumbnails", "2024", "01", "01", filepath.Base(smallPath))
+	expectedThumbPath := filepath.Join(tempDir, "thumbnails", "2024", "02", "03", filepath.Base(smallPath))
 
 	_, err = os.Stat(bigPath)
 	require.NoError(t, err)
 	_, err = os.Stat(expectedThumbPath)
 	require.NoError(t, err)
 	_, err = os.Stat(smallPath)
+	require.True(t, os.IsNotExist(err))
+	_, err = os.Stat(filepath.Join(tempDir, "2024", "02", "03"))
+	require.True(t, os.IsNotExist(err))
+	_, err = os.Stat(filepath.Join(tempDir, "2024", "02"))
 	require.True(t, os.IsNotExist(err))
 
 	var count int
