@@ -9,21 +9,36 @@ import (
 	"io"
 	"math"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 
 	"github.com/corona10/goimagehash"
+	projectexiftool "github.com/linuxhenhao/photo_organize/internal/exiftool"
 	"github.com/twmb/murmur3"
 )
 
 func mimeTypeWithExiftool(path string) (string, error) {
-	cmd := exec.Command("exiftool", "-MIMEType", "-s3", "-fast", path)
-	out, err := cmd.Output()
+	pool, err := projectexiftool.SharedPool()
 	if err != nil {
 		return "", err
 	}
-	return strings.ToLower(strings.TrimSpace(string(out))), nil
+
+	results, err := pool.Extract([]string{path}, []string{"MIMEType"}, projectexiftool.QueryOptions{
+		Fast:              true,
+		IgnoreMinorErrors: true,
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(results) != 1 {
+		return "", fmt.Errorf("unexpected exiftool result count for %s: %d", path, len(results))
+	}
+
+	mimeType, ok := results[0].GetString("MIMEType")
+	if !ok {
+		return "", fmt.Errorf("MIMEType missing for %s", path)
+	}
+	return strings.ToLower(strings.TrimSpace(mimeType)), nil
 }
 
 // CanVisualHash reports whether a file should participate in image-only visual hashing.
@@ -53,8 +68,37 @@ func IsImageForPHash(path string) bool {
 
 // extractThumbnail attempts to extract the embedded thumbnail using exiftool.
 func extractThumbnail(path string) ([]byte, error) {
-	cmd := exec.Command("exiftool", "-b", "-ThumbnailImage", "-q", path)
-	return cmd.Output()
+	pool, err := projectexiftool.SharedPool()
+	if err != nil {
+		return nil, err
+	}
+
+	results, err := pool.Extract([]string{path}, []string{
+		"PreviewImage",
+		"JpgFromRaw",
+		"ThumbnailImage",
+	}, projectexiftool.QueryOptions{
+		Binary:            true,
+		IgnoreMinorErrors: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(results) != 1 {
+		return nil, fmt.Errorf("unexpected exiftool result count for %s: %d", path, len(results))
+	}
+
+	for _, key := range []string{"PreviewImage", "JpgFromRaw", "ThumbnailImage"} {
+		data, ok, err := results[0].GetBytes(key)
+		if err != nil {
+			return nil, err
+		}
+		if ok && len(data) > 0 {
+			return data, nil
+		}
+	}
+
+	return nil, fmt.Errorf("no embedded preview found for %s", path)
 }
 
 func decodeImageForHash(path string) (image.Image, error) {

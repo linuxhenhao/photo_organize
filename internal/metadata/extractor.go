@@ -7,9 +7,10 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
+
+	projectexiftool "github.com/linuxhenhao/photo_organize/internal/exiftool"
 )
 
 // MediaMeta holds basic dimensions, size and creation time of a media file (image or video)
@@ -40,50 +41,48 @@ func ExtractImageMeta(fullPath string) MediaMeta {
 		}
 	}
 
-	// 2. Fallback or augment with exiftool for videos, complex image formats, or metadata
-	// Use -s instead of -s -s -s to keep the "Key : Value" format for parsing.
-	cmd := exec.Command("exiftool", "-s",
-		"-ImageWidth", "-ImageHeight", "-VideoSize",
-		"-CreateDate", "-DateTimeOriginal", "-MediaCreateDate",
-		"-fast", fullPath)
-	output, err := cmd.Output()
+	// 2. Fallback or augment with the shared exiftool pool for videos, complex image formats, or metadata.
+	pool, err := projectexiftool.SharedPool()
 	if err == nil {
-		lines := strings.Split(string(output), "\n")
-		for _, line := range lines {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) < 2 {
-				continue
+		results, queryErr := pool.Extract([]string{fullPath}, []string{
+			"ImageWidth",
+			"ImageHeight",
+			"VideoSize",
+			"CreateDate",
+			"DateTimeOriginal",
+			"MediaCreateDate",
+		}, projectexiftool.QueryOptions{
+			Fast:              true,
+			IgnoreMinorErrors: true,
+			DateFormat:        "%Y-%m-%d %H:%M:%S",
+		})
+		if queryErr == nil && len(results) == 1 {
+			if width, ok := results[0].GetInt("ImageWidth"); ok && meta.Width == 0 {
+				meta.Width = width
 			}
-			key := strings.TrimSpace(parts[0])
-			val := strings.TrimSpace(parts[1])
+			if height, ok := results[0].GetInt("ImageHeight"); ok && meta.Height == 0 {
+				meta.Height = height
+			}
 
-			switch key {
-			case "ImageWidth":
-				if w, err := strconv.Atoi(val); err == nil && meta.Width == 0 {
-					meta.Width = w
-				}
-			case "ImageHeight":
-				if h, err := strconv.Atoi(val); err == nil && meta.Height == 0 {
-					meta.Height = h
-				}
-			case "VideoSize":
-				// Often in format "1920x1080"
-				dims := strings.Split(val, "x")
+			if value, ok := results[0].GetString("VideoSize"); ok {
+				dims := strings.Split(value, "x")
 				if len(dims) == 2 {
-					if w, err := strconv.Atoi(dims[0]); err == nil && meta.Width == 0 {
+					if w, err := strconv.Atoi(strings.TrimSpace(dims[0])); err == nil && meta.Width == 0 {
 						meta.Width = w
 					}
-					if h, err := strconv.Atoi(dims[1]); err == nil && meta.Height == 0 {
+					if h, err := strconv.Atoi(strings.TrimSpace(dims[1])); err == nil && meta.Height == 0 {
 						meta.Height = h
 					}
 				}
-			case "CreateDate", "DateTimeOriginal", "MediaCreateDate":
-				// Exiftool often returns "2023:01:01 12:00:00". Normalize to "2023-01-01 12:00:00"
-				normalized := strings.Replace(val, ":", "-", 2)
-				// Prefer non-zero exif dates over the filesystem modtime
-				if !strings.Contains(val, "0000:00:00") && val != "" {
-					meta.CreateTime = normalized
+			}
+
+			for _, key := range []string{"CreateDate", "DateTimeOriginal", "MediaCreateDate"} {
+				value, ok := results[0].GetString(key)
+				if !ok || value == "" || strings.Contains(value, "0000:00:00") {
+					continue
 				}
+				meta.CreateTime = value
+				break
 			}
 		}
 	}

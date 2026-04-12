@@ -1,17 +1,17 @@
 package metadata
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	projectexiftool "github.com/linuxhenhao/photo_organize/internal/exiftool"
 )
 
 // validateDate checks if the given year, month, and day form a valid date
@@ -79,46 +79,47 @@ func ExtractTimeFromFilename(path string) (time.Time, error) {
 func GetMetadata(path string, fi os.FileInfo) (time.Time, string, error) {
 	var mimeType string
 
-	cmd := exec.Command("exiftool", "-m", "-d", "%Y-%m-%dT%H:%M:%S",
-		"-CreateDate", "-DateTimeOriginal", "-MediaCreateDate", "-TrackCreateDate",
-		"-SubSecCreateDate", "-SubSecDateTimeOriginal", "-MIMEType",
-		"-T", "-fast", path)
-	output, err := cmd.Output()
-
+	pool, err := projectexiftool.SharedPool()
 	if err == nil {
-		fields := strings.Split(string(bytes.TrimSpace(output)), "\t")
-		
-		if len(fields) > 0 {
-			mimeType = strings.TrimSpace(fields[len(fields)-1])
-			if mimeType == "-" {
-				mimeType = ""
+		results, queryErr := pool.Extract([]string{path}, []string{
+			"MIMEType",
+			"CreateDate",
+			"DateTimeOriginal",
+			"MediaCreateDate",
+			"TrackCreateDate",
+			"SubSecCreateDate",
+			"SubSecDateTimeOriginal",
+		}, projectexiftool.QueryOptions{
+			Fast:              true,
+			IgnoreMinorErrors: true,
+			DateFormat:        "%Y-%m-%dT%H:%M:%S",
+		})
+		if queryErr == nil && len(results) == 1 {
+			if value, ok := results[0].GetString("MIMEType"); ok && value != "-" {
+				mimeType = strings.TrimSpace(value)
 			}
-		}
 
-		for i, field := range fields {
-			if i == len(fields)-1 {
-				continue
-			}
-			if field == "-" || field == "" {
-				continue
-			}
-			layouts := []string{
-				"2006-01-02T15:04:05",
-			}
-			for _, layout := range layouts {
-				if t, errParseLocal := time.ParseInLocation(layout, field, time.Local); errParseLocal == nil {
+			for _, key := range []string{
+				"CreateDate",
+				"DateTimeOriginal",
+				"MediaCreateDate",
+				"TrackCreateDate",
+				"SubSecCreateDate",
+				"SubSecDateTimeOriginal",
+			} {
+				value, ok := results[0].GetString(key)
+				if !ok || value == "" || value == "-" {
+					continue
+				}
+				if t, errParseLocal := time.ParseInLocation("2006-01-02T15:04:05", value, time.Local); errParseLocal == nil {
 					return t, mimeType, nil
 				}
 			}
+		} else if queryErr != nil {
+			log.Printf("exiftool pool query failed for [%s]: %v. Trying other methods.", path, queryErr)
 		}
 	} else {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			log.Printf("exiftool command failed for [%s] with exit code %d. Stderr: %s. Trying other methods.", path, exitErr.ExitCode(), string(exitErr.Stderr))
-		} else if errors.Is(err, exec.ErrNotFound) {
-			log.Printf("exiftool command not found. Ensure it's installed and in PATH. Skipping exiftool for [%s].", path)
-		} else {
-			log.Printf("exiftool execution failed for [%s]: %v. Trying other methods.", path, err)
-		}
+		log.Printf("exiftool pool unavailable for [%s]: %v. Trying other methods.", path, err)
 	}
 
 	if t, err := ExtractTimeFromFilename(path); err == nil {

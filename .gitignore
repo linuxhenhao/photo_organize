@@ -1,0 +1,6 @@
+.codex
+.codex/
+output/
+*.db*
+.comments/
+coverage.out

@@ -1,6 +1,7 @@
 package dedupe
 
 import (
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
 	"github.com/stretchr/testify/require"
 )
@@ -53,6 +55,28 @@ func TestEvaluateThumbnailMatchConfirmsRepoThumbnail(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, decision.Confirmed)
 	require.False(t, decision.PreferCandidate)
+}
+
+func TestCandidateSearchDistanceCoversRepoMockThumbnails(t *testing.T) {
+	maxDistance := 0
+
+	for i := 1; i <= 5; i++ {
+		masterPath := filepath.Clean(filepath.Join("..", "..", "test_data", "source_mock", fmt.Sprintf("img_2023_05_%02d.jpg", i)))
+		thumbPath := filepath.Clean(filepath.Join("..", "..", "test_data", "source_mock_thumbs", fmt.Sprintf("thumb_2023_05_%02d.jpg", i)))
+
+		masterHash, err := hasher.CalculatePHash(masterPath)
+		require.NoError(t, err)
+		thumbHash, err := hasher.CalculatePHash(thumbPath)
+		require.NoError(t, err)
+
+		distance := hasher.HammingDistance(masterHash, thumbHash)
+		if distance > maxDistance {
+			maxDistance = distance
+		}
+		require.LessOrEqual(t, distance, CandidateSearchDistance, "pair %d should be reachable in stage-1 recall", i)
+	}
+
+	require.Greater(t, maxDistance, 12, "repo fixtures should guard against regressing to the old 12-bit cutoff")
 }
 
 func TestEvaluateThumbnailMatchRejectsAspectRatioMismatch(t *testing.T) {

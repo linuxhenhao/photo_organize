@@ -26,14 +26,18 @@ type CacheInfo struct {
 
 // cacheEntry represents a database update task for the CacheManager background worker.
 type cacheEntry struct {
-	path      string
-	mmh3      string
-	phash     string // String representation for the DB
-	size      int64
-	metadata  string
-	thumbJson string
-	isAppend  bool
-	isDelete  bool
+	path        string
+	mmh3        string
+	phash       string // String representation for the DB
+	size        int64
+	metadata    string
+	thumbJson   string
+	thumbPath   string
+	thumbMeta   string
+	promoteFrom string
+	isAppend    bool
+	isDelete    bool
+	isPromote   bool
 }
 
 // CacheManager handles the MMH3 Hash and PHash cache operations,
@@ -236,6 +240,34 @@ func (cm *CacheManager) runWorker() {
 			} else if entry.isAppend {
 				_, err = tx.Exec(`UPDATE file_cache SET thumbnails = json_insert(CASE WHEN thumbnails = '' OR thumbnails IS NULL THEN '[]' ELSE thumbnails END, '$[#]', json(?)) WHERE target_path = ?`,
 					entry.thumbJson, entry.path)
+			} else if entry.isPromote {
+				oldThumbs := "[]"
+				if entry.promoteFrom != "" {
+					scanErr := tx.QueryRow(`SELECT thumbnails FROM file_cache WHERE target_path = ?`, entry.promoteFrom).Scan(&oldThumbs)
+					if scanErr != nil && scanErr != sql.ErrNoRows {
+						err = scanErr
+					}
+				}
+				newThumbs := "[]"
+				if err == nil {
+					scanErr := tx.QueryRow(`SELECT thumbnails FROM file_cache WHERE target_path = ?`, entry.path).Scan(&newThumbs)
+					if scanErr != nil && scanErr != sql.ErrNoRows {
+						err = scanErr
+					}
+				}
+				if err == nil {
+					merged := mergeThumbnailEntries(
+						parseThumbnailEntries(newThumbs),
+						parseThumbnailEntries(oldThumbs),
+					)
+					if entry.thumbPath != "" {
+						merged = mergeThumbnailEntries(merged, []thumbnailEntry{makeThumbnailEntry(entry.thumbPath, entry.thumbMeta)})
+					}
+					err = setThumbnails(tx, entry.path, marshalThumbnailEntries(merged))
+				}
+				if err == nil && entry.promoteFrom != "" {
+					err = deleteCacheRow(tx, entry.promoteFrom)
+				}
 			} else {
 				_, err = tx.Exec(`
 					INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata)
@@ -403,6 +435,22 @@ func (cm *CacheManager) DeleteEntry(path string) {
 	cm.entries <- cacheEntry{
 		path:     path,
 		isDelete: true,
+	}
+}
+
+// PromoteMaster replaces oldMasterPath with newMasterPath while preserving the old master's
+// existing thumbnail list and appending the moved old master as a thumbnail of the new master.
+func (cm *CacheManager) PromoteMaster(newMasterPath, oldMasterPath, oldMasterThumbPath, oldMasterThumbMeta string) {
+	cm.mutex.Lock()
+	cm.removeEntryLocked(oldMasterPath)
+	cm.mutex.Unlock()
+
+	cm.entries <- cacheEntry{
+		path:        newMasterPath,
+		thumbPath:   oldMasterThumbPath,
+		thumbMeta:   oldMasterThumbMeta,
+		promoteFrom: oldMasterPath,
+		isPromote:   true,
 	}
 }
 

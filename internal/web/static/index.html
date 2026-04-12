@@ -18,10 +18,10 @@
                 </svg>
                 <h1>Photo Cleanup</h1>
             </div>
-            
+
             <div class="nav-controls">
                 <div class="shortcut-hint">
-                    <kbd>←</kbd> <kbd>→</kbd> Select Option &bull; <kbd>Enter</kbd> Resolve Group
+                    Single click switches keep &bull; Double click toggles multi-keep &bull; <kbd>Enter</kbd> Resolve Group &bull; <kbd>Shift</kbd> <kbd>Enter</kbd> Resolve Page
                 </div>
             </div>
         </div>
@@ -35,12 +35,11 @@
             </div>
             <div class="stat">
                 <span class="stat-value" id="pot-space">0 MB</span>
-                <span class="stat-label">Potential Savings</span>
+                <span class="stat-label">Visible Savings</span>
             </div>
         </div>
 
         <div id="groups-container" class="groups-container">
-            <!-- Dynamic duplicate groups will be injected here -->
             <div class="loading-state" id="loading-indicator">
                 <div class="spinner"></div>
                 <p>Analyzing duplicate clusters...</p>
@@ -48,21 +47,43 @@
         </div>
 
         <div class="pagination-controls glass-panel" id="pagination">
-            <button id="prev-page" disabled>Previous Page</button>
-            <span id="page-info">Page 1</span>
-            <button id="next-page" disabled>Next Page</button>
+            <div class="pagination-top-row">
+                <label class="page-size-control" for="page-size">
+                    <span>Page Size</span>
+                    <select id="page-size">
+                        <option value="10">10</option>
+                        <option value="25" selected>25</option>
+                        <option value="50">50</option>
+                        <option value="100">100</option>
+                        <option value="200">200</option>
+                    </select>
+                </label>
+
+                <div class="page-batch-actions">
+                    <button id="resolve-page" class="primary-btn" type="button">Resolve 0 Groups on This Page</button>
+                    <span id="batch-status" class="batch-status">No groups loaded</span>
+                </div>
+            </div>
+
+            <div class="pagination-bottom-row">
+                <button id="prev-page" type="button" disabled>Previous</button>
+                <div id="page-numbers" class="page-numbers"></div>
+                <span id="page-info">Page 1 of 1</span>
+                <button id="next-page" type="button" disabled>Next</button>
+            </div>
         </div>
     </main>
 
     <template id="group-template">
         <div class="duplicate-group glass-panel">
             <div class="group-header">
-                <h3>Visual Cluster</h3>
-                <button class="resolve-btn primary-btn">Resolve & Destroy Others</button>
+                <div class="group-title-wrap">
+                    <h3 class="group-title">Visual Cluster</h3>
+                    <span class="group-summary"></span>
+                </div>
+                <button class="resolve-btn primary-btn" type="button">Resolve Group</button>
             </div>
-            <div class="images-grid">
-                <!-- Images injected here -->
-            </div>
+            <div class="images-grid"></div>
         </div>
     </template>
 
