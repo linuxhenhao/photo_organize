@@ -21,10 +21,62 @@ const resolvePageBtn = document.getElementById('resolve-page');
 const batchStatus = document.getElementById('batch-status');
 const totalGroupsEl = document.getElementById('total-groups');
 const potentialSavingsEl = document.getElementById('pot-space');
+const DEFAULT_PAGE = STATE.page;
+const DEFAULT_LIMIT = STATE.limit;
+const allowedPageSizes = new Set(
+    Array.from(pageSizeSelect.options, (option) => Number.parseInt(option.value, 10))
+        .filter((value) => Number.isInteger(value) && value > 0)
+);
 
 const visibleGroups = () => STATE.groups.filter(Boolean);
 const allItemsForGroup = (group) => [group.master, ...group.duplicates];
 const isSelected = (group, path) => group.selectedPaths.includes(path);
+
+const parsePositiveInt = (value, fallback) => {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const sanitizeLimit = (value) => {
+    const parsed = parsePositiveInt(value, DEFAULT_LIMIT);
+    return allowedPageSizes.has(parsed) ? parsed : DEFAULT_LIMIT;
+};
+
+const readPaginationFromURL = () => {
+    const params = new URLSearchParams(window.location.search);
+    return {
+        page: parsePositiveInt(params.get('page'), DEFAULT_PAGE),
+        limit: sanitizeLimit(params.get('limit')),
+    };
+};
+
+const buildDuplicatesURL = (page, limit) => {
+    const params = new URLSearchParams({
+        page: String(page),
+        limit: String(limit),
+    });
+    return `/api/duplicates?${params.toString()}`;
+};
+
+const buildBrowserURL = (page, limit) => {
+    const url = new URL(window.location.href);
+    url.searchParams.set('page', String(page));
+    url.searchParams.set('limit', String(limit));
+    return `${url.pathname}?${url.searchParams.toString()}${url.hash}`;
+};
+
+const syncPaginationURL = (page, limit, historyMode = 'replace') => {
+    if (historyMode === 'none') return;
+
+    const nextURL = buildBrowserURL(page, limit);
+    const currentURL = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (nextURL === currentURL) {
+        return;
+    }
+
+    const historyMethod = historyMode === 'push' ? 'pushState' : 'replaceState';
+    window.history[historyMethod]({ page, limit }, '', nextURL);
+};
 
 const formatBytes = (bytes) => {
     if (!bytes) return '0 B';
@@ -150,7 +202,13 @@ const renderGroups = () => {
         titleEl.textContent = `Cluster ${(STATE.page - 1) * STATE.limit + index + 1}`;
         summaryEl.textContent = selectionSummary(group);
 
-        allItemsForGroup(group).forEach((img) => {
+        const groupItems = allItemsForGroup(group);
+        const groupItemCount = groupItems.length;
+
+        grid.classList.toggle('layout-pair', groupItemCount <= 2);
+        grid.classList.toggle('layout-crowded', groupItemCount >= 7);
+
+        groupItems.forEach((img) => {
             const imgNode = document.importNode(tplImage, true);
             const card = imgNode.querySelector('.image-card');
             const imageEl = imgNode.querySelector('img');
@@ -238,7 +296,7 @@ const renderPageNumbers = () => {
             button.classList.add('active');
             button.disabled = true;
         }
-        button.addEventListener('click', () => fetchGroups(item));
+        button.addEventListener('click', () => fetchGroups(item, { historyMode: 'push' }));
         pageNumbers.appendChild(button);
     });
 };
@@ -364,8 +422,10 @@ const markGroupResolved = (groupIndex) => {
     }
 };
 
-const fetchGroups = async (page) => {
+const fetchGroups = async (page, { historyMode = 'replace' } = {}) => {
     if (STATE.loading) return;
+
+    const requestedPage = parsePositiveInt(page, DEFAULT_PAGE);
 
     STATE.loading = true;
     updatePagination();
@@ -373,16 +433,18 @@ const fetchGroups = async (page) => {
     clearRenderedGroups();
 
     try {
-        const response = await fetch(`/api/duplicates?page=${page}&limit=${STATE.limit}`);
+        const response = await fetch(buildDuplicatesURL(requestedPage, STATE.limit));
         if (!response.ok) {
             throw new Error(`request failed with status ${response.status}`);
         }
 
         const data = await response.json();
-        STATE.page = data.page || page;
+        STATE.page = parsePositiveInt(data.page, requestedPage);
+        STATE.limit = sanitizeLimit(data.limit);
         STATE.totalGroups = data.total || 0;
         STATE.totalPages = data.totalPages || 0;
         STATE.groups = (data.groups || []).map(normalizeGroup);
+        syncPaginationURL(STATE.page, STATE.limit, historyMode === 'none' ? 'replace' : historyMode);
 
         renderGroups();
         updateStats();
@@ -464,15 +526,26 @@ document.addEventListener('keydown', (event) => {
     }
 });
 
-prevBtn.addEventListener('click', () => fetchGroups(Math.max(1, STATE.page - 1)));
-nextBtn.addEventListener('click', () => fetchGroups(STATE.page + 1));
+prevBtn.addEventListener('click', () => fetchGroups(Math.max(1, STATE.page - 1), { historyMode: 'push' }));
+nextBtn.addEventListener('click', () => fetchGroups(STATE.page + 1, { historyMode: 'push' }));
 pageSizeSelect.addEventListener('change', (event) => {
-    STATE.limit = Number.parseInt(event.target.value, 10) || 25;
-    fetchGroups(1);
+    STATE.limit = sanitizeLimit(event.target.value);
+    fetchGroups(1, { historyMode: 'push' });
 });
 resolvePageBtn.addEventListener('click', () => resolveCurrentPage());
 
 window.addEventListener('DOMContentLoaded', () => {
+    const initialPagination = readPaginationFromURL();
+    STATE.page = initialPagination.page;
+    STATE.limit = initialPagination.limit;
     updatePagination();
-    fetchGroups(1);
+    fetchGroups(initialPagination.page, { historyMode: 'replace' });
+});
+
+window.addEventListener('popstate', () => {
+    const pagination = readPaginationFromURL();
+    STATE.page = pagination.page;
+    STATE.limit = pagination.limit;
+    updatePagination();
+    fetchGroups(pagination.page, { historyMode: 'none' });
 });
