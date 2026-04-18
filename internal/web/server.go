@@ -188,19 +188,6 @@ type groupArchiveManifest struct {
 	Members     []groupArchiveMember `json:"members"`
 }
 
-type groupsArchiveGroupSummary struct {
-	MasterPath   string `json:"masterPath"`
-	Directory    string `json:"directory"`
-	ManifestPath string `json:"manifestPath"`
-	MemberCount  int    `json:"memberCount"`
-}
-
-type groupsArchiveManifest struct {
-	GeneratedAt string                      `json:"generatedAt"`
-	GroupCount  int                         `json:"groupCount"`
-	Groups      []groupsArchiveGroupSummary `json:"groups"`
-}
-
 type renameRecord struct {
 	currentPath  string
 	originalPath string
@@ -487,53 +474,6 @@ func (ws *WebServer) streamGroupArchive(w io.Writer, masterRaw string, members [
 
 	_, err := ws.writeGroupArchiveToTar(tw, masterRaw, members, "")
 	return err
-}
-
-func groupArchiveDirectoryName(index int, masterRaw string) string {
-	digest := md5.Sum([]byte(masterRaw))
-	return fmt.Sprintf("groups/%03d-%s-%s", index+1, safeArchiveBaseName(masterRaw), hex.EncodeToString(digest[:4]))
-}
-
-func (ws *WebServer) streamGroupsArchive(w io.Writer, masterPaths []string) error {
-	tw := tar.NewWriter(w)
-	defer tw.Close()
-
-	manifest := groupsArchiveManifest{
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-		GroupCount:  len(masterPaths),
-		Groups:      make([]groupsArchiveGroupSummary, 0, len(masterPaths)),
-	}
-
-	for index, masterRaw := range masterPaths {
-		masterAbs, err := ws.resolveWithinDest(masterRaw)
-		if err != nil {
-			return err
-		}
-
-		members, err := ws.loadGroupMembers(masterRaw, masterAbs)
-		if err != nil {
-			return err
-		}
-
-		groupDir := groupArchiveDirectoryName(index, masterRaw)
-		groupManifest, err := ws.writeGroupArchiveToTar(tw, masterRaw, members, groupDir)
-		if err != nil {
-			return err
-		}
-
-		manifest.Groups = append(manifest.Groups, groupsArchiveGroupSummary{
-			MasterPath:   masterRaw,
-			Directory:    groupDir,
-			ManifestPath: path.Join(groupDir, "manifest.json"),
-			MemberCount:  len(groupManifest.Members),
-		})
-	}
-
-	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return err
-	}
-	return writeTarBytes(tw, "manifest.json", manifestBytes)
 }
 
 func rollbackRenames(renames []renameRecord) {
@@ -830,7 +770,6 @@ func (ws *WebServer) Start(host string, port int, db *sql.DB) error {
 	// API Endpoints
 	mux.HandleFunc("/api/duplicates", ws.handleGetDuplicates)
 	mux.HandleFunc("/api/group-archive", ws.handleGroupArchiveDownload)
-	mux.HandleFunc("/api/groups-archive", ws.handleGroupsArchiveDownload)
 	mux.HandleFunc("/api/resolve", ws.handleResolveGroup)
 	mux.HandleFunc("/image", ws.handleImageServe)
 
@@ -1253,36 +1192,6 @@ func (ws *WebServer) handleGroupArchiveDownload(w http.ResponseWriter, r *http.R
 
 	if err := ws.streamGroupArchive(w, masterRaw, members); err != nil {
 		log.Printf("Failed to stream group archive for %s: %v", masterRaw, err)
-	}
-}
-
-func (ws *WebServer) handleGroupsArchiveDownload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		MasterPaths []string `json:"masterPaths"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	masterPaths := dedupePaths(req.MasterPaths)
-	if len(masterPaths) == 0 {
-		http.Error(w, "masterPaths is required", http.StatusBadRequest)
-		return
-	}
-
-	archiveDigest := md5.Sum([]byte(strings.Join(masterPaths, "\n")))
-	archiveName := fmt.Sprintf("visible-groups-%d-%s.tar", len(masterPaths), hex.EncodeToString(archiveDigest[:4]))
-	w.Header().Set("Content-Type", "application/x-tar")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", archiveName))
-
-	if err := ws.streamGroupsArchive(w, masterPaths); err != nil {
-		log.Printf("Failed to stream groups archive: %v", err)
 	}
 }
 

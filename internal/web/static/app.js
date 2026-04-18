@@ -6,7 +6,6 @@ const STATE = {
     totalPages: 0,
     loading: false,
     resolvingPage: false,
-    downloadingArchive: false,
     batchProgressText: '',
     focusedIndex: -1,
     pendingSingleClick: null,
@@ -21,7 +20,6 @@ const nextBtn = document.getElementById('next-page');
 const pageInfo = document.getElementById('page-info');
 const pageNumbers = document.getElementById('page-numbers');
 const pageSizeSelect = document.getElementById('page-size');
-const downloadPageBtn = document.getElementById('download-page');
 const resolvePageBtn = document.getElementById('resolve-page');
 const batchStatus = document.getElementById('batch-status');
 const totalGroupsEl = document.getElementById('total-groups');
@@ -68,18 +66,6 @@ const buildGroupArchiveURL = (masterPath) => {
         masterPath,
     });
     return `/api/group-archive?${params.toString()}`;
-};
-
-const parseDownloadFilename = (contentDisposition, fallback) => {
-    if (!contentDisposition) return fallback;
-
-    const utf8Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
-    if (utf8Match) {
-        return decodeURIComponent(utf8Match[1]);
-    }
-
-    const basicMatch = contentDisposition.match(/filename="?([^";]+)"?/i);
-    return basicMatch ? basicMatch[1] : fallback;
 };
 
 const buildBrowserURL = (page, limit) => {
@@ -162,38 +148,6 @@ const postResolve = async (group) => {
     }
 };
 
-const postGroupsArchive = async (groups) => {
-    const response = await fetch('/api/groups-archive', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            masterPaths: groups.map((group) => group.master.path),
-        }),
-    });
-
-    if (!response.ok) {
-        const message = await response.text();
-        throw new Error(message || 'archive download failed');
-    }
-
-    return {
-        blob: await response.blob(),
-        filename: parseDownloadFilename(response.headers.get('Content-Disposition'), `visible-groups-${groups.length}.tar`),
-    };
-};
-
-const downloadBlob = (blob, filename) => {
-    const objectURL = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = objectURL;
-    link.download = filename;
-    link.rel = 'noopener';
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    window.setTimeout(() => URL.revokeObjectURL(objectURL), 1000);
-};
-
 const downloadGroupArchive = (group) => {
     const link = document.createElement('a');
     link.href = buildGroupArchiveURL(group.master.path);
@@ -232,9 +186,9 @@ const updateGroupSelectionUI = (groupIndex) => {
     const downloadBtn = groupEl.querySelector('.download-btn');
     const resolveBtn = groupEl.querySelector('.resolve-btn');
     if (downloadBtn) {
-        downloadBtn.disabled = STATE.resolvingPage || STATE.downloadingArchive;
+        downloadBtn.disabled = STATE.resolvingPage;
     }
-    resolveBtn.disabled = STATE.resolvingPage || STATE.downloadingArchive || group.selectedPaths.length === 0;
+    resolveBtn.disabled = STATE.resolvingPage || group.selectedPaths.length === 0;
     resolveBtn.textContent = group.selectedPaths.length > 1
         ? `Resolve Keeping ${group.selectedPaths.length}`
         : 'Resolve Group';
@@ -364,7 +318,7 @@ const renderPageNumbers = () => {
         button.type = 'button';
         button.className = 'page-number';
         button.textContent = String(item);
-        button.disabled = STATE.loading || STATE.resolvingPage || STATE.downloadingArchive;
+        button.disabled = STATE.loading || STATE.resolvingPage;
         if (item === STATE.page) {
             button.classList.add('active');
             button.disabled = true;
@@ -375,25 +329,24 @@ const renderPageNumbers = () => {
 };
 
 const updatePagination = () => {
-    prevBtn.disabled = STATE.loading || STATE.resolvingPage || STATE.downloadingArchive || STATE.page <= 1;
-    nextBtn.disabled = STATE.loading || STATE.resolvingPage || STATE.downloadingArchive || STATE.totalPages === 0 || STATE.page >= STATE.totalPages;
+    prevBtn.disabled = STATE.loading || STATE.resolvingPage || STATE.page <= 1;
+    nextBtn.disabled = STATE.loading || STATE.resolvingPage || STATE.totalPages === 0 || STATE.page >= STATE.totalPages;
 
     pageInfo.textContent = STATE.totalPages > 0
         ? `Page ${STATE.page} of ${STATE.totalPages}`
         : 'No pages';
 
     pageSizeSelect.value = String(STATE.limit);
-    pageSizeSelect.disabled = STATE.loading || STATE.resolvingPage || STATE.downloadingArchive;
-    downloadPageBtn.disabled = STATE.loading || STATE.resolvingPage || STATE.downloadingArchive || visibleGroups().length === 0;
+    pageSizeSelect.disabled = STATE.loading || STATE.resolvingPage;
     renderPageNumbers();
 
     const currentCount = visibleGroups().length;
-    resolvePageBtn.disabled = STATE.loading || STATE.resolvingPage || STATE.downloadingArchive || currentCount === 0;
+    resolvePageBtn.disabled = STATE.loading || STATE.resolvingPage || currentCount === 0;
     resolvePageBtn.textContent = STATE.resolvingPage
         ? 'Resolving Current Page...'
         : `Resolve ${currentCount} Groups on This Page`;
 
-    if ((STATE.resolvingPage || STATE.downloadingArchive) && STATE.batchProgressText) {
+    if (STATE.resolvingPage && STATE.batchProgressText) {
         batchStatus.textContent = STATE.batchProgressText;
         return;
     }
@@ -548,7 +501,7 @@ const fetchGroups = async (page, { historyMode = 'replace' } = {}) => {
 
 const resolveGroup = async (groupIndex) => {
     const group = STATE.groups[groupIndex];
-    if (!group || STATE.resolvingPage || STATE.downloadingArchive) return;
+    if (!group || STATE.resolvingPage) return;
 
     try {
         await postResolve(group);
@@ -629,40 +582,6 @@ const resolveCurrentPage = async () => {
     }
 };
 
-const downloadVisibleGroupsArchive = async () => {
-    const groups = visibleGroups();
-    if (groups.length === 0 || STATE.resolvingPage || STATE.downloadingArchive) return;
-
-    const confirmed = window.confirm(`Download a tar containing ${groups.length} visible groups on page ${STATE.page}?`);
-    if (!confirmed) return;
-
-    STATE.downloadingArchive = true;
-    STATE.batchProgressText = `Preparing archive for ${groups.length} visible groups on page ${STATE.page}`;
-    updatePagination();
-    STATE.groups.forEach((group, index) => {
-        if (group) {
-            updateGroupSelectionUI(index);
-        }
-    });
-
-    try {
-        const { blob, filename } = await postGroupsArchive(groups);
-        downloadBlob(blob, filename);
-    } catch (error) {
-        console.error('Archive download error', error);
-        alert(`Failed to download visible groups: ${error.message}`);
-    } finally {
-        STATE.downloadingArchive = false;
-        STATE.batchProgressText = '';
-        updatePagination();
-        STATE.groups.forEach((group, index) => {
-            if (group) {
-                updateGroupSelectionUI(index);
-            }
-        });
-    }
-};
-
 document.addEventListener('keydown', (event) => {
     if (event.shiftKey && event.key === 'Enter') {
         event.preventDefault();
@@ -682,7 +601,6 @@ pageSizeSelect.addEventListener('change', (event) => {
     STATE.limit = sanitizeLimit(event.target.value);
     fetchGroups(1, { historyMode: 'push' });
 });
-downloadPageBtn.addEventListener('click', () => downloadVisibleGroupsArchive());
 resolvePageBtn.addEventListener('click', () => resolveCurrentPage());
 
 window.addEventListener('DOMContentLoaded', () => {

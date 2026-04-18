@@ -5,3 +5,4 @@ output/
 .comments/
 coverage.out
 token.txt
+*.tar
