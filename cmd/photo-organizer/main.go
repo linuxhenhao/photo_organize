@@ -54,6 +54,11 @@ func main() {
 	var moveDuplicates bool
 	initCacheCmd.BoolVar(&moveDuplicates, "move-duplicates", false, "Move perceptual duplicates into thumbnails; default is read-only cache refresh")
 
+	cleanGroupsCmd := flag.NewFlagSet("cleangroups", flag.ExitOnError)
+	cleanGroupsCmd.StringVar(&destDir, "dest", "", "Target directory containing deduplicated items and cache.db")
+	var applyCleanGroups bool
+	cleanGroupsCmd.BoolVar(&applyCleanGroups, "apply", false, "Persist cleanup changes; default is dry-run")
+
 	serveCmd := flag.NewFlagSet("serve", flag.ExitOnError)
 	serveCmd.StringVar(&destDir, "dest", "", "Target directory containing deduplicated items and cache.db")
 	var serveHost string
@@ -63,13 +68,15 @@ func main() {
 
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: photo-organizer <command> [options]")
-		fmt.Println("Commands: scan, import, initcache, serve")
+		fmt.Println("Commands: scan, import, initcache, cleangroups, serve")
 		fmt.Println("\nScan command options:")
 		scanCmd.PrintDefaults()
 		fmt.Println("\nImport command options:")
 		importCmd.PrintDefaults()
 		fmt.Println("\nInitCache command options:")
 		initCacheCmd.PrintDefaults()
+		fmt.Println("\nCleanGroups command options:")
+		cleanGroupsCmd.PrintDefaults()
 		fmt.Println("\nServe command options:")
 		serveCmd.PrintDefaults()
 		os.Exit(1)
@@ -108,6 +115,26 @@ func main() {
 		target.InitTargetDirCacheWithContext(ctx, destDir, cacheManager, target.InitCacheOptions{
 			MoveDuplicates: moveDuplicates,
 		})
+	case "cleangroups":
+		cleanGroupsCmd.Parse(os.Args[2:])
+		if destDir == "" {
+			log.Fatal("CleanGroups command requires a target directory specified with -dest.")
+		}
+
+		cacheManager, err := target.NewCacheManager(destDir, 100)
+		if err != nil {
+			log.Fatalf("Failed to initialize target directory cache: %v", err)
+		}
+		defer cacheManager.Close()
+
+		ctx, stopSignals := newInitCacheContext()
+		defer stopSignals()
+
+		if _, err := target.CleanThumbnailGroupsWithContext(ctx, destDir, cacheManager, target.CleanGroupsOptions{
+			Apply: applyCleanGroups,
+		}); err != nil {
+			log.Fatalf("CleanGroups failed: %v", err)
+		}
 	case "serve":
 		serveCmd.Parse(os.Args[2:])
 		if destDir == "" {
