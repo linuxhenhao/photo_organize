@@ -92,7 +92,7 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 				continue
 			}
 
-			decision, err := dedupe.ClassifyDerivative(
+			decision, err := dedupe.RevalidateDerivative(
 				entryAbsPath,
 				string(entry.Metadata),
 				entryStat.Size(),
@@ -263,7 +263,7 @@ func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheMan
 	}
 
 	if exactPath, ok := cm.FindExactMatch(candidate.MMH3); ok && exactPath != "" && exactPath != excludedMaster && exactPath != candidate.Path {
-		if _, exists := rows[exactPath]; exists && dedupe.CanAutoGroupUnderParent(candidate.Path, exactPath) {
+		if _, exists := rows[exactPath]; exists {
 			return exactPath, nil
 		}
 	}
@@ -292,7 +292,7 @@ func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheMan
 			continue
 		}
 
-		decision, err := dedupe.ClassifyDerivative(
+		decision, err := dedupe.RevalidateDerivative(
 			candidate.Path,
 			candidate.Metadata,
 			candidate.Size,

@@ -35,10 +35,21 @@ type DerivativeDecision struct {
 	Confirmed bool
 }
 
+// RevalidateDerivative checks whether child belongs under parent without
+// applying repository-path heuristics. This is intended for cleaning existing
+// historical cache relationships rather than creating new ones.
+func RevalidateDerivative(childPath string, childMetaJSON string, childSize int64, parentPath string, parentMetaJSON string, parentSize int64) (DerivativeDecision, error) {
+	return classifyDerivative(childPath, childMetaJSON, childSize, parentPath, parentMetaJSON, parentSize, false)
+}
+
 // ClassifyDerivative confirms whether child should be treated as a derived
 // thumbnail/export of parent. The relationship is directional.
 func ClassifyDerivative(childPath string, childMetaJSON string, childSize int64, parentPath string, parentMetaJSON string, parentSize int64) (DerivativeDecision, error) {
-	if !CanAutoGroupUnderParent(childPath, parentPath) {
+	return classifyDerivative(childPath, childMetaJSON, childSize, parentPath, parentMetaJSON, parentSize, true)
+}
+
+func classifyDerivative(childPath string, childMetaJSON string, childSize int64, parentPath string, parentMetaJSON string, parentSize int64, enforcePathPolicy bool) (DerivativeDecision, error) {
+	if enforcePathPolicy && !CanAutoGroupUnderParent(childPath, parentPath) {
 		return DerivativeDecision{}, nil
 	}
 

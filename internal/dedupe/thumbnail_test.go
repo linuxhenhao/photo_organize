@@ -186,6 +186,29 @@ func TestClassifyDerivativeRejectsThumbnailParent(t *testing.T) {
 	require.False(t, decision.Confirmed)
 }
 
+func TestRevalidateDerivativeAllowsThumbnailParentForExistingGroups(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "dedupe_thumbnail_revalidate_parent")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	parentPath := filepath.Join(tempDir, "thumbnails", "master.jpg")
+	childPath := filepath.Join(tempDir, "thumbnails", "thumb.jpg")
+	writePatternJPEG(t, parentPath, 160, 120, 90)
+	writePatternJPEG(t, childPath, 160, 120, 72)
+
+	parentMeta := metadata.ExtractImageMetaJson(parentPath)
+	childMeta := metadata.ExtractImageMetaJson(childPath)
+	childStat, err := os.Stat(childPath)
+	require.NoError(t, err)
+	parentStat, err := os.Stat(parentPath)
+	require.NoError(t, err)
+
+	decision, err := RevalidateDerivative(childPath, childMeta, childStat.Size(), parentPath, parentMeta, parentStat.Size())
+	require.NoError(t, err)
+	require.True(t, decision.Confirmed)
+	require.Equal(t, DerivativeVariant, decision.Kind)
+}
+
 func TestCompareMasterPreferencePrefersHigherResolutionOverFileSize(t *testing.T) {
 	decision := CompareMasterPreference(
 		"candidate.jpg",
