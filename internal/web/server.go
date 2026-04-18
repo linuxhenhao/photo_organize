@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	projectexiftool "github.com/linuxhenhao/photo_organize/internal/exiftool"
@@ -45,6 +46,9 @@ type WebServer struct {
 	ugosThumbnailMode   bool
 	prewarmWorkers      int
 	thumbnailCache      sync.Map
+	resolveDBWriteMu    sync.Mutex
+	resolveDBWriteHook  func()
+	resolveRequestSeq   atomic.Uint64
 }
 
 // ImageInfo holds metadata for the frontend
@@ -214,6 +218,27 @@ func dedupePaths(paths []string) []string {
 		result = append(result, trimmed)
 	}
 	return result
+}
+
+func summarizePathsForLog(paths []string) string {
+	if len(paths) == 0 {
+		return "[]"
+	}
+
+	const maxPaths = 6
+	if len(paths) <= maxPaths {
+		return fmt.Sprintf("%q", paths)
+	}
+
+	return fmt.Sprintf("%q ... (%d total)", paths[:maxPaths], len(paths))
+}
+
+func rawPathsForMembers(members []groupMember) []string {
+	paths := make([]string, 0, len(members))
+	for _, member := range members {
+		paths = append(paths, member.raw)
+	}
+	return paths
 }
 
 func (ws *WebServer) storagePathForResolved(absPath string) (string, error) {
@@ -915,6 +940,9 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	resolveID := ws.resolveRequestSeq.Add(1)
+	w.Header().Set("X-Resolve-Request-Id", strconv.FormatUint(resolveID, 10))
+
 	var req struct {
 		KeepPath    string   `json:"keepPath"`
 		KeepPaths   []string `json:"keepPaths"`
@@ -922,33 +950,64 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 		MasterPath  string   `json:"masterPath"`
 	}
 
+	keepRawPaths := []string(nil)
+	deleteRawPaths := []string(nil)
+
+	failResolve := func(status int, publicMessage string, stage string, detail string, err error) {
+		msg := fmt.Sprintf("[resolve %d] %s failed: remote=%q master=%q keep=%s delete=%s",
+			resolveID,
+			stage,
+			r.RemoteAddr,
+			req.MasterPath,
+			summarizePathsForLog(keepRawPaths),
+			summarizePathsForLog(deleteRawPaths),
+		)
+		if detail != "" {
+			msg += " " + detail
+		}
+		if err != nil {
+			msg += fmt.Sprintf(" err=%v", err)
+		}
+		log.Print(msg)
+		http.Error(w, fmt.Sprintf("%s [resolve_id=%d]", publicMessage, resolveID), status)
+	}
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		failResolve(http.StatusBadRequest, "Invalid request body", "decode request body", "", err)
 		return
 	}
+
+	deleteRawPaths = dedupePaths(req.DeletePaths)
 
 	masterAbs, err := ws.resolveWithinDest(req.MasterPath)
 	if err != nil {
-		http.Error(w, "Invalid masterPath", http.StatusBadRequest)
+		failResolve(http.StatusBadRequest, "Invalid masterPath", "resolve master path", "", err)
 		return
 	}
 
-	keepRawPaths := dedupePaths(req.KeepPaths)
+	keepRawPaths = dedupePaths(req.KeepPaths)
 	if len(keepRawPaths) == 0 && strings.TrimSpace(req.KeepPath) != "" {
 		keepRawPaths = []string{strings.TrimSpace(req.KeepPath)}
 	}
+	log.Printf("[resolve %d] start: remote=%q master=%q requested_keep=%s requested_delete=%s",
+		resolveID,
+		r.RemoteAddr,
+		req.MasterPath,
+		summarizePathsForLog(keepRawPaths),
+		summarizePathsForLog(deleteRawPaths),
+	)
 	if len(keepRawPaths) == 0 {
-		http.Error(w, "At least one keep path is required", http.StatusBadRequest)
+		failResolve(http.StatusBadRequest, "At least one keep path is required", "validate keep paths", "", nil)
 		return
 	}
 
 	members, err := ws.loadGroupMembers(req.MasterPath, masterAbs)
 	if err == sql.ErrNoRows {
-		http.Error(w, "Master group not found", http.StatusNotFound)
+		failResolve(http.StatusNotFound, "Master group not found", "load group members", "", err)
 		return
 	}
 	if err != nil {
-		http.Error(w, "Failed to load group", http.StatusInternalServerError)
+		failResolve(http.StatusInternalServerError, "Failed to load group", "load group members", "", err)
 		return
 	}
 
@@ -963,14 +1022,14 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 	for _, keepRaw := range keepRawPaths {
 		keepAbs, err := ws.resolveWithinDest(keepRaw)
 		if err != nil {
-			http.Error(w, "Invalid keepPaths entry", http.StatusBadRequest)
+			failResolve(http.StatusBadRequest, "Invalid keepPaths entry", "resolve keep path", fmt.Sprintf("keep=%q", keepRaw), err)
 			return
 		}
 
 		key := filepath.Clean(keepAbs)
 		member, ok := memberByAbs[key]
 		if !ok {
-			http.Error(w, "keepPaths must belong to the selected group", http.StatusBadRequest)
+			failResolve(http.StatusBadRequest, "keepPaths must belong to the selected group", "validate keep path membership", fmt.Sprintf("keep=%q", keepRaw), nil)
 			return
 		}
 		if keepSet[key] {
@@ -992,32 +1051,29 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 	}
 
 	promoteSingle := !keepMaster && len(keepMembers) == 1
-
-	tx, err := ws.db.Begin()
-	if err != nil {
-		http.Error(w, "Failed to begin transaction", http.StatusInternalServerError)
-		return
+	log.Printf("[resolve %d] validated: members=%d keep=%d delete=%d keep_master=%t promote_single=%t validated_keep=%s computed_delete=%s",
+		resolveID,
+		len(members),
+		len(keepMembers),
+		len(deleteMembers),
+		keepMaster,
+		promoteSingle,
+		summarizePathsForLog(rawPathsForMembers(keepMembers)),
+		summarizePathsForLog(rawPathsForMembers(deleteMembers)),
+	)
+	if len(deleteRawPaths) > 0 && len(deleteRawPaths) != len(deleteMembers) {
+		log.Printf("[resolve %d] delete count mismatch: requested=%d computed=%d requested_delete=%s computed_delete=%s",
+			resolveID,
+			len(deleteRawPaths),
+			len(deleteMembers),
+			summarizePathsForLog(deleteRawPaths),
+			summarizePathsForLog(rawPathsForMembers(deleteMembers)),
+		)
 	}
-	defer tx.Rollback()
 
 	for _, member := range deleteMembers {
 		if err := os.Remove(member.abs); err != nil && !os.IsNotExist(err) {
-			log.Printf("Warning: failed to delete file %s: %v", member.abs, err)
-		}
-	}
-
-	switch {
-	case keepMaster:
-		_, err = tx.Exec(`UPDATE file_cache SET thumbnails = '[]' WHERE target_path = ?`, req.MasterPath)
-		if err != nil {
-			http.Error(w, "Failed to clear thumbnails", http.StatusInternalServerError)
-			return
-		}
-	case !promoteSingle:
-		_, err = tx.Exec(`DELETE FROM file_cache WHERE target_path = ?`, req.MasterPath)
-		if err != nil {
-			http.Error(w, "Failed to delete master row", http.StatusInternalServerError)
-			return
+			log.Printf("[resolve %d] warning: failed to delete file %s: %v", resolveID, member.abs, err)
 		}
 	}
 
@@ -1036,7 +1092,7 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 			if filepath.Clean(member.abs) != filepath.Clean(masterAbs) {
 				if err := os.Rename(member.abs, masterAbs); err != nil {
 					rollbackRenames(renames)
-					http.Error(w, "Failed to promote kept file", http.StatusInternalServerError)
+					failResolve(http.StatusInternalServerError, "Failed to promote kept file", "rename kept file to master", fmt.Sprintf("from=%q to=%q", member.raw, req.MasterPath), err)
 					return
 				}
 				renames = append(renames, renameRecord{currentPath: masterAbs, originalPath: member.abs})
@@ -1047,26 +1103,26 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 			finalAbs, err = ws.restoreThumbnailDestination(member.abs)
 			if err != nil {
 				rollbackRenames(renames)
-				http.Error(w, "Failed to restore kept thumbnail", http.StatusInternalServerError)
+				failResolve(http.StatusInternalServerError, "Failed to restore kept thumbnail", "resolve kept thumbnail destination", fmt.Sprintf("thumb=%q", member.raw), err)
 				return
 			}
 			if err := os.Rename(member.abs, finalAbs); err != nil {
 				rollbackRenames(renames)
-				http.Error(w, "Failed to restore kept thumbnail", http.StatusInternalServerError)
+				failResolve(http.StatusInternalServerError, "Failed to restore kept thumbnail", "rename kept thumbnail", fmt.Sprintf("from=%q to=%q", member.raw, finalAbs), err)
 				return
 			}
 			renames = append(renames, renameRecord{currentPath: finalAbs, originalPath: member.abs})
 			storedPath, err = ws.storagePathForResolved(finalAbs)
 			if err != nil {
 				rollbackRenames(renames)
-				http.Error(w, "Failed to resolve kept file path", http.StatusInternalServerError)
+				failResolve(http.StatusInternalServerError, "Failed to resolve kept file path", "resolve storage path for restored thumbnail", fmt.Sprintf("path=%q", finalAbs), err)
 				return
 			}
 		} else {
 			storedPath, err = ws.storagePathForResolved(finalAbs)
 			if err != nil {
 				rollbackRenames(renames)
-				http.Error(w, "Failed to resolve kept file path", http.StatusInternalServerError)
+				failResolve(http.StatusInternalServerError, "Failed to resolve kept file path", "resolve storage path", fmt.Sprintf("path=%q", finalAbs), err)
 				return
 			}
 		}
@@ -1074,7 +1130,7 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 		stat, err := os.Stat(finalAbs)
 		if err != nil {
 			rollbackRenames(renames)
-			http.Error(w, "Failed to stat kept file", http.StatusInternalServerError)
+			failResolve(http.StatusInternalServerError, "Failed to stat kept file", "stat kept file", fmt.Sprintf("path=%q", finalAbs), err)
 			return
 		}
 
@@ -1082,7 +1138,7 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 		hash, phash, hasPHash, err := hashFileForCache(finalAbs)
 		if err != nil {
 			rollbackRenames(renames)
-			http.Error(w, "Failed to hash kept file", http.StatusInternalServerError)
+			failResolve(http.StatusInternalServerError, "Failed to hash kept file", "hash kept file", fmt.Sprintf("path=%q", finalAbs), err)
 			return
 		}
 
@@ -1095,18 +1151,6 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 			metadata:   meta,
 		}
 
-		phashStr := ""
-		if hasPHash {
-			phashStr = hasher.PHashToString(phash)
-		}
-		_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, '[]')`,
-			entry.storedPath, entry.hash, phashStr, entry.size, entry.metadata)
-		if err != nil {
-			rollbackRenames(renames)
-			http.Error(w, "Failed to keep selected file", http.StatusInternalServerError)
-			return
-		}
-
 		if promoteSingle {
 			copyEntry := entry
 			promotedEntry = &copyEntry
@@ -1115,9 +1159,75 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	invokeResolveDBWriteHook := func() {
+		if ws.resolveDBWriteHook != nil {
+			ws.resolveDBWriteHook()
+		}
+	}
+
+	ws.resolveDBWriteMu.Lock()
+	defer ws.resolveDBWriteMu.Unlock()
+
+	tx, err := ws.db.Begin()
+	if err != nil {
+		rollbackRenames(renames)
+		failResolve(http.StatusInternalServerError, "Failed to begin transaction", "begin transaction", "", err)
+		return
+	}
+	defer tx.Rollback()
+
+	switch {
+	case keepMaster:
+		_, err = tx.Exec(`UPDATE file_cache SET thumbnails = '[]' WHERE target_path = ?`, req.MasterPath)
+		if err != nil {
+			rollbackRenames(renames)
+			failResolve(http.StatusInternalServerError, "Failed to clear thumbnails", "update master thumbnails", "", err)
+			return
+		}
+		invokeResolveDBWriteHook()
+	case !promoteSingle:
+		_, err = tx.Exec(`DELETE FROM file_cache WHERE target_path = ?`, req.MasterPath)
+		if err != nil {
+			rollbackRenames(renames)
+			failResolve(http.StatusInternalServerError, "Failed to delete master row", "delete master row", "", err)
+			return
+		}
+		invokeResolveDBWriteHook()
+	}
+
+	for _, entry := range standaloneEntries {
+		phashStr := ""
+		if entry.hasPHash {
+			phashStr = hasher.PHashToString(entry.phash)
+		}
+		_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, '[]')`,
+			entry.storedPath, entry.hash, phashStr, entry.size, entry.metadata)
+		if err != nil {
+			rollbackRenames(renames)
+			failResolve(http.StatusInternalServerError, "Failed to keep selected file", "upsert kept standalone file", fmt.Sprintf("path=%q", entry.storedPath), err)
+			return
+		}
+		invokeResolveDBWriteHook()
+	}
+
+	if promoteSingle && promotedEntry != nil {
+		phashStr := ""
+		if promotedEntry.hasPHash {
+			phashStr = hasher.PHashToString(promotedEntry.phash)
+		}
+		_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, '[]')`,
+			promotedEntry.storedPath, promotedEntry.hash, phashStr, promotedEntry.size, promotedEntry.metadata)
+		if err != nil {
+			rollbackRenames(renames)
+			failResolve(http.StatusInternalServerError, "Failed to keep selected file", "upsert promoted file", fmt.Sprintf("path=%q", promotedEntry.storedPath), err)
+			return
+		}
+		invokeResolveDBWriteHook()
+	}
+
 	if err := tx.Commit(); err != nil {
 		rollbackRenames(renames)
-		http.Error(w, "Failed to commit resolution", http.StatusInternalServerError)
+		failResolve(http.StatusInternalServerError, "Failed to commit resolution", "commit transaction", "", err)
 		return
 	}
 
@@ -1146,10 +1256,19 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 	}
 	for dir := range dirsToClean {
 		if err := fsutil.RemoveEmptyParentDirs(dir, ws.destDir); err != nil {
-			log.Printf("Failed to remove empty directory for %s: %v", dir, err)
+			log.Printf("[resolve %d] failed to remove empty directory for %s: %v", resolveID, dir, err)
 		}
 	}
 
+	log.Printf("[resolve %d] success: master=%q kept=%d deleted=%d renames=%d keep_master=%t promote_single=%t",
+		resolveID,
+		req.MasterPath,
+		len(keepMembers),
+		len(deleteMembers),
+		len(renames),
+		keepMaster,
+		promoteSingle,
+	)
 	w.WriteHeader(http.StatusOK)
 }
 

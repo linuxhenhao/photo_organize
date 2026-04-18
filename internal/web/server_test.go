@@ -136,6 +136,7 @@ func TestHandleResolveGroupPromotesThumbnailToMaster(t *testing.T) {
 	ws.handleResolveGroup(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
+	require.NotEmpty(t, rr.Header().Get("X-Resolve-Request-Id"))
 
 	gotBytes, err := os.ReadFile(masterPath)
 	require.NoError(t, err)
@@ -162,6 +163,24 @@ func TestHandleResolveGroupPromotesThumbnailToMaster(t *testing.T) {
 	foundPath, found := cacheManager.FindExactMatch(expectedHash)
 	require.True(t, found)
 	require.Equal(t, masterPath, foundPath)
+}
+
+func TestHandleResolveGroupReportsResolveRequestIDOnBadRequest(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "web_resolve_bad_request_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	ws := NewWebServer(nil, tempDir)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/resolve", strings.NewReader(`{"masterPath":""}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	ws.handleResolveGroup(rr, req)
+
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+	require.NotEmpty(t, rr.Header().Get("X-Resolve-Request-Id"))
+	require.Contains(t, rr.Body.String(), "resolve_id=")
 }
 
 func TestHandleResolveGroupKeepsMultipleSelectedItems(t *testing.T) {
@@ -254,6 +273,104 @@ func TestHandleResolveGroupKeepsMultipleSelectedItems(t *testing.T) {
 	foundPath, found := cacheManager.FindExactMatch(expectedHash)
 	require.True(t, found)
 	require.Equal(t, restoredKeepPath, foundPath)
+}
+
+func TestHandleResolveGroupSerializesConcurrentDBWrites(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "web_resolve_concurrent_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	cacheManager, err := target.NewCacheManager(tempDir, 1)
+	require.NoError(t, err)
+	defer cacheManager.Close()
+
+	dbPath := filepath.Join(tempDir, "cache.db")
+	sqliteDB, err := sql.Open("sqlite", dbPath+"?_busy_timeout=1")
+	require.NoError(t, err)
+	defer sqliteDB.Close()
+
+	type groupFixture struct {
+		masterPath string
+		thumbPath  string
+	}
+
+	makeGroup := func(name string, masterFill color.RGBA, thumbFill color.RGBA) groupFixture {
+		masterPath := filepath.Join(tempDir, "2024", "01", "02", name+"-master.jpg")
+		thumbPath := filepath.Join(tempDir, "thumbnails", "2024", "01", "02", name+"-thumb.jpg")
+
+		writeJPEG(t, masterPath, 24, 24, masterFill)
+		writeJPEG(t, thumbPath, 20, 20, thumbFill)
+
+		masterStat, err := os.Stat(masterPath)
+		require.NoError(t, err)
+		masterMeta := metadata.ExtractImageMetaJson(masterPath)
+		thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
+
+		_, err = sqliteDB.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
+			masterPath, "old-hash-"+name, "0000000000000001", masterStat.Size(), masterMeta,
+			`[{"path":"`+thumbPath+`","metadata":`+thumbMeta+`}]`)
+		require.NoError(t, err)
+		cacheManager.SetEntryMemory(masterPath, "old-hash-"+name, 1, masterStat.Size(), masterMeta)
+
+		return groupFixture{
+			masterPath: masterPath,
+			thumbPath:  thumbPath,
+		}
+	}
+
+	groupA := makeGroup("a", color.RGBA{255, 0, 0, 255}, color.RGBA{0, 255, 0, 255})
+	groupB := makeGroup("b", color.RGBA{0, 0, 255, 255}, color.RGBA{255, 255, 0, 255})
+
+	ws := NewWebServer(cacheManager, tempDir)
+	ws.db = sqliteDB
+	ws.resolveDBWriteHook = func() {
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	runResolve := func(masterPath string) *httptest.ResponseRecorder {
+		body, err := json.Marshal(map[string]any{
+			"keepPaths":  []string{masterPath},
+			"masterPath": masterPath,
+		})
+		require.NoError(t, err)
+
+		req := httptest.NewRequest(http.MethodPost, "/api/resolve", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		ws.handleResolveGroup(rr, req)
+		return rr
+	}
+
+	start := make(chan struct{})
+	results := make(chan *httptest.ResponseRecorder, 2)
+
+	go func() {
+		<-start
+		results <- runResolve(groupA.masterPath)
+	}()
+	go func() {
+		<-start
+		results <- runResolve(groupB.masterPath)
+	}()
+	close(start)
+
+	rr1 := <-results
+	rr2 := <-results
+
+	require.Equal(t, http.StatusOK, rr1.Code, rr1.Body.String())
+	require.Equal(t, http.StatusOK, rr2.Code, rr2.Body.String())
+
+	for _, group := range []groupFixture{groupA, groupB} {
+		_, err = os.Stat(group.masterPath)
+		require.NoError(t, err)
+		_, err = os.Stat(group.thumbPath)
+		require.True(t, os.IsNotExist(err))
+
+		var thumbnails string
+		err = sqliteDB.QueryRow(`SELECT thumbnails FROM file_cache WHERE target_path = ?`, group.masterPath).Scan(&thumbnails)
+		require.NoError(t, err)
+		require.Equal(t, "[]", thumbnails)
+	}
 }
 
 func TestHandleGroupArchiveDownloadIncludesManifestAndFiles(t *testing.T) {

@@ -135,17 +135,62 @@ const buildResolvePayload = (group) => {
     };
 };
 
+const summarizeResolvePayload = (payload) => ({
+    masterPath: payload.masterPath,
+    keepCount: payload.keepPaths.length,
+    deleteCount: payload.deletePaths.length,
+    keepPaths: payload.keepPaths,
+    deletePaths: payload.deletePaths,
+});
+
+const formatResolveErrorSummary = (error) => {
+    const parts = [error.message || 'resolve failed'];
+    if (error.requestId) {
+        parts.push(`request id ${error.requestId}`);
+    }
+    if (Number.isInteger(error.status)) {
+        parts.push(`HTTP ${error.status}`);
+    }
+    return parts.join(' | ');
+};
+
 const postResolve = async (group) => {
+    const payload = buildResolvePayload(group);
+    console.info('[resolve] request', summarizeResolvePayload(payload));
+
     const response = await fetch('/api/resolve', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildResolvePayload(group)),
+        body: JSON.stringify(payload),
     });
+    const requestId = response.headers.get('X-Resolve-Request-Id') || '';
 
     if (!response.ok) {
         const message = await response.text();
-        throw new Error(message || 'resolve failed');
+        const error = new Error(message || 'resolve failed');
+        error.requestId = requestId;
+        error.status = response.status;
+        error.payload = payload;
+        console.error('[resolve] failed', {
+            requestId,
+            status: response.status,
+            ...summarizeResolvePayload(payload),
+            message: error.message,
+        });
+        throw error;
     }
+
+    if (payload.keepPaths.length > 1) {
+        console.info('[resolve] success', {
+            requestId,
+            ...summarizeResolvePayload(payload),
+        });
+    }
+
+    return {
+        requestId,
+        payload,
+    };
 };
 
 const downloadGroupArchive = (group) => {
@@ -511,8 +556,13 @@ const resolveGroup = async (groupIndex) => {
             await fetchGroups(STATE.page);
         }
     } catch (error) {
-        console.error('Resolve error', error);
-        alert(`Failed to resolve group: ${error.message}`);
+        console.error('Resolve error', {
+            error,
+            requestId: error.requestId || '',
+            status: error.status,
+            payload: error.payload || buildResolvePayload(group),
+        });
+        alert(`Failed to resolve group: ${formatResolveErrorSummary(error)}`);
     }
 };
 
@@ -528,6 +578,11 @@ const resolveCurrentPage = async () => {
     STATE.resolvingPage = true;
     STATE.batchProgressText = `Resolving 0/${groups.length} groups on page ${STATE.page} with concurrency ${Math.min(BATCH_RESOLVE_CONCURRENCY, groups.length)}`;
     updatePagination();
+    console.info('[resolve page] start', {
+        page: STATE.page,
+        groupCount: groups.length,
+        concurrency: Math.min(BATCH_RESOLVE_CONCURRENCY, groups.length),
+    });
 
     let resolved = 0;
     let failed = 0;
@@ -558,8 +613,17 @@ const resolveCurrentPage = async () => {
                     failures.push({
                         path: currentTask.group.master.path,
                         message: error.message,
+                        requestId: error.requestId || '',
+                        status: error.status,
+                        keepCount: error.payload?.keepPaths?.length || currentTask.group.selectedPaths.length,
                     });
-                    console.error('Batch resolve error', currentTask.group.master.path, error);
+                    console.error('Batch resolve error', {
+                        masterPath: currentTask.group.master.path,
+                        requestId: error.requestId || '',
+                        status: error.status,
+                        keepCount: error.payload?.keepPaths?.length || currentTask.group.selectedPaths.length,
+                        error,
+                    });
                 }
 
                 updateBatchProgress();
@@ -570,14 +634,19 @@ const resolveCurrentPage = async () => {
     } finally {
         STATE.resolvingPage = false;
         STATE.batchProgressText = '';
+        console.info('[resolve page] finished', {
+            page: STATE.page,
+            resolved,
+            failed,
+        });
         await fetchGroups(STATE.page);
     }
 
     if (failures.length > 0) {
         const firstFailure = failures[0];
         const suffix = failures.length > 1
-            ? ` First failure: ${firstFailure.path} (${firstFailure.message})`
-            : ` Failure: ${firstFailure.path} (${firstFailure.message})`;
+            ? ` First failure: ${firstFailure.path} (${firstFailure.message}; request id ${firstFailure.requestId || 'n/a'}; HTTP ${firstFailure.status || 'n/a'}; keep ${firstFailure.keepCount})`
+            : ` Failure: ${firstFailure.path} (${firstFailure.message}; request id ${firstFailure.requestId || 'n/a'}; HTTP ${firstFailure.status || 'n/a'}; keep ${firstFailure.keepCount})`;
         alert(`Resolved ${resolved} groups, ${failed} failed.${suffix}`);
     }
 };
