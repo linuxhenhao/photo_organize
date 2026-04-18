@@ -27,28 +27,6 @@ type ImportTask struct {
 	PHash      string
 }
 
-// moveFileToThumbnails moves a file preserving its relative target path structure under "thumbnails"
-func moveFileToThumbnails(baseDir, filePath string) string {
-	rel, err := filepath.Rel(baseDir, filePath)
-	if err != nil {
-		log.Printf("Failed to resolve relative path for thumbnail fallback: %s", filePath)
-		return filePath
-	}
-	thumbDir := filepath.Join(baseDir, "thumbnails", filepath.Dir(rel))
-	if err := os.MkdirAll(thumbDir, 0755); err != nil {
-		log.Printf("Failed to create thumbnail wrapper dir %s: %v", thumbDir, err)
-		return filePath
-	}
-	newPath := filepath.Join(thumbDir, filepath.Base(filePath))
-	err = os.Rename(filePath, newPath)
-	if err != nil {
-		log.Printf("Failed to move thumbnail %s -> %s: %v", filePath, newPath, err)
-		return filePath
-	}
-	log.Printf("Moved smaller identical visual to thumbnails: %s", newPath)
-	return newPath
-}
-
 // copyFile copies a single file from src to dst.
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
@@ -111,9 +89,7 @@ func importWorker(tasks <-chan ImportTask, wg *sync.WaitGroup, successCount *int
 
 			switch plan.action {
 			case importPlanCopyThumbnail:
-				log.Printf("Found confirmed visual duplicate. Rerouting [%s] to thumbnails under [%s].", task.SourcePath, plan.reservation.committedMatchPath)
-			case importPlanPromoteCommitted:
-				log.Printf("Found superior confirmed visual duplicate. Promoting [%s] over [%s].", task.SourcePath, plan.reservation.committedMatchPath)
+				log.Printf("Found confirmed derived variant. Rerouting [%s] to thumbnails under [%s].", task.SourcePath, plan.reservation.committedMatchPath)
 			case importPlanCopyMaster:
 				if finalTargetPath != filepath.Join(task.TargetDir, task.FileName) {
 					log.Printf("Conflict resolved for [%s], using new name [%s]", task.SourcePath, filepath.Base(finalTargetPath))

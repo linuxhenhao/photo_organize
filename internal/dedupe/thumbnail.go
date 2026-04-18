@@ -8,98 +8,106 @@ import (
 
 	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
+	"github.com/linuxhenhao/photo_organize/internal/vision"
 )
 
 const (
-	// CandidateSearchDistance is intentionally looser than the old 12-bit cutoff.
-	// Repo mock thumbnails currently reach dHash distance 14 after JPEG re-encode
-	// and resize, while ARW preview-derived thumbnails stay near 0-1. Using 16
-	// keeps a small recall margin above the worst known thumbnail fixture without
-	// pushing BK-tree candidate volume into the much noisier 18+ range.
+	// CandidateSearchDistance is intentionally conservative because automatic
+	// matching only targets derived thumbnails, not generic similar-image search.
 	CandidateSearchDistance = 16
-	maxConfirmPHashDistance = 16
-	aspectRatioTolerance    = 0.03
+	maxConfirmPHashDistance = 12
+	maxAssistPHashDistance  = 16
+	aspectRatioTolerance    = 0.02
 	maxColorSignatureDelta  = 12
-	rawResolutionTolerance  = 0.02
+	maxParentUpscaleRatio   = 1.05
 )
 
-// ThumbnailDecision reports whether two files are the same image and which one should remain master.
-type ThumbnailDecision struct {
-	Confirmed       bool
-	PreferCandidate bool
+type DerivativeKind int
+
+const (
+	DerivativeNoMatch DerivativeKind = iota
+	DerivativeVariant
+)
+
+// DerivativeDecision reports whether child is a derived variant of parent.
+type DerivativeDecision struct {
+	Kind      DerivativeKind
+	Confirmed bool
 }
 
-// EvaluateThumbnailMatch confirms whether candidate and existing files are the same visual asset.
-// It uses metadata shape checks plus a stronger perceptual hash before allowing auto-moves.
-func EvaluateThumbnailMatch(candidatePath string, candidateMetaJSON string, candidateSize int64, existingPath string, existingMetaJSON string, existingSize int64) (ThumbnailDecision, error) {
-	candidateMeta := loadComparableMeta(candidatePath, candidateMetaJSON)
-	existingMeta := loadComparableMeta(existingPath, existingMetaJSON)
-
-	if !aspectRatioCompatible(candidateMeta, existingMeta) {
-		return ThumbnailDecision{}, nil
+// ClassifyDerivative confirms whether child should be treated as a derived
+// thumbnail/export of parent. The relationship is directional.
+func ClassifyDerivative(childPath string, childMetaJSON string, childSize int64, parentPath string, parentMetaJSON string, parentSize int64) (DerivativeDecision, error) {
+	if !CanAutoGroupUnderParent(childPath, parentPath) {
+		return DerivativeDecision{}, nil
 	}
 
-	candidateHash, candidateHashErr := hasher.CalculatePerceptionHash(candidatePath)
-	existingHash, existingHashErr := hasher.CalculatePerceptionHash(existingPath)
-	if candidateHashErr == nil && existingHashErr == nil && hasher.HammingDistance(candidateHash, existingHash) <= maxConfirmPHashDistance {
-		return ThumbnailDecision{
-			Confirmed:       true,
-			PreferCandidate: ComparePreference(candidatePath, candidateMeta, candidateSize, existingPath, existingMeta, existingSize) > 0,
-		}, nil
+	childMeta := loadComparableMeta(childPath, childMetaJSON)
+	parentMeta := loadComparableMeta(parentPath, parentMetaJSON)
+
+	if !hasComparableDimensions(childMeta, parentMeta) {
+		return DerivativeDecision{}, nil
+	}
+	if !aspectRatioCompatible(childMeta, parentMeta) {
+		return DerivativeDecision{}, nil
+	}
+	if !childFitsWithinParent(childMeta, parentMeta) {
+		return DerivativeDecision{}, nil
 	}
 
-	candidateSignature, sigErr := hasher.CalculateColorSignature(candidatePath)
-	existingSignature, existingSigErr := hasher.CalculateColorSignature(existingPath)
-	if sigErr == nil && existingSigErr == nil {
-		if hasher.ColorSignatureDistance(candidateSignature, existingSignature) <= maxColorSignatureDelta {
-			return ThumbnailDecision{
-				Confirmed:       true,
-				PreferCandidate: ComparePreference(candidatePath, candidateMeta, candidateSize, existingPath, existingMeta, existingSize) > 0,
-			}, nil
+	childHash, err := hasher.CalculatePHash(childPath)
+	if err != nil {
+		return DerivativeDecision{}, fmt.Errorf("failed to calculate child candidate hash %s: %w", childPath, err)
+	}
+	parentHash, err := hasher.CalculatePHash(parentPath)
+	if err != nil {
+		return DerivativeDecision{}, fmt.Errorf("failed to calculate parent candidate hash %s: %w", parentPath, err)
+	}
+
+	hashDistance := hasher.HammingDistance(childHash, parentHash)
+	if hashDistance > maxAssistPHashDistance {
+		return DerivativeDecision{}, nil
+	}
+
+	childSignature, err := hasher.CalculateColorSignature(childPath)
+	if err != nil {
+		return DerivativeDecision{}, fmt.Errorf("failed to calculate color signature for %s: %w", childPath, err)
+	}
+	parentSignature, err := hasher.CalculateColorSignature(parentPath)
+	if err != nil {
+		return DerivativeDecision{}, fmt.Errorf("failed to calculate color signature for %s: %w", parentPath, err)
+	}
+	colorDistance := hasher.ColorSignatureDistance(childSignature, parentSignature)
+	if hashDistance > maxConfirmPHashDistance && colorDistance > maxColorSignatureDelta {
+		return DerivativeDecision{}, nil
+	}
+
+	verification, err := vision.VerifyDerivativeWithSIFT(childPath, parentPath)
+	if err != nil {
+		return DerivativeDecision{}, err
+	}
+	if verification.Confirmed {
+		return DerivativeDecision{Kind: DerivativeVariant, Confirmed: true}, nil
+	}
+
+	return DerivativeDecision{}, nil
+}
+
+// CompareMasterPreference chooses which of two files is a better canonical
+// master once they are already known to represent the same base image.
+func CompareMasterPreference(candidatePath string, candidate metadata.MediaMeta, candidateSize int64, existingPath string, existing metadata.MediaMeta, existingSize int64) int {
+	candidateMasterLike := IsLikelyMasterPath(candidatePath)
+	existingMasterLike := IsLikelyMasterPath(existingPath)
+	if candidateMasterLike != existingMasterLike {
+		if candidateMasterLike {
+			return 1
 		}
-		return ThumbnailDecision{}, nil
+		return -1
 	}
 
-	if candidateHashErr != nil {
-		return ThumbnailDecision{}, fmt.Errorf("failed to confirm candidate %s: %w", candidatePath, candidateHashErr)
-	}
-	if existingHashErr != nil {
-		return ThumbnailDecision{}, fmt.Errorf("failed to confirm existing %s: %w", existingPath, existingHashErr)
-	}
-	if sigErr != nil {
-		return ThumbnailDecision{}, fmt.Errorf("failed to calculate color signature for %s: %w", candidatePath, sigErr)
-	}
-	if existingSigErr != nil {
-		return ThumbnailDecision{}, fmt.Errorf("failed to calculate color signature for %s: %w", existingPath, existingSigErr)
-	}
-
-	return ThumbnailDecision{}, nil
-}
-
-func loadComparableMeta(path string, raw string) metadata.MediaMeta {
-	meta := metadata.ParseMediaMetaJSON(raw)
-	if meta.Width > 0 && meta.Height > 0 {
-		return meta
-	}
-	return metadata.ExtractImageMeta(path)
-}
-
-func aspectRatioCompatible(a metadata.MediaMeta, b metadata.MediaMeta) bool {
-	if a.Width <= 0 || a.Height <= 0 || b.Width <= 0 || b.Height <= 0 {
-		return true
-	}
-
-	ratioA := float64(a.Width) / float64(a.Height)
-	ratioB := float64(b.Width) / float64(b.Height)
-	diff := math.Abs(ratioA-ratioB) / math.Max(ratioA, ratioB)
-	return diff <= aspectRatioTolerance
-}
-
-// ComparePreference chooses which of two visually equivalent files should remain the master.
-func ComparePreference(candidatePath string, candidate metadata.MediaMeta, candidateSize int64, existingPath string, existing metadata.MediaMeta, existingSize int64) int {
 	candidateRaw := isRawPath(candidatePath)
 	existingRaw := isRawPath(existingPath)
-	if candidateRaw != existingRaw && dimensionsNearlyEqual(candidate, existing, rawResolutionTolerance) {
+	if candidateRaw != existingRaw && dimensionsNearlyEqual(candidate, existing, aspectRatioTolerance) {
 		if candidateRaw {
 			return 1
 		}
@@ -136,6 +144,60 @@ func ComparePreference(candidatePath string, candidate metadata.MediaMeta, candi
 		return -1
 	}
 	return 0
+}
+
+func CanAutoGroupUnderParent(childPath, parentPath string) bool {
+	if childPath == "" || parentPath == "" {
+		return false
+	}
+	if filepath.Clean(childPath) == filepath.Clean(parentPath) {
+		return false
+	}
+	return IsLikelyMasterPath(parentPath)
+}
+
+func IsThumbnailPath(path string) bool {
+	clean := filepath.Clean(path)
+	parts := strings.Split(clean, string(filepath.Separator))
+	for _, part := range parts {
+		if strings.EqualFold(part, "thumbnails") {
+			return true
+		}
+	}
+	return false
+}
+
+func ThumbnailLikeFilename(path string) bool {
+	name := strings.ToLower(filepath.Base(path))
+	return strings.Contains(name, "thumb") || strings.HasPrefix(name, "defaultimg_")
+}
+
+func IsLikelyMasterPath(path string) bool {
+	return !IsThumbnailPath(path) && !ThumbnailLikeFilename(path)
+}
+
+func loadComparableMeta(path string, raw string) metadata.MediaMeta {
+	meta := metadata.ParseMediaMetaJSON(raw)
+	if meta.Width > 0 && meta.Height > 0 {
+		return meta
+	}
+	return metadata.ExtractImageMeta(path)
+}
+
+func hasComparableDimensions(a metadata.MediaMeta, b metadata.MediaMeta) bool {
+	return a.Width > 0 && a.Height > 0 && b.Width > 0 && b.Height > 0
+}
+
+func aspectRatioCompatible(a metadata.MediaMeta, b metadata.MediaMeta) bool {
+	ratioA := float64(a.Width) / float64(a.Height)
+	ratioB := float64(b.Width) / float64(b.Height)
+	diff := math.Abs(ratioA-ratioB) / math.Max(ratioA, ratioB)
+	return diff <= aspectRatioTolerance
+}
+
+func childFitsWithinParent(child metadata.MediaMeta, parent metadata.MediaMeta) bool {
+	return float64(child.Width) <= float64(parent.Width)*maxParentUpscaleRatio &&
+		float64(child.Height) <= float64(parent.Height)*maxParentUpscaleRatio
 }
 
 func dimensionsNearlyEqual(a metadata.MediaMeta, b metadata.MediaMeta, tolerance float64) bool {

@@ -14,6 +14,7 @@ import (
 	"github.com/linuxhenhao/photo_organize/internal/dedupe"
 	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
+	"github.com/nfnt/resize"
 	"github.com/stretchr/testify/require"
 )
 
@@ -24,7 +25,21 @@ func writeJPEGWithQuality(t *testing.T, path string, quality int) {
 func writeJPEGFixturePair(t *testing.T, masterPath string, thumbPath string) {
 	t.Helper()
 	writeSizedJPEGWithQuality(t, masterPath, 96, 72, 90)
-	writeSizedJPEGWithQuality(t, thumbPath, 48, 36, 70)
+
+	file, err := os.Open(masterPath)
+	require.NoError(t, err)
+	defer file.Close()
+
+	img, _, err := image.Decode(file)
+	require.NoError(t, err)
+
+	require.NoError(t, os.MkdirAll(filepath.Dir(thumbPath), 0755))
+	thumbFile, err := os.Create(thumbPath)
+	require.NoError(t, err)
+	defer thumbFile.Close()
+
+	thumbImg := resize.Resize(48, 36, img, resize.Lanczos3)
+	require.NoError(t, jpeg.Encode(thumbFile, thumbImg, &jpeg.Options{Quality: 70}))
 }
 
 func writeSizedJPEGWithQuality(t *testing.T, path string, width int, height int, quality int) {
@@ -35,14 +50,19 @@ func writeSizedJPEGWithQuality(t *testing.T, path string, width int, height int,
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
-			rx := float64(x) / float64(width)
-			ry := float64(y) / float64(height)
-			img.Set(x, y, color.RGBA{
-				R: uint8(255 * rx),
-				G: uint8(255 * ry),
-				B: uint8(255 * (1 - rx*ry)),
-				A: 255,
-			})
+			rx := float64(x) / float64(maxDim(width-1, 1))
+			ry := float64(y) / float64(maxDim(height-1, 1))
+			baseR := uint8(255 * rx)
+			baseG := uint8(255 * ry)
+			baseB := uint8(255 * (1 - rx*ry))
+			if ((x/8)+(y/8))%2 == 0 {
+				baseR = 255 - baseR/2
+				baseB /= 2
+			}
+			if (x-width/3)*(x-width/3)+(y-height/2)*(y-height/2) < (minDim(width, height)/6)*(minDim(width, height)/6) {
+				baseG = 255
+			}
+			img.Set(x, y, color.RGBA{R: baseR, G: baseG, B: baseB, A: 255})
 		}
 	}
 
@@ -51,6 +71,20 @@ func writeSizedJPEGWithQuality(t *testing.T, path string, width int, height int,
 	defer file.Close()
 
 	require.NoError(t, jpeg.Encode(file, img, &jpeg.Options{Quality: quality}))
+}
+
+func maxDim(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minDim(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func TestInitTargetDirCacheReadOnlyDoesNotMoveFiles(t *testing.T) {

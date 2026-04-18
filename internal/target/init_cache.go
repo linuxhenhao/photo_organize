@@ -50,8 +50,7 @@ type thumbnailEntry struct {
 }
 
 type confirmedDuplicateMatch struct {
-	Match           hasher.MatchResult
-	PreferCandidate bool
+	Match hasher.MatchResult
 }
 
 type preparedTargetFile struct {
@@ -430,23 +429,11 @@ func initTargetDirCacheMove(ctx context.Context, targetDir string, paths []strin
 			continue
 		}
 
-		if !match.PreferCandidate {
-			if err := stopInitCacheAtSafePoint(ctx, fmt.Sprintf("before moving duplicate %s into thumbnails", file.Path)); err != nil {
-				return err
-			}
-			if err := demoteCurrentFile(targetDir, file, match.Match, rows, cm); err != nil {
-				log.Printf("Failed to move duplicate %s to thumbnails: %v", file.Path, err)
-				continue
-			}
-			processed++
-			continue
-		}
-
-		if err := stopInitCacheAtSafePoint(ctx, fmt.Sprintf("before promoting superior duplicate %s", file.Path)); err != nil {
+		if err := stopInitCacheAtSafePoint(ctx, fmt.Sprintf("before moving derived variant %s into thumbnails", file.Path)); err != nil {
 			return err
 		}
-		if err := promoteCurrentFile(targetDir, file, match.Match, rows, cm); err != nil {
-			log.Printf("Failed to promote superior duplicate %s: %v", file.Path, err)
+		if err := demoteCurrentFile(targetDir, file, match.Match, rows, cm); err != nil {
+			log.Printf("Failed to move derived variant %s to thumbnails: %v", file.Path, err)
 			continue
 		}
 		processed++
@@ -468,6 +455,9 @@ func initTargetDirCacheMove(ctx context.Context, targetDir string, paths []strin
 
 func findConfirmedDuplicateMatch(ctx context.Context, file targetFile, rows map[string]fileCacheRow, cm *CacheManager) (*confirmedDuplicateMatch, error) {
 	matches := cm.SearchPHash(file.PHash, dedupe.CandidateSearchDistance)
+	var best *confirmedDuplicateMatch
+	var bestMeta metadata.MediaMeta
+	ambiguous := false
 	for _, candidate := range matches {
 		if err := stopInitCacheAtSafePoint(ctx, fmt.Sprintf("before confirming duplicate candidates for %s", file.Path)); err != nil {
 			return nil, err
@@ -488,19 +478,36 @@ func findConfirmedDuplicateMatch(ctx context.Context, file targetFile, rows map[
 		}
 
 		row := rows[candidate.Path]
-		decision, err := dedupe.EvaluateThumbnailMatch(file.Path, file.Metadata, file.Size, candidate.Path, row.Metadata, candidate.Size)
+		decision, err := dedupe.ClassifyDerivative(file.Path, file.Metadata, file.Size, candidate.Path, row.Metadata, candidate.Size)
 		if err != nil {
 			log.Printf("Failed to confirm visual duplicate %s against %s: %v", file.Path, candidate.Path, err)
 			continue
 		}
 		if decision.Confirmed {
-			return &confirmedDuplicateMatch{
-				Match:           candidate,
-				PreferCandidate: decision.PreferCandidate,
-			}, nil
+			candidateMeta := metadata.ParseMediaMetaJSON(row.Metadata)
+			if best == nil {
+				best = &confirmedDuplicateMatch{Match: candidate}
+				bestMeta = candidateMeta
+				ambiguous = false
+				continue
+			}
+
+			cmp := dedupe.CompareMasterPreference(candidate.Path, candidateMeta, candidate.Size, best.Match.Path, bestMeta, best.Match.Size)
+			if cmp > 0 || (cmp == 0 && candidate.Distance < best.Match.Distance) {
+				best = &confirmedDuplicateMatch{Match: candidate}
+				bestMeta = candidateMeta
+				ambiguous = false
+				continue
+			}
+			if cmp == 0 && candidate.Distance == best.Match.Distance {
+				ambiguous = true
+			}
 		}
 	}
-	return nil, nil
+	if ambiguous {
+		return nil, nil
+	}
+	return best, nil
 }
 
 func buildThumbnailPath(baseDir, filePath string) (string, error) {
@@ -756,55 +763,5 @@ func demoteCurrentFile(targetDir string, file targetFile, match hasher.MatchResu
 	matchRow := rows[match.Path]
 	matchRow.Thumbnails = thumbJSON
 	rows[match.Path] = matchRow
-	return nil
-}
-
-func promoteCurrentFile(targetDir string, file targetFile, match hasher.MatchResult, rows map[string]fileCacheRow, cm *CacheManager) error {
-	oldThumbPath, err := moveFileToThumbnails(targetDir, match.Path)
-	if err != nil {
-		return err
-	}
-
-	oldThumbMeta := metadata.ExtractImageMetaJson(oldThumbPath)
-	mergedThumbs := mergeThumbnailEntries(
-		parseThumbnailEntries(rows[file.Path].Thumbnails),
-		parseThumbnailEntries(rows[match.Path].Thumbnails),
-		[]thumbnailEntry{makeThumbnailEntry(oldThumbPath, oldThumbMeta)},
-	)
-	thumbJSON := marshalThumbnailEntries(mergedThumbs)
-
-	tx, err := cm.db.Begin()
-	if err != nil {
-		rollbackRename(oldThumbPath, match.Path)
-		return err
-	}
-	defer tx.Rollback()
-
-	if err := deleteCacheRow(tx, match.Path); err != nil {
-		rollbackRename(oldThumbPath, match.Path)
-		return err
-	}
-	if err := replaceMasterWithThumbnails(tx, file, thumbJSON); err != nil {
-		rollbackRename(oldThumbPath, match.Path)
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		rollbackRename(oldThumbPath, match.Path)
-		return err
-	}
-
-	cm.DeleteEntryMemory(match.Path)
-	cm.SetEntryMemoryWithPresence(file.Path, file.MMH3, file.PHash, file.HasPHash, file.Size, file.Metadata)
-	delete(rows, match.Path)
-	if err := fsutil.RemoveEmptyParentDirs(filepath.Dir(match.Path), targetDir); err != nil {
-		log.Printf("Failed to remove empty directory for %s: %v", match.Path, err)
-	}
-	rows[file.Path] = fileCacheRow{
-		MMH3:       file.MMH3,
-		PHash:      file.PHashStr,
-		Size:       file.Size,
-		Metadata:   file.Metadata,
-		Thumbnails: thumbJSON,
-	}
 	return nil
 }

@@ -21,7 +21,6 @@ const (
 	importPlanWait
 	importPlanCopyMaster
 	importPlanCopyThumbnail
-	importPlanPromoteCommitted
 )
 
 type importPlan struct {
@@ -48,8 +47,7 @@ type inflightVisualCandidate struct {
 }
 
 type confirmedImportMatch struct {
-	match           hasher.MatchResult
-	preferCandidate bool
+	match hasher.MatchResult
 }
 
 type importCoordinator struct {
@@ -106,11 +104,6 @@ func (c *importCoordinator) planTask(task ImportTask, sourceMeta string) importP
 	masterTargetPath := c.resolveAvailableTargetPathLocked(task.TargetDir, task.FileName)
 	if hasPHash {
 		if match := c.findCommittedVisualMatchLocked(task, sourceMeta, phash); match != nil {
-			if match.preferCandidate {
-				reservation := c.reserveLocked(task, sourceMeta, masterTargetPath, phash, true, importPlanPromoteCommitted, match.match.Path)
-				return importPlan{action: importPlanPromoteCommitted, reservation: reservation}
-			}
-
 			thumbDir := filepath.Join(
 				targetDirRoot(task.TargetDir),
 				"thumbnails",
@@ -193,26 +186,6 @@ func (c *importCoordinator) commitReservation(reservation *importReservation) {
 				reservation.task.Size,
 				reservation.sourceMeta,
 			)
-		}
-	case importPlanPromoteCommitted:
-		c.cacheManager.AddEntryWithPresence(
-			reservation.finalPath,
-			reservation.task.MMH3Hash,
-			reservation.phash,
-			reservation.hasPHash,
-			reservation.task.Size,
-			reservation.sourceMeta,
-		)
-
-		if c.isCommittedPathValidLocked(reservation.committedMatchPath) {
-			baseDir := targetDirRoot(filepath.Dir(reservation.finalPath))
-			thumbPath := moveFileToThumbnails(baseDir, reservation.committedMatchPath)
-			if thumbPath == reservation.committedMatchPath {
-				log.Printf("Keeping both files because old master [%s] could not be moved to thumbnails", reservation.committedMatchPath)
-			} else {
-				thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
-				c.cacheManager.PromoteMaster(reservation.finalPath, reservation.committedMatchPath, thumbPath, thumbMeta)
-			}
 		}
 	}
 
@@ -301,6 +274,9 @@ func (c *importCoordinator) findCommittedExactMatchLocked(mmh3 string) (string, 
 
 func (c *importCoordinator) findCommittedVisualMatchLocked(task ImportTask, sourceMeta string, phash uint64) *confirmedImportMatch {
 	matches := c.cacheManager.SearchPHash(phash, dedupe.CandidateSearchDistance)
+	var best *confirmedImportMatch
+	var bestMeta metadata.MediaMeta
+	ambiguous := false
 	for _, candidate := range matches {
 		if _, err := os.Stat(candidate.Path); err != nil {
 			log.Printf("Removing stale perceptual match entry for missing path [%s]", candidate.Path)
@@ -309,20 +285,37 @@ func (c *importCoordinator) findCommittedVisualMatchLocked(task ImportTask, sour
 		}
 
 		existingMeta := metadata.ExtractImageMetaJson(candidate.Path)
-		decision, err := dedupe.EvaluateThumbnailMatch(task.SourcePath, sourceMeta, task.Size, candidate.Path, existingMeta, candidate.Size)
+		decision, err := dedupe.ClassifyDerivative(task.SourcePath, sourceMeta, task.Size, candidate.Path, existingMeta, candidate.Size)
 		if err != nil {
 			log.Printf("Failed to confirm visual duplicate [%s] against [%s]: %v", task.SourcePath, candidate.Path, err)
 			continue
 		}
 		if decision.Confirmed {
-			return &confirmedImportMatch{
-				match:           candidate,
-				preferCandidate: decision.PreferCandidate,
+			candidateMeta := metadata.ParseMediaMetaJSON(existingMeta)
+			if best == nil {
+				best = &confirmedImportMatch{match: candidate}
+				bestMeta = candidateMeta
+				ambiguous = false
+				continue
+			}
+
+			cmp := dedupe.CompareMasterPreference(candidate.Path, candidateMeta, candidate.Size, best.match.Path, bestMeta, best.match.Size)
+			if cmp > 0 || (cmp == 0 && candidate.Distance < best.match.Distance) {
+				best = &confirmedImportMatch{match: candidate}
+				bestMeta = candidateMeta
+				ambiguous = false
+				continue
+			}
+			if cmp == 0 && candidate.Distance == best.match.Distance {
+				ambiguous = true
 			}
 		}
 	}
 
-	return nil
+	if ambiguous {
+		return nil
+	}
+	return best
 }
 
 func (c *importCoordinator) findInflightVisualMatchLocked(task ImportTask, sourceMeta string, phash uint64) <-chan struct{} {
@@ -352,18 +345,18 @@ func (c *importCoordinator) findInflightVisualMatchLocked(task ImportTask, sourc
 	})
 
 	for _, candidate := range candidates {
-		comparePath, compareMeta, ok := c.comparePathForReservationLocked(candidate.reservation)
+		comparePath, compareMeta, compareSize, ok := c.comparePathForReservationLocked(candidate.reservation)
 		if !ok {
 			continue
 		}
 
-		decision, err := dedupe.EvaluateThumbnailMatch(
+		decision, err := dedupe.ClassifyDerivative(
 			task.SourcePath,
 			sourceMeta,
 			task.Size,
 			comparePath,
 			compareMeta,
-			candidate.reservation.task.Size,
+			compareSize,
 		)
 		if err != nil {
 			log.Printf("Failed to confirm in-flight visual duplicate [%s] against [%s]: %v", task.SourcePath, comparePath, err)
@@ -377,14 +370,20 @@ func (c *importCoordinator) findInflightVisualMatchLocked(task ImportTask, sourc
 	return nil
 }
 
-func (c *importCoordinator) comparePathForReservationLocked(reservation *importReservation) (string, string, bool) {
-	if _, err := os.Stat(reservation.task.SourcePath); err == nil {
-		return reservation.task.SourcePath, reservation.sourceMeta, true
+func (c *importCoordinator) comparePathForReservationLocked(reservation *importReservation) (string, string, int64, bool) {
+	if reservation.action == importPlanCopyThumbnail && reservation.committedMatchPath != "" {
+		if stat, err := os.Stat(reservation.committedMatchPath); err == nil {
+			return reservation.committedMatchPath, metadata.ExtractImageMetaJson(reservation.committedMatchPath), stat.Size(), true
+		}
 	}
 
-	if _, err := os.Stat(reservation.finalPath); err == nil {
-		return reservation.finalPath, metadata.ExtractImageMetaJson(reservation.finalPath), true
+	if stat, err := os.Stat(reservation.task.SourcePath); err == nil {
+		return reservation.task.SourcePath, reservation.sourceMeta, stat.Size(), true
 	}
 
-	return "", "", false
+	if stat, err := os.Stat(reservation.finalPath); err == nil {
+		return reservation.finalPath, metadata.ExtractImageMetaJson(reservation.finalPath), stat.Size(), true
+	}
+
+	return "", "", 0, false
 }

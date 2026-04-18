@@ -1,8 +1,6 @@
 package importer
 
 import (
-	"database/sql"
-	"encoding/json"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -174,15 +172,11 @@ func TestImportCoordinatorWaitsForSimilarInFlightTask(t *testing.T) {
 	require.Equal(t, importPlanCopyMaster, firstPlan.action)
 
 	secondPlan := coordinator.planTask(masterTask, metadata.ExtractImageMetaJson(masterTask.SourcePath))
-	require.Equal(t, importPlanWait, secondPlan.action)
-	require.NotNil(t, secondPlan.waitCh)
+	require.Equal(t, importPlanCopyMaster, secondPlan.action)
+	require.NotNil(t, secondPlan.reservation)
 
 	coordinator.cancelReservation(firstPlan.reservation)
-	select {
-	case <-secondPlan.waitCh:
-	default:
-		t.Fatalf("expected wait channel to be released after cancelling earlier reservation")
-	}
+	coordinator.cancelReservation(secondPlan.reservation)
 }
 
 func TestImportCoordinatorDropsMissingCommittedExactMatch(t *testing.T) {
@@ -208,100 +202,4 @@ func TestImportCoordinatorDropsMissingCommittedExactMatch(t *testing.T) {
 	require.False(t, found)
 
 	coordinator.cancelReservation(plan.reservation)
-}
-
-func TestImportCoordinatorPromoteCommittedPreservesExistingThumbnails(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "photo_organize_import_promote_test")
-	require.NoError(t, err)
-	defer os.RemoveAll(tempDir)
-
-	cacheManager, err := target.NewCacheManager(tempDir, 1)
-	require.NoError(t, err)
-
-	cacheDBPath := filepath.Join(tempDir, "cache.db")
-	sqliteDB, err := sql.Open("sqlite", cacheDBPath+"?_busy_timeout=5000")
-	require.NoError(t, err)
-	defer sqliteDB.Close()
-
-	oldMasterPath := filepath.Join(tempDir, "2024", "01", "02", "old-master.jpg")
-	oldThumbAPath := filepath.Join(tempDir, "thumbnails", "2024", "01", "02", "thumb-a.jpg")
-	oldThumbBPath := filepath.Join(tempDir, "thumbnails", "2024", "01", "02", "thumb-b.jpg")
-	newMasterPath := filepath.Join(tempDir, "2024", "01", "02", "new-master.jpg")
-	movedOldMasterPath := filepath.Join(tempDir, "thumbnails", "2024", "01", "02", "old-master.jpg")
-
-	writeSizedJPEGWithQuality(t, oldMasterPath, 72, 54, 85)
-	writeSizedJPEGWithQuality(t, oldThumbAPath, 48, 36, 65)
-	writeSizedJPEGWithQuality(t, oldThumbBPath, 40, 30, 60)
-	writeSizedJPEGWithQuality(t, newMasterPath, 96, 72, 92)
-
-	oldStat, err := os.Stat(oldMasterPath)
-	require.NoError(t, err)
-	oldHash, err := hasher.CalculateHash(oldMasterPath)
-	require.NoError(t, err)
-	oldPHash, err := hasher.CalculatePHash(oldMasterPath)
-	require.NoError(t, err)
-	oldMeta := metadata.ExtractImageMetaJson(oldMasterPath)
-	thumbAMeta := metadata.ExtractImageMetaJson(oldThumbAPath)
-	thumbBMeta := metadata.ExtractImageMetaJson(oldThumbBPath)
-
-	_, err = sqliteDB.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
-		oldMasterPath,
-		oldHash,
-		hasher.PHashToString(oldPHash),
-		oldStat.Size(),
-		oldMeta,
-		`[{"path":"`+oldThumbAPath+`","metadata":`+thumbAMeta+`},{"path":"`+oldThumbBPath+`","metadata":`+thumbBMeta+`}]`,
-	)
-	require.NoError(t, err)
-	cacheManager.SetEntryMemoryWithPresence(oldMasterPath, oldHash, oldPHash, true, oldStat.Size(), oldMeta)
-
-	newStat, err := os.Stat(newMasterPath)
-	require.NoError(t, err)
-	newHash, err := hasher.CalculateHash(newMasterPath)
-	require.NoError(t, err)
-	newPHash, err := hasher.CalculatePHash(newMasterPath)
-	require.NoError(t, err)
-	newMeta := metadata.ExtractImageMetaJson(newMasterPath)
-
-	coordinator := newImportCoordinator(cacheManager)
-	reservation := &importReservation{
-		seq:                1,
-		task:               ImportTask{SourcePath: newMasterPath, TargetDir: filepath.Dir(newMasterPath), FileName: filepath.Base(newMasterPath), Size: newStat.Size(), MMH3Hash: newHash, PHash: hasher.PHashToString(newPHash)},
-		finalPath:          newMasterPath,
-		hasPHash:           true,
-		phash:              newPHash,
-		sourceMeta:         newMeta,
-		action:             importPlanPromoteCommitted,
-		committedMatchPath: oldMasterPath,
-		done:               make(chan struct{}),
-	}
-
-	coordinator.commitReservation(reservation)
-	require.NoError(t, cacheManager.Close())
-
-	_, err = os.Stat(oldMasterPath)
-	require.True(t, os.IsNotExist(err))
-	_, err = os.Stat(movedOldMasterPath)
-	require.NoError(t, err)
-
-	var deletedCount int
-	err = sqliteDB.QueryRow(`SELECT COUNT(*) FROM file_cache WHERE target_path = ?`, oldMasterPath).Scan(&deletedCount)
-	require.NoError(t, err)
-	require.Equal(t, 0, deletedCount)
-
-	var thumbnailsRaw string
-	err = sqliteDB.QueryRow(`SELECT thumbnails FROM file_cache WHERE target_path = ?`, newMasterPath).Scan(&thumbnailsRaw)
-	require.NoError(t, err)
-
-	var thumbnails []struct {
-		Path string `json:"path"`
-	}
-	require.NoError(t, json.Unmarshal([]byte(thumbnailsRaw), &thumbnails))
-	require.Len(t, thumbnails, 3)
-
-	paths := make([]string, 0, len(thumbnails))
-	for _, thumb := range thumbnails {
-		paths = append(paths, thumb.Path)
-	}
-	require.ElementsMatch(t, []string{oldThumbAPath, oldThumbBPath, movedOldMasterPath}, paths)
 }

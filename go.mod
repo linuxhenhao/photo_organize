@@ -7,6 +7,8 @@ require (
 	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646
 	github.com/stretchr/testify v1.10.0
 	github.com/twmb/murmur3 v1.1.8
+	gocv.io/x/gocv v0.43.0
+	golang.org/x/sys v0.33.0
 	modernc.org/sqlite v1.37.1
 )
 
@@ -19,7 +21,6 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	golang.org/x/exp v0.0.0-20250408133849-7e4ce0ab07d0 // indirect
-	golang.org/x/sys v0.33.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/libc v1.65.7 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

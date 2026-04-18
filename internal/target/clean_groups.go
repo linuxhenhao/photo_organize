@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/linuxhenhao/photo_organize/internal/dedupe"
+	"github.com/linuxhenhao/photo_organize/internal/metadata"
 )
 
 // CleanGroupsOptions controls how thumbnail-group cleanup is executed.
@@ -91,7 +92,7 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 				continue
 			}
 
-			decision, err := dedupe.EvaluateThumbnailMatch(
+			decision, err := dedupe.ClassifyDerivative(
 				entryAbsPath,
 				string(entry.Metadata),
 				entryStat.Size(),
@@ -262,7 +263,7 @@ func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheMan
 	}
 
 	if exactPath, ok := cm.FindExactMatch(candidate.MMH3); ok && exactPath != "" && exactPath != excludedMaster && exactPath != candidate.Path {
-		if _, exists := rows[exactPath]; exists {
+		if _, exists := rows[exactPath]; exists && dedupe.CanAutoGroupUnderParent(candidate.Path, exactPath) {
 			return exactPath, nil
 		}
 	}
@@ -271,6 +272,10 @@ func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheMan
 		return "", nil
 	}
 
+	bestPath := ""
+	bestMeta := metadata.MediaMeta{}
+	bestDistance := 0
+	ambiguous := false
 	for _, match := range cm.SearchPHash(candidate.PHash, dedupe.CandidateSearchDistance) {
 		if match.Path == excludedMaster || match.Path == candidate.Path {
 			continue
@@ -287,7 +292,7 @@ func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheMan
 			continue
 		}
 
-		decision, err := dedupe.EvaluateThumbnailMatch(
+		decision, err := dedupe.ClassifyDerivative(
 			candidate.Path,
 			candidate.Metadata,
 			candidate.Size,
@@ -300,11 +305,33 @@ func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheMan
 			continue
 		}
 		if decision.Confirmed {
-			return match.Path, nil
+			matchMeta := metadata.ParseMediaMetaJSON(existingFile.Metadata)
+			if bestPath == "" {
+				bestPath = match.Path
+				bestMeta = matchMeta
+				bestDistance = match.Distance
+				ambiguous = false
+				continue
+			}
+
+			cmp := dedupe.CompareMasterPreference(match.Path, matchMeta, match.Size, bestPath, bestMeta, rows[bestPath].Size)
+			if cmp > 0 || (cmp == 0 && match.Distance < bestDistance) {
+				bestPath = match.Path
+				bestMeta = matchMeta
+				bestDistance = match.Distance
+				ambiguous = false
+				continue
+			}
+			if cmp == 0 && match.Distance == bestDistance {
+				ambiguous = true
+			}
 		}
 	}
 
-	return "", nil
+	if ambiguous {
+		return "", nil
+	}
+	return bestPath, nil
 }
 
 func loadStoredTargetFile(targetDir, storedPath string, row fileCacheRow, prepared map[string]targetFile) (targetFile, error) {

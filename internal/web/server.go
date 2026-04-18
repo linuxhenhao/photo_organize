@@ -224,7 +224,7 @@ func preferredKeepPathForGroup(group DuplicateGroup) string {
 	bestMeta := imageInfoMeta(best)
 
 	for _, candidate := range group.Duplicates {
-		if dedupe.ComparePreference(
+		if dedupe.CompareMasterPreference(
 			candidate.Path,
 			imageInfoMeta(candidate),
 			candidate.Size,
