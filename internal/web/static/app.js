@@ -6,9 +6,12 @@ const STATE = {
     totalPages: 0,
     loading: false,
     resolvingPage: false,
+    batchProgressText: '',
     focusedIndex: -1,
     pendingSingleClick: null,
 };
+
+const BATCH_RESOLVE_CONCURRENCY = 6;
 
 const groupsContainer = document.getElementById('groups-container');
 const loadingIndicator = document.getElementById('loading-indicator');
@@ -320,6 +323,11 @@ const updatePagination = () => {
         ? 'Resolving Current Page...'
         : `Resolve ${currentCount} Groups on This Page`;
 
+    if (STATE.resolvingPage && STATE.batchProgressText) {
+        batchStatus.textContent = STATE.batchProgressText;
+        return;
+    }
+
     batchStatus.textContent = STATE.totalGroups > 0
         ? `Showing ${currentCount} of ${STATE.totalGroups} groups`
         : 'No groups loaded';
@@ -486,32 +494,68 @@ const resolveGroup = async (groupIndex) => {
 };
 
 const resolveCurrentPage = async () => {
-    const groups = visibleGroups();
+    const groups = STATE.groups
+        .map((group, index) => (group ? { group, index } : null))
+        .filter(Boolean);
     if (groups.length === 0 || STATE.resolvingPage) return;
 
     const confirmed = window.confirm(`Resolve ${groups.length} groups on page ${STATE.page}?`);
     if (!confirmed) return;
 
     STATE.resolvingPage = true;
+    STATE.batchProgressText = `Resolving 0/${groups.length} groups on page ${STATE.page} with concurrency ${Math.min(BATCH_RESOLVE_CONCURRENCY, groups.length)}`;
     updatePagination();
 
     let resolved = 0;
-    try {
-        for (let idx = 0; idx < STATE.groups.length; idx += 1) {
-            const group = STATE.groups[idx];
-            if (!group) continue;
+    let failed = 0;
+    let nextTask = 0;
+    const failures = [];
 
-            batchStatus.textContent = `Resolving ${resolved + 1} of ${groups.length} groups on page ${STATE.page}`;
-            await postResolve(group);
-            markGroupResolved(idx);
-            resolved += 1;
+    const updateBatchProgress = () => {
+        STATE.batchProgressText = `Resolved ${resolved}/${groups.length} groups on page ${STATE.page}`;
+        if (failed > 0) {
+            STATE.batchProgressText += `, ${failed} failed`;
         }
-    } catch (error) {
-        console.error('Batch resolve error', error);
-        alert(`Batch resolve stopped after ${resolved} groups: ${error.message}`);
+        updatePagination();
+    };
+
+    try {
+        const concurrency = Math.min(BATCH_RESOLVE_CONCURRENCY, groups.length);
+        const workers = Array.from({ length: concurrency }, async () => {
+            while (nextTask < groups.length) {
+                const currentTask = groups[nextTask];
+                nextTask += 1;
+
+                try {
+                    await postResolve(currentTask.group);
+                    markGroupResolved(currentTask.index);
+                    resolved += 1;
+                } catch (error) {
+                    failed += 1;
+                    failures.push({
+                        path: currentTask.group.master.path,
+                        message: error.message,
+                    });
+                    console.error('Batch resolve error', currentTask.group.master.path, error);
+                }
+
+                updateBatchProgress();
+            }
+        });
+
+        await Promise.all(workers);
     } finally {
         STATE.resolvingPage = false;
+        STATE.batchProgressText = '';
         await fetchGroups(STATE.page);
+    }
+
+    if (failures.length > 0) {
+        const firstFailure = failures[0];
+        const suffix = failures.length > 1
+            ? ` First failure: ${firstFailure.path} (${firstFailure.message})`
+            : ` Failure: ${firstFailure.path} (${firstFailure.message})`;
+        alert(`Resolved ${resolved} groups, ${failed} failed.${suffix}`);
     }
 };
 
