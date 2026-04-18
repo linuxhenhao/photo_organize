@@ -125,7 +125,19 @@ func TestComparePreferencePrefersRAWWhenResolutionMatches(t *testing.T) {
 	require.Equal(t, 1, decision)
 }
 
-func TestComparePreferenceStillPrefersHigherResolutionOverRAW(t *testing.T) {
+func TestComparePreferencePrefersRAWWhenResolutionIsWithinTolerance(t *testing.T) {
+	decision := ComparePreference(
+		"candidate.CR2",
+		metadata.MediaMeta{Width: 5184, Height: 3456},
+		21_531_849,
+		"existing.jpg",
+		metadata.MediaMeta{Width: 5208, Height: 3476},
+		1_807_441,
+	)
+	require.Equal(t, 1, decision)
+}
+
+func TestComparePreferenceStillPrefersHigherResolutionOverRAWOutsideTolerance(t *testing.T) {
 	decision := ComparePreference(
 		"candidate.CR2",
 		metadata.MediaMeta{Width: 4000, Height: 3000},

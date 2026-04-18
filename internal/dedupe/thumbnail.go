@@ -20,6 +20,7 @@ const (
 	maxConfirmPHashDistance = 16
 	aspectRatioTolerance    = 0.03
 	maxColorSignatureDelta  = 12
+	rawResolutionTolerance  = 0.02
 )
 
 // ThumbnailDecision reports whether two files are the same image and which one should remain master.
@@ -96,6 +97,15 @@ func aspectRatioCompatible(a metadata.MediaMeta, b metadata.MediaMeta) bool {
 
 // ComparePreference chooses which of two visually equivalent files should remain the master.
 func ComparePreference(candidatePath string, candidate metadata.MediaMeta, candidateSize int64, existingPath string, existing metadata.MediaMeta, existingSize int64) int {
+	candidateRaw := isRawPath(candidatePath)
+	existingRaw := isRawPath(existingPath)
+	if candidateRaw != existingRaw && dimensionsNearlyEqual(candidate, existing, rawResolutionTolerance) {
+		if candidateRaw {
+			return 1
+		}
+		return -1
+	}
+
 	candidateArea := pixelArea(candidate)
 	existingArea := pixelArea(existing)
 	if candidateArea > 0 && existingArea > 0 && candidateArea != existingArea {
@@ -119,15 +129,6 @@ func ComparePreference(candidatePath string, candidate metadata.MediaMeta, candi
 		return -1
 	}
 
-	candidateRaw := isRawPath(candidatePath)
-	existingRaw := isRawPath(existingPath)
-	if candidateRaw != existingRaw {
-		if candidateRaw {
-			return 1
-		}
-		return -1
-	}
-
 	if candidateSize > existingSize {
 		return 1
 	}
@@ -135,6 +136,16 @@ func ComparePreference(candidatePath string, candidate metadata.MediaMeta, candi
 		return -1
 	}
 	return 0
+}
+
+func dimensionsNearlyEqual(a metadata.MediaMeta, b metadata.MediaMeta, tolerance float64) bool {
+	if a.Width <= 0 || a.Height <= 0 || b.Width <= 0 || b.Height <= 0 {
+		return false
+	}
+
+	widthDiff := math.Abs(float64(a.Width)-float64(b.Width)) / math.Max(float64(a.Width), float64(b.Width))
+	heightDiff := math.Abs(float64(a.Height)-float64(b.Height)) / math.Max(float64(a.Height), float64(b.Height))
+	return widthDiff <= tolerance && heightDiff <= tolerance
 }
 
 func isRawPath(path string) bool {

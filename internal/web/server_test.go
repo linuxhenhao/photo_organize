@@ -686,7 +686,7 @@ func TestHandleGetDuplicatesReturnsPaginationMetadata(t *testing.T) {
 	require.Equal(t, "b-master.jpg", payload.Groups[0].Master.Path)
 }
 
-func TestHandleGetDuplicatesPrefersRawKeepPathWhenResolutionMatches(t *testing.T) {
+func TestHandleGetDuplicatesPrefersRawKeepPathWhenResolutionIsWithinTolerance(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "web_duplicates_preferred_keep_test")
 	require.NoError(t, err)
 	defer os.RemoveAll(tempDir)
@@ -716,8 +716,8 @@ func TestHandleGetDuplicatesPrefersRawKeepPathWhenResolutionMatches(t *testing.T
 		"h1",
 		"p1",
 		8_000_000,
-		`{"width":6000,"height":4000,"size":8000000}`,
-		`[{"path":"shot.CR2","metadata":{"width":6000,"height":4000,"size":2000000}}]`,
+		`{"width":5208,"height":3476,"size":8000000}`,
+		`[{"path":"shot.CR2","metadata":{"width":5184,"height":3456,"size":2000000}}]`,
 	)
 	require.NoError(t, err)
 
