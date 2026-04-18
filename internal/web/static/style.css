@@ -158,6 +158,14 @@ kbd {
     margin-bottom: 1.5rem;
 }
 
+.group-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
 .group-title-wrap {
     display: flex;
     flex-direction: column;
@@ -197,6 +205,23 @@ kbd {
     cursor: not-allowed;
     transform: none;
     box-shadow: none;
+}
+
+.download-btn {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-primary);
+    border: 1px solid var(--glass-border);
+    padding: 0.6rem 1rem;
+    border-radius: 8px;
+    font-family: inherit;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.download-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.18);
 }
 
 .images-grid {

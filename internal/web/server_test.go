@@ -1,6 +1,7 @@
 package web
 
 import (
+	"archive/tar"
 	"bytes"
 	"crypto/md5"
 	"database/sql"
@@ -10,10 +11,12 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -252,6 +255,174 @@ func TestHandleResolveGroupKeepsMultipleSelectedItems(t *testing.T) {
 	foundPath, found := cacheManager.FindExactMatch(expectedHash)
 	require.True(t, found)
 	require.Equal(t, restoredKeepPath, foundPath)
+}
+
+func TestHandleGroupArchiveDownloadIncludesManifestAndFiles(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "web_group_archive_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	dbPath := filepath.Join(tempDir, "cache.db")
+	sqliteDB, err := sql.Open("sqlite", dbPath+"?_busy_timeout=5000")
+	require.NoError(t, err)
+	defer sqliteDB.Close()
+
+	_, err = sqliteDB.Exec(`
+		CREATE TABLE file_cache (
+			target_path TEXT PRIMARY KEY,
+			mmh3_hash TEXT,
+			phash TEXT,
+			size INTEGER,
+			metadata TEXT DEFAULT '{}',
+			thumbnails TEXT DEFAULT '[]'
+		)
+	`)
+	require.NoError(t, err)
+
+	masterPath := filepath.Join(tempDir, "2024", "01", "02", "master.jpg")
+	dupPath := filepath.Join(tempDir, "2024", "01", "02", "dup.jpg")
+	masterBytes := writeJPEG(t, masterPath, 12, 12, color.RGBA{255, 0, 0, 255})
+	dupBytes := writeJPEG(t, dupPath, 10, 10, color.RGBA{0, 255, 0, 255})
+
+	_, err = sqliteDB.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
+		masterPath, "master-hash", "", int64(len(masterBytes)), "{}",
+		`[{"path":"`+dupPath+`","metadata":{"size":`+fmt.Sprintf("%d", len(dupBytes))+`}}]`)
+	require.NoError(t, err)
+
+	ws := NewWebServer(nil, tempDir)
+	ws.db = sqliteDB
+
+	req := httptest.NewRequest(http.MethodGet, "/api/group-archive?masterPath="+url.QueryEscape(masterPath), nil)
+	rr := httptest.NewRecorder()
+
+	ws.handleGroupArchiveDownload(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Equal(t, "application/x-tar", rr.Header().Get("Content-Type"))
+	require.Contains(t, rr.Header().Get("Content-Disposition"), "attachment;")
+
+	tr := tar.NewReader(bytes.NewReader(rr.Body.Bytes()))
+	entries := map[string][]byte{}
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+
+		content, err := io.ReadAll(tr)
+		require.NoError(t, err)
+		entries[header.Name] = content
+	}
+
+	require.Contains(t, entries, "manifest.json")
+	require.Contains(t, entries, "2024/01/02/master.jpg")
+	require.Contains(t, entries, "2024/01/02/dup.jpg")
+	require.Equal(t, masterBytes, entries["2024/01/02/master.jpg"])
+	require.Equal(t, dupBytes, entries["2024/01/02/dup.jpg"])
+
+	var manifest groupArchiveManifest
+	require.NoError(t, json.Unmarshal(entries["manifest.json"], &manifest))
+	require.Equal(t, masterPath, manifest.MasterPath)
+	require.Len(t, manifest.Members, 2)
+	require.Equal(t, "2024/01/02/master.jpg", manifest.Members[0].ArchivePath)
+	require.True(t, manifest.Members[0].IsMaster)
+	require.Equal(t, "2024/01/02/dup.jpg", manifest.Members[1].ArchivePath)
+	require.False(t, manifest.Members[1].IsMaster)
+}
+
+func TestHandleGroupsArchiveDownloadIncludesAllVisibleGroups(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "web_groups_archive_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	dbPath := filepath.Join(tempDir, "cache.db")
+	sqliteDB, err := sql.Open("sqlite", dbPath+"?_busy_timeout=5000")
+	require.NoError(t, err)
+	defer sqliteDB.Close()
+
+	_, err = sqliteDB.Exec(`
+		CREATE TABLE file_cache (
+			target_path TEXT PRIMARY KEY,
+			mmh3_hash TEXT,
+			phash TEXT,
+			size INTEGER,
+			metadata TEXT DEFAULT '{}',
+			thumbnails TEXT DEFAULT '[]'
+		)
+	`)
+	require.NoError(t, err)
+
+	masterA := filepath.Join(tempDir, "2024", "01", "02", "master-a.jpg")
+	dupA := filepath.Join(tempDir, "2024", "01", "02", "dup-a.jpg")
+	masterB := filepath.Join(tempDir, "2024", "01", "03", "master-b.jpg")
+	masterABytes := writeJPEG(t, masterA, 12, 12, color.RGBA{255, 0, 0, 255})
+	dupABytes := writeJPEG(t, dupA, 10, 10, color.RGBA{0, 255, 0, 255})
+	masterBBytes := writeJPEG(t, masterB, 14, 14, color.RGBA{0, 0, 255, 255})
+
+	_, err = sqliteDB.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
+		masterA, "hash-a", "", int64(len(masterABytes)), "{}",
+		`[{"path":"`+dupA+`","metadata":{"size":`+fmt.Sprintf("%d", len(dupABytes))+`}}]`)
+	require.NoError(t, err)
+	_, err = sqliteDB.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
+		masterB, "hash-b", "", int64(len(masterBBytes)), "{}", "[]")
+	require.NoError(t, err)
+
+	ws := NewWebServer(nil, tempDir)
+	ws.db = sqliteDB
+
+	body, err := json.Marshal(map[string]any{
+		"masterPaths": []string{masterA, masterB},
+	})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/groups-archive", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	ws.handleGroupsArchiveDownload(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Equal(t, "application/x-tar", rr.Header().Get("Content-Type"))
+
+	tr := tar.NewReader(bytes.NewReader(rr.Body.Bytes()))
+	entries := map[string][]byte{}
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+
+		content, err := io.ReadAll(tr)
+		require.NoError(t, err)
+		entries[header.Name] = content
+	}
+
+	rootManifestBytes, ok := entries["manifest.json"]
+	require.True(t, ok)
+
+	var rootManifest groupsArchiveManifest
+	require.NoError(t, json.Unmarshal(rootManifestBytes, &rootManifest))
+	require.Equal(t, 2, rootManifest.GroupCount)
+	require.Len(t, rootManifest.Groups, 2)
+
+	firstGroup := rootManifest.Groups[0]
+	secondGroup := rootManifest.Groups[1]
+
+	require.Equal(t, masterA, firstGroup.MasterPath)
+	require.Equal(t, 2, firstGroup.MemberCount)
+	require.Equal(t, masterB, secondGroup.MasterPath)
+	require.Equal(t, 1, secondGroup.MemberCount)
+
+	require.Contains(t, entries, firstGroup.ManifestPath)
+	require.Contains(t, entries, secondGroup.ManifestPath)
+	require.Contains(t, entries, path.Join(firstGroup.Directory, "2024/01/02/master-a.jpg"))
+	require.Contains(t, entries, path.Join(firstGroup.Directory, "2024/01/02/dup-a.jpg"))
+	require.Contains(t, entries, path.Join(secondGroup.Directory, "2024/01/03/master-b.jpg"))
+	require.Equal(t, masterABytes, entries[path.Join(firstGroup.Directory, "2024/01/02/master-a.jpg")])
+	require.Equal(t, dupABytes, entries[path.Join(firstGroup.Directory, "2024/01/02/dup-a.jpg")])
+	require.Equal(t, masterBBytes, entries[path.Join(secondGroup.Directory, "2024/01/03/master-b.jpg")])
 }
 
 func TestHandleImageServeAcceptsStoredRelativeDestPath(t *testing.T) {

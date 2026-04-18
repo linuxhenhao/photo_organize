@@ -1,6 +1,7 @@
 package web
 
 import (
+	"archive/tar"
 	"crypto/md5"
 	"database/sql"
 	"embed"
@@ -12,11 +13,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	projectexiftool "github.com/linuxhenhao/photo_organize/internal/exiftool"
 	"github.com/linuxhenhao/photo_organize/internal/fsutil"
@@ -172,6 +175,32 @@ type groupMember struct {
 	isMaster bool
 }
 
+type groupArchiveMember struct {
+	Path        string `json:"path"`
+	ArchivePath string `json:"archivePath"`
+	IsMaster    bool   `json:"isMaster"`
+	Size        int64  `json:"size"`
+}
+
+type groupArchiveManifest struct {
+	MasterPath  string               `json:"masterPath"`
+	GeneratedAt string               `json:"generatedAt"`
+	Members     []groupArchiveMember `json:"members"`
+}
+
+type groupsArchiveGroupSummary struct {
+	MasterPath   string `json:"masterPath"`
+	Directory    string `json:"directory"`
+	ManifestPath string `json:"manifestPath"`
+	MemberCount  int    `json:"memberCount"`
+}
+
+type groupsArchiveManifest struct {
+	GeneratedAt string                      `json:"generatedAt"`
+	GroupCount  int                         `json:"groupCount"`
+	Groups      []groupsArchiveGroupSummary `json:"groups"`
+}
+
 type renameRecord struct {
 	currentPath  string
 	originalPath string
@@ -252,6 +281,27 @@ func fileNameWithSuffix(name string, suffix int, ext string) string {
 	return fmt.Sprintf("%s-%d%s", name, suffix, ext)
 }
 
+func safeArchiveBaseName(path string) string {
+	base := strings.TrimSpace(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
+	if base == "" {
+		base = "group"
+	}
+	replacer := strings.NewReplacer(
+		" ", "-",
+		"/", "-",
+		"\\", "-",
+		":", "-",
+		";", "-",
+		",", "-",
+	)
+	base = replacer.Replace(base)
+	base = strings.Trim(base, "-.")
+	if base == "" {
+		base = "group"
+	}
+	return base
+}
+
 func (ws *WebServer) isThumbnailAbs(absPath string) bool {
 	absDest, err := filepath.Abs(ws.destDir)
 	if err != nil {
@@ -299,6 +349,191 @@ func (ws *WebServer) restoreThumbnailDestination(absThumbPath string) (string, e
 			return "", err
 		}
 	}
+}
+
+func (ws *WebServer) archivePathFor(absPath string) (string, error) {
+	absDest, err := filepath.Abs(ws.destDir)
+	if err != nil {
+		return "", err
+	}
+
+	rel, err := filepath.Rel(absDest, absPath)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path escapes destination")
+	}
+
+	return filepath.ToSlash(filepath.Clean(rel)), nil
+}
+
+type archiveFileEntry struct {
+	sourcePath  string
+	archivePath string
+	stat        os.FileInfo
+}
+
+func (ws *WebServer) prepareGroupArchive(masterRaw string, members []groupMember, prefix string) (groupArchiveManifest, []archiveFileEntry, error) {
+	manifest := groupArchiveManifest{
+		MasterPath:  masterRaw,
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		Members:     make([]groupArchiveMember, 0, len(members)),
+	}
+
+	entries := make([]archiveFileEntry, 0, len(members))
+	for _, member := range members {
+		stat, err := os.Stat(member.abs)
+		if err != nil {
+			return groupArchiveManifest{}, nil, err
+		}
+		if stat.IsDir() {
+			continue
+		}
+
+		archivePath, err := ws.archivePathFor(member.abs)
+		if err != nil {
+			return groupArchiveManifest{}, nil, err
+		}
+		if prefix != "" {
+			archivePath = path.Join(prefix, archivePath)
+		}
+
+		entries = append(entries, archiveFileEntry{
+			sourcePath:  member.abs,
+			archivePath: archivePath,
+			stat:        stat,
+		})
+		manifest.Members = append(manifest.Members, groupArchiveMember{
+			Path:        member.raw,
+			ArchivePath: archivePath,
+			IsMaster:    member.isMaster,
+			Size:        stat.Size(),
+		})
+	}
+
+	return manifest, entries, nil
+}
+
+func writeTarBytes(tw *tar.Writer, archivePath string, data []byte) error {
+	header := &tar.Header{
+		Name:    archivePath,
+		Mode:    0644,
+		Size:    int64(len(data)),
+		ModTime: time.Now(),
+	}
+	if err := tw.WriteHeader(header); err != nil {
+		return err
+	}
+	_, err := tw.Write(data)
+	return err
+}
+
+func writeArchiveFiles(tw *tar.Writer, entries []archiveFileEntry) error {
+	for _, entry := range entries {
+		file, err := os.Open(entry.sourcePath)
+		if err != nil {
+			return err
+		}
+
+		header, err := tar.FileInfoHeader(entry.stat, "")
+		if err != nil {
+			file.Close()
+			return err
+		}
+		header.Name = entry.archivePath
+		if err := tw.WriteHeader(header); err != nil {
+			file.Close()
+			return err
+		}
+		if _, err := io.Copy(tw, file); err != nil {
+			file.Close()
+			return err
+		}
+		file.Close()
+	}
+
+	return nil
+}
+
+func (ws *WebServer) writeGroupArchiveToTar(tw *tar.Writer, masterRaw string, members []groupMember, prefix string) (groupArchiveManifest, error) {
+	manifest, entries, err := ws.prepareGroupArchive(masterRaw, members, prefix)
+	if err != nil {
+		return groupArchiveManifest{}, err
+	}
+
+	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return groupArchiveManifest{}, err
+	}
+
+	manifestPath := "manifest.json"
+	if prefix != "" {
+		manifestPath = path.Join(prefix, "manifest.json")
+	}
+	if err := writeTarBytes(tw, manifestPath, manifestBytes); err != nil {
+		return groupArchiveManifest{}, err
+	}
+	if err := writeArchiveFiles(tw, entries); err != nil {
+		return groupArchiveManifest{}, err
+	}
+
+	return manifest, nil
+}
+
+func (ws *WebServer) streamGroupArchive(w io.Writer, masterRaw string, members []groupMember) error {
+	tw := tar.NewWriter(w)
+	defer tw.Close()
+
+	_, err := ws.writeGroupArchiveToTar(tw, masterRaw, members, "")
+	return err
+}
+
+func groupArchiveDirectoryName(index int, masterRaw string) string {
+	digest := md5.Sum([]byte(masterRaw))
+	return fmt.Sprintf("groups/%03d-%s-%s", index+1, safeArchiveBaseName(masterRaw), hex.EncodeToString(digest[:4]))
+}
+
+func (ws *WebServer) streamGroupsArchive(w io.Writer, masterPaths []string) error {
+	tw := tar.NewWriter(w)
+	defer tw.Close()
+
+	manifest := groupsArchiveManifest{
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		GroupCount:  len(masterPaths),
+		Groups:      make([]groupsArchiveGroupSummary, 0, len(masterPaths)),
+	}
+
+	for index, masterRaw := range masterPaths {
+		masterAbs, err := ws.resolveWithinDest(masterRaw)
+		if err != nil {
+			return err
+		}
+
+		members, err := ws.loadGroupMembers(masterRaw, masterAbs)
+		if err != nil {
+			return err
+		}
+
+		groupDir := groupArchiveDirectoryName(index, masterRaw)
+		groupManifest, err := ws.writeGroupArchiveToTar(tw, masterRaw, members, groupDir)
+		if err != nil {
+			return err
+		}
+
+		manifest.Groups = append(manifest.Groups, groupsArchiveGroupSummary{
+			MasterPath:   masterRaw,
+			Directory:    groupDir,
+			ManifestPath: path.Join(groupDir, "manifest.json"),
+			MemberCount:  len(groupManifest.Members),
+		})
+	}
+
+	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeTarBytes(tw, "manifest.json", manifestBytes)
 }
 
 func rollbackRenames(renames []renameRecord) {
@@ -594,6 +829,8 @@ func (ws *WebServer) Start(host string, port int, db *sql.DB) error {
 
 	// API Endpoints
 	mux.HandleFunc("/api/duplicates", ws.handleGetDuplicates)
+	mux.HandleFunc("/api/group-archive", ws.handleGroupArchiveDownload)
+	mux.HandleFunc("/api/groups-archive", ws.handleGroupsArchiveDownload)
 	mux.HandleFunc("/api/resolve", ws.handleResolveGroup)
 	mux.HandleFunc("/image", ws.handleImageServe)
 
@@ -975,6 +1212,78 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func (ws *WebServer) handleGroupArchiveDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	masterRaw := strings.TrimSpace(r.URL.Query().Get("masterPath"))
+	if masterRaw == "" {
+		http.Error(w, "masterPath is required", http.StatusBadRequest)
+		return
+	}
+
+	masterAbs, err := ws.resolveWithinDest(masterRaw)
+	if err != nil {
+		http.Error(w, "Invalid masterPath", http.StatusBadRequest)
+		return
+	}
+
+	members, err := ws.loadGroupMembers(masterRaw, masterAbs)
+	if err == sql.ErrNoRows {
+		http.Error(w, "Master group not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "Failed to load group", http.StatusInternalServerError)
+		return
+	}
+
+	archiveDigest := md5.Sum([]byte(masterRaw))
+	archiveName := fmt.Sprintf(
+		"%s-%s.tar",
+		safeArchiveBaseName(masterRaw),
+		hex.EncodeToString(archiveDigest[:4]),
+	)
+	w.Header().Set("Content-Type", "application/x-tar")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", archiveName))
+
+	if err := ws.streamGroupArchive(w, masterRaw, members); err != nil {
+		log.Printf("Failed to stream group archive for %s: %v", masterRaw, err)
+	}
+}
+
+func (ws *WebServer) handleGroupsArchiveDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		MasterPaths []string `json:"masterPaths"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	masterPaths := dedupePaths(req.MasterPaths)
+	if len(masterPaths) == 0 {
+		http.Error(w, "masterPaths is required", http.StatusBadRequest)
+		return
+	}
+
+	archiveDigest := md5.Sum([]byte(strings.Join(masterPaths, "\n")))
+	archiveName := fmt.Sprintf("visible-groups-%d-%s.tar", len(masterPaths), hex.EncodeToString(archiveDigest[:4]))
+	w.Header().Set("Content-Type", "application/x-tar")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", archiveName))
+
+	if err := ws.streamGroupsArchive(w, masterPaths); err != nil {
+		log.Printf("Failed to stream groups archive: %v", err)
+	}
 }
 
 func (ws *WebServer) handleImageServe(w http.ResponseWriter, r *http.Request) {
