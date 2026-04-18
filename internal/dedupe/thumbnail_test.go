@@ -102,11 +102,37 @@ func TestEvaluateThumbnailMatchRejectsAspectRatioMismatch(t *testing.T) {
 }
 
 func TestComparePreferencePrefersHigherResolutionOverFileSize(t *testing.T) {
-	decision := comparePreference(
+	decision := ComparePreference(
+		"candidate.jpg",
 		metadata.MediaMeta{Width: 128, Height: 128},
 		900,
+		"existing.jpg",
 		metadata.MediaMeta{Width: 64, Height: 64},
 		1500,
 	)
 	require.Equal(t, 1, decision)
+}
+
+func TestComparePreferencePrefersRAWWhenResolutionMatches(t *testing.T) {
+	decision := ComparePreference(
+		"candidate.CR2",
+		metadata.MediaMeta{Width: 6000, Height: 4000},
+		2_000_000,
+		"existing.jpg",
+		metadata.MediaMeta{Width: 6000, Height: 4000},
+		8_000_000,
+	)
+	require.Equal(t, 1, decision)
+}
+
+func TestComparePreferenceStillPrefersHigherResolutionOverRAW(t *testing.T) {
+	decision := ComparePreference(
+		"candidate.CR2",
+		metadata.MediaMeta{Width: 4000, Height: 3000},
+		20_000_000,
+		"existing.jpg",
+		metadata.MediaMeta{Width: 6000, Height: 4000},
+		8_000_000,
+	)
+	require.Equal(t, -1, decision)
 }

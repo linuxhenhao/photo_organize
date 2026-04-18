@@ -3,6 +3,8 @@ package dedupe
 import (
 	"fmt"
 	"math"
+	"path/filepath"
+	"strings"
 
 	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
@@ -41,7 +43,7 @@ func EvaluateThumbnailMatch(candidatePath string, candidateMetaJSON string, cand
 	if candidateHashErr == nil && existingHashErr == nil && hasher.HammingDistance(candidateHash, existingHash) <= maxConfirmPHashDistance {
 		return ThumbnailDecision{
 			Confirmed:       true,
-			PreferCandidate: comparePreference(candidateMeta, candidateSize, existingMeta, existingSize) > 0,
+			PreferCandidate: ComparePreference(candidatePath, candidateMeta, candidateSize, existingPath, existingMeta, existingSize) > 0,
 		}, nil
 	}
 
@@ -51,7 +53,7 @@ func EvaluateThumbnailMatch(candidatePath string, candidateMetaJSON string, cand
 		if hasher.ColorSignatureDistance(candidateSignature, existingSignature) <= maxColorSignatureDelta {
 			return ThumbnailDecision{
 				Confirmed:       true,
-				PreferCandidate: comparePreference(candidateMeta, candidateSize, existingMeta, existingSize) > 0,
+				PreferCandidate: ComparePreference(candidatePath, candidateMeta, candidateSize, existingPath, existingMeta, existingSize) > 0,
 			}, nil
 		}
 		return ThumbnailDecision{}, nil
@@ -92,7 +94,8 @@ func aspectRatioCompatible(a metadata.MediaMeta, b metadata.MediaMeta) bool {
 	return diff <= aspectRatioTolerance
 }
 
-func comparePreference(candidate metadata.MediaMeta, candidateSize int64, existing metadata.MediaMeta, existingSize int64) int {
+// ComparePreference chooses which of two visually equivalent files should remain the master.
+func ComparePreference(candidatePath string, candidate metadata.MediaMeta, candidateSize int64, existingPath string, existing metadata.MediaMeta, existingSize int64) int {
 	candidateArea := pixelArea(candidate)
 	existingArea := pixelArea(existing)
 	if candidateArea > 0 && existingArea > 0 && candidateArea != existingArea {
@@ -116,6 +119,15 @@ func comparePreference(candidate metadata.MediaMeta, candidateSize int64, existi
 		return -1
 	}
 
+	candidateRaw := isRawPath(candidatePath)
+	existingRaw := isRawPath(existingPath)
+	if candidateRaw != existingRaw {
+		if candidateRaw {
+			return 1
+		}
+		return -1
+	}
+
 	if candidateSize > existingSize {
 		return 1
 	}
@@ -123,6 +135,15 @@ func comparePreference(candidate metadata.MediaMeta, candidateSize int64, existi
 		return -1
 	}
 	return 0
+}
+
+func isRawPath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".cr2", ".cr3", ".arw", ".nef", ".nrw", ".dng", ".rw2", ".orf", ".raf", ".srw", ".raw":
+		return true
+	default:
+		return false
+	}
 }
 
 func pixelArea(meta metadata.MediaMeta) int64 {

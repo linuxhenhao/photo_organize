@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/linuxhenhao/photo_organize/internal/dedupe"
 	projectexiftool "github.com/linuxhenhao/photo_organize/internal/exiftool"
 	"github.com/linuxhenhao/photo_organize/internal/fsutil"
 	"github.com/linuxhenhao/photo_organize/internal/hasher"
@@ -63,8 +64,9 @@ type ImageInfo struct {
 
 // DuplicateGroup represents a group of visually identical photos
 type DuplicateGroup struct {
-	Master     ImageInfo   `json:"master"`
-	Duplicates []ImageInfo `json:"duplicates"`
+	Master            ImageInfo   `json:"master"`
+	Duplicates        []ImageInfo `json:"duplicates"`
+	PreferredKeepPath string      `json:"preferredKeepPath,omitempty"`
 }
 
 // NewWebServer initializes the web server backend
@@ -204,6 +206,36 @@ type resolvedStandaloneEntry struct {
 	hasPHash   bool
 	size       int64
 	metadata   string
+}
+
+func imageInfoMeta(info ImageInfo) metadata.MediaMeta {
+	return metadata.MediaMeta{
+		Width:      info.Width,
+		Height:     info.Height,
+		Size:       info.Size,
+		CreateTime: info.CreateTime,
+	}
+}
+
+func preferredKeepPathForGroup(group DuplicateGroup) string {
+	best := group.Master
+	bestMeta := imageInfoMeta(best)
+
+	for _, candidate := range group.Duplicates {
+		if dedupe.ComparePreference(
+			candidate.Path,
+			imageInfoMeta(candidate),
+			candidate.Size,
+			best.Path,
+			bestMeta,
+			best.Size,
+		) > 0 {
+			best = candidate
+			bestMeta = imageInfoMeta(candidate)
+		}
+	}
+
+	return best.Path
 }
 
 func dedupePaths(paths []string) []string {
@@ -918,6 +950,8 @@ func (ws *WebServer) handleGetDuplicates(w http.ResponseWriter, r *http.Request)
 				}
 			}
 		}
+
+		group.PreferredKeepPath = preferredKeepPathForGroup(group)
 
 		groups = append(groups, group)
 	}

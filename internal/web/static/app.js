@@ -110,7 +110,7 @@ const determineWinner = (master, duplicates) => {
 };
 
 const normalizeGroup = (group) => {
-    const autoSelectedPath = determineWinner(group.master, group.duplicates);
+    const autoSelectedPath = group.preferredKeepPath || determineWinner(group.master, group.duplicates);
     return {
         ...group,
         autoSelectedPath,
