@@ -204,18 +204,20 @@ const renderGroups = () => {
 
         const groupItems = allItemsForGroup(group);
         const groupItemCount = groupItems.length;
+        const isCompactGroup = groupItemCount <= 2;
 
-        grid.classList.toggle('layout-pair', groupItemCount <= 2);
+        groupEl.classList.toggle('group-compact', isCompactGroup);
+        grid.classList.toggle('layout-pair', isCompactGroup);
         grid.classList.toggle('layout-crowded', groupItemCount >= 7);
 
-        groupItems.forEach((img) => {
+        groupItems.forEach((img, itemIndex) => {
             const imgNode = document.importNode(tplImage, true);
             const card = imgNode.querySelector('.image-card');
             const imageEl = imgNode.querySelector('img');
 
             card.dataset.path = img.path;
             card.dataset.isMaster = img.isMaster;
-            card.id = `card-${index}-${btoa(img.path).replace(/=/g, '')}`;
+            card.id = `card-${index}-${itemIndex}`;
 
             imageEl.src = `/image?path=${encodeURIComponent(img.path)}`;
             imageEl.alt = img.path;
@@ -458,7 +460,7 @@ const fetchGroups = async (page, { historyMode = 'replace' } = {}) => {
     } catch (error) {
         console.error('Failed to load groups', error);
         clearRenderedGroups();
-        renderEmptyState('Failed to load data. Ensure server is running.');
+        renderEmptyState('Failed to load data. Check browser console for details.');
     } finally {
         STATE.loading = false;
         setLoadingState(false);

@@ -2,7 +2,9 @@ package web
 
 import (
 	"bytes"
+	"crypto/md5"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -14,7 +16,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
@@ -45,6 +49,20 @@ func writeJPEG(t *testing.T, path string, width int, height int, fill color.RGBA
 func TestListenAddrUsesConfiguredHost(t *testing.T) {
 	require.Equal(t, "127.0.0.1:8080", listenAddr("127.0.0.1", 8080))
 	require.Equal(t, "0.0.0.0:9090", listenAddr("0.0.0.0", 9090))
+}
+
+func TestValidateListenHostRejectsUnspecifiedAddresses(t *testing.T) {
+	for _, host := range []string{"0.0.0.0", "::", "[::]"} {
+		err := validateListenHost(host)
+		require.Error(t, err, host)
+	}
+}
+
+func TestValidateListenHostAllowsScopedAddresses(t *testing.T) {
+	for _, host := range []string{"127.0.0.1", "192.168.1.10", "localhost"} {
+		err := validateListenHost(host)
+		require.NoError(t, err, host)
+	}
 }
 
 func TestHandleImageServeRejectsPathEscape(t *testing.T) {
@@ -293,6 +311,132 @@ func TestHandleImageServeFallsBackToEmbeddedPreview(t *testing.T) {
 	require.Equal(t, "image/jpeg", strings.Split(rr.Header().Get("Content-Type"), ";")[0])
 }
 
+func TestHandleImageServePrefersGeneratedThumbnail(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "web_generated_thumbnail_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	originalPath := filepath.Join(tempDir, "2024", "01", "02", "original.jpg")
+	originalBytes := writeJPEG(t, originalPath, 48, 48, color.RGBA{200, 0, 0, 255})
+
+	thumbnailBase := filepath.Join(tempDir, "thumb-cache", "abcdef")
+	thumbnailPath := thumbnailBase + "_640_40.jpg"
+	thumbnailBytes := writeJPEG(t, thumbnailPath, 24, 24, color.RGBA{0, 200, 0, 255})
+
+	ws := NewWebServer(nil, tempDir)
+	ws.thumbnailForPath = func(path string) string {
+		require.Equal(t, originalPath, path)
+		return thumbnailBase
+	}
+	ws.thumbnailCandidates = []string{"_640_40.jpg"}
+
+	imageURL := fmt.Sprintf("/image?path=%s", url.QueryEscape(originalPath))
+	req := httptest.NewRequest(http.MethodGet, imageURL, nil)
+	rr := httptest.NewRecorder()
+
+	ws.handleImageServe(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Equal(t, thumbnailBytes, rr.Body.Bytes())
+	require.NotEqual(t, originalBytes, rr.Body.Bytes())
+	require.Equal(t, "image/jpeg", strings.Split(rr.Header().Get("Content-Type"), ";")[0])
+}
+
+func TestHandleImageServePrefersUGOSXattrThumbnail(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "web_ugos_thumbnail_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	originalPath := filepath.Join(tempDir, "2024", "01", "02", "original.jpg")
+	originalBytes := writeJPEG(t, originalPath, 48, 48, color.RGBA{200, 0, 0, 255})
+
+	thumbnailDir := filepath.Join(tempDir, "@thumbnail", "91", "98")
+	stem := "f97f3173c3fb1b618dc4b2c62ecd2d30"
+	thumbnailPath := filepath.Join(thumbnailDir, stem+"_640_40.jpg")
+	thumbnailBytes := writeJPEG(t, thumbnailPath, 24, 24, color.RGBA{0, 200, 0, 255})
+
+	ws := NewWebServer(nil, tempDir)
+	ws.ugosThumbnailMode = true
+	ws.xattrForPath = func(path string, name string) (string, error) {
+		require.Equal(t, originalPath, path)
+		switch name {
+		case "user.thumb.dir":
+			return thumbnailDir, nil
+		case "user.thumb.id":
+			return stem + "-1749255935-675edb", nil
+		default:
+			return "", fmt.Errorf("unexpected xattr %s", name)
+		}
+	}
+	ws.thumbnailForPath = func(string) string {
+		t.Fatal("legacy thumbnail lookup should not run in UGOS thumbnail mode")
+		return ""
+	}
+
+	imageURL := fmt.Sprintf("/image?path=%s", url.QueryEscape(originalPath))
+	req := httptest.NewRequest(http.MethodGet, imageURL, nil)
+	rr := httptest.NewRecorder()
+
+	ws.handleImageServe(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Equal(t, thumbnailBytes, rr.Body.Bytes())
+	require.NotEqual(t, originalBytes, rr.Body.Bytes())
+	require.Equal(t, "image/jpeg", strings.Split(rr.Header().Get("Content-Type"), ";")[0])
+}
+
+func TestHandleImageServeFallsBackToOriginalWhenUGOSThumbnailMissing(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "web_ugos_thumbnail_fallback_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	originalPath := filepath.Join(tempDir, "2024", "01", "02", "original.jpg")
+	originalBytes := writeJPEG(t, originalPath, 48, 48, color.RGBA{200, 0, 0, 255})
+
+	thumbnailDir := filepath.Join(tempDir, "@thumbnail", "91", "98")
+	require.NoError(t, os.MkdirAll(thumbnailDir, 0755))
+
+	ws := NewWebServer(nil, tempDir)
+	ws.ugosThumbnailMode = true
+	ws.xattrForPath = func(path string, name string) (string, error) {
+		require.Equal(t, originalPath, path)
+		switch name {
+		case "user.thumb.dir":
+			return thumbnailDir, nil
+		case "user.thumb.id":
+			return "f97f3173c3fb1b618dc4b2c62ecd2d30-1749255935-675edb", nil
+		default:
+			return "", fmt.Errorf("unexpected xattr %s", name)
+		}
+	}
+	ws.thumbnailForPath = func(string) string {
+		t.Fatal("legacy thumbnail lookup should not run in UGOS thumbnail mode")
+		return ""
+	}
+
+	imageURL := fmt.Sprintf("/image?path=%s", url.QueryEscape(originalPath))
+	req := httptest.NewRequest(http.MethodGet, imageURL, nil)
+	rr := httptest.NewRecorder()
+
+	ws.handleImageServe(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.Equal(t, originalBytes, rr.Body.Bytes())
+	require.Equal(t, "image/jpeg", strings.Split(rr.Header().Get("Content-Type"), ";")[0])
+}
+
+func TestSynologyThumbnailBasePathFor(t *testing.T) {
+	path := "/volume4/photos/album/img.jpg"
+	basePath := synologyThumbnailBasePathFor(path)
+	require.NotEmpty(t, basePath)
+
+	digest := md5.Sum([]byte(filepath.Clean(path)))
+	hashHex := hex.EncodeToString(digest[:])
+	expected := filepath.Join("/volume4", "@thumbnail", hashHex[:2], hashHex[2:4], hashHex)
+
+	require.Equal(t, expected, basePath)
+}
+
 func TestHandleGetDuplicatesReturnsPaginationMetadata(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "web_duplicates_pagination_test")
 	require.NoError(t, err)
@@ -347,4 +491,30 @@ func TestHandleGetDuplicatesReturnsPaginationMetadata(t *testing.T) {
 	require.Equal(t, 2, payload.TotalPages)
 	require.Len(t, payload.Groups, 1)
 	require.Equal(t, "b-master.jpg", payload.Groups[0].Master.Path)
+}
+
+func TestPrewarmThumbnailPathsRunsConcurrently(t *testing.T) {
+	ws := NewWebServer(nil, t.TempDir())
+	ws.prewarmWorkers = 4
+
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	ws.thumbnailPathFor = func(path string) string {
+		current := active.Add(1)
+		defer active.Add(-1)
+
+		for {
+			prev := maxActive.Load()
+			if current <= prev || maxActive.CompareAndSwap(prev, current) {
+				break
+			}
+		}
+
+		time.Sleep(25 * time.Millisecond)
+		return path
+	}
+
+	ws.prewarmThumbnailPaths([]string{"a", "b", "c", "d"})
+
+	require.Greater(t, maxActive.Load(), int32(1))
 }

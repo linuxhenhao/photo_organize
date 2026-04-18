@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -302,13 +303,66 @@ func (c *client) writeRequest(paths []string, tags []string, opts QueryOptions, 
 	}
 
 	for _, path := range paths {
-		if _, err := fmt.Fprintln(c.stdin, path); err != nil {
+		if err := writeArgfileCString(c.stdin, normalizeArgfilePath(path)); err != nil {
 			return err
 		}
 	}
 
 	_, err := fmt.Fprintf(c.stdin, "-execute%d\n", requestID)
 	return err
+}
+
+func writeArgfileCString(w io.Writer, arg string) error {
+	if strings.ContainsRune(arg, '\x00') {
+		return fmt.Errorf("argument contains NUL byte")
+	}
+
+	var encoded strings.Builder
+	encoded.Grow(len(arg) + len("#[CSTR]") + 1)
+	encoded.WriteString("#[CSTR]")
+
+	for _, r := range arg {
+		switch r {
+		case '\\':
+			encoded.WriteString(`\\`)
+		case '\a':
+			encoded.WriteString(`\a`)
+		case '\b':
+			encoded.WriteString(`\b`)
+		case '\f':
+			encoded.WriteString(`\f`)
+		case '\n':
+			encoded.WriteString(`\n`)
+		case '\r':
+			encoded.WriteString(`\r`)
+		case '\t':
+			encoded.WriteString(`\t`)
+		case '\v':
+			encoded.WriteString(`\v`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				_, _ = fmt.Fprintf(&encoded, `\x%02X`, r)
+				continue
+			}
+			encoded.WriteRune(r)
+		}
+	}
+	encoded.WriteByte('\n')
+
+	_, err := io.WriteString(w, encoded.String())
+	return err
+}
+
+func normalizeArgfilePath(path string) string {
+	if path == "" || path == "-" {
+		return path
+	}
+
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	return absPath
 }
 
 func (c *client) readResponse(requestID uint64) ([]byte, error) {

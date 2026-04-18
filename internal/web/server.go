@@ -1,8 +1,10 @@
 package web
 
 import (
+	"crypto/md5"
 	"database/sql"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,14 +13,17 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	projectexiftool "github.com/linuxhenhao/photo_organize/internal/exiftool"
 	"github.com/linuxhenhao/photo_organize/internal/fsutil"
 	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
 	"github.com/linuxhenhao/photo_organize/internal/target"
+	"golang.org/x/sys/unix"
 )
 
 //go:embed static/*
@@ -26,10 +31,17 @@ var staticFS embed.FS
 
 // WebServer handles the Web UI for duplicate resolution.
 type WebServer struct {
-	cm             *target.CacheManager
-	db             *sql.DB
-	destDir        string
-	previewForPath func(string) ([]byte, string, error)
+	cm                  *target.CacheManager
+	db                  *sql.DB
+	destDir             string
+	previewForPath      func(string) ([]byte, string, error)
+	thumbnailPathFor    func(string) string
+	thumbnailForPath    func(string) string
+	thumbnailCandidates []string
+	xattrForPath        func(string, string) (string, error)
+	ugosThumbnailMode   bool
+	prewarmWorkers      int
+	thumbnailCache      sync.Map
 }
 
 // ImageInfo holds metadata for the frontend
@@ -50,15 +62,43 @@ type DuplicateGroup struct {
 
 // NewWebServer initializes the web server backend
 func NewWebServer(cm *target.CacheManager, destDir string) *WebServer {
-	return &WebServer{
-		cm:             cm,
-		destDir:        destDir,
-		previewForPath: extractPreviewForBrowser,
+	ws := &WebServer{
+		cm:               cm,
+		destDir:          destDir,
+		previewForPath:   extractPreviewForBrowser,
+		thumbnailForPath: synologyThumbnailBasePathFor,
+		thumbnailCandidates: []string{
+			"_640_40.webp",
+			"_640_40.jpg",
+			"_320_40.webp",
+			"_320_40.jpg",
+			".webp",
+			".jpg",
+		},
+		xattrForPath:      readXattrString,
+		ugosThumbnailMode: detectUGOSThumbnailSystem(),
+		prewarmWorkers:    defaultThumbnailPrewarmWorkers(),
 	}
+	ws.thumbnailPathFor = ws.cachedThumbnailPathFor
+	return ws
 }
 
 func listenAddr(host string, port int) string {
 	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+func validateListenHost(host string) error {
+	trimmed := strings.TrimSpace(host)
+	if trimmed == "" {
+		return fmt.Errorf("listen host is required")
+	}
+
+	unwrapped := strings.TrimPrefix(strings.TrimSuffix(trimmed, "]"), "[")
+	if ip := net.ParseIP(unwrapped); ip != nil && ip.IsUnspecified() {
+		return fmt.Errorf("refusing to listen on unrestricted host %q; bind to a specific LAN address instead", host)
+	}
+
+	return nil
 }
 
 func pathWithinRoot(root string, candidate string) bool {
@@ -329,8 +369,223 @@ func extractPreviewForBrowser(path string) ([]byte, string, error) {
 	return nil, "", fmt.Errorf("no embedded preview found for %s", path)
 }
 
+var ugosThumbnailSentinelPaths = []string{
+	"/usr/ugreen",
+	"/ugreen",
+	"/etc/sysconfig/thumb_core.sh",
+}
+
+var ugosThumbnailCandidates = []string{
+	"_640_40.webp",
+	"_640_40.jpg",
+	"_320_40.webp",
+	"_320_40.jpg",
+	"_mini.webp",
+	"_mini.jpg",
+	"_1600_40.webp",
+	"_1600_40.jpg",
+}
+
+func detectUGOSThumbnailSystem() bool {
+	for _, sentinel := range ugosThumbnailSentinelPaths {
+		if _, err := os.Stat(sentinel); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func defaultThumbnailPrewarmWorkers() int {
+	workers := runtime.NumCPU()
+	switch {
+	case workers < 4:
+		return 4
+	case workers > 16:
+		return 16
+	default:
+		return workers
+	}
+}
+
+func readXattrString(path string, name string) (string, error) {
+	size, err := unix.Getxattr(path, name, nil)
+	if err != nil {
+		return "", err
+	}
+	if size == 0 {
+		return "", nil
+	}
+
+	buf := make([]byte, size)
+	n, err := unix.Getxattr(path, name, buf)
+	if err != nil {
+		return "", err
+	}
+	return string(buf[:n]), nil
+}
+
+func ugosThumbnailStem(thumbID string) string {
+	stem, _, _ := strings.Cut(strings.TrimSpace(thumbID), "-")
+	return stem
+}
+
+func browserRenderableFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	_, ok := browserRenderableContentType(path)
+	return ok
+}
+
+func (ws *WebServer) cachedThumbnailPathFor(path string) string {
+	cleanPath := filepath.Clean(path)
+	if cached, ok := ws.thumbnailCache.Load(cleanPath); ok {
+		return cached.(string)
+	}
+
+	resolved := ws.resolveThumbnailPath(cleanPath)
+	ws.thumbnailCache.Store(cleanPath, resolved)
+	return resolved
+}
+
+func (ws *WebServer) resolveThumbnailPath(path string) string {
+	if ws.ugosThumbnailMode {
+		return ws.resolveUGOSThumbnailPath(path)
+	}
+	return ws.resolveLegacyThumbnailPath(path)
+}
+
+func (ws *WebServer) resolveUGOSThumbnailPath(path string) string {
+	if ws.xattrForPath == nil {
+		return ""
+	}
+
+	thumbnailDir, err := ws.xattrForPath(path, "user.thumb.dir")
+	if err != nil || strings.TrimSpace(thumbnailDir) == "" {
+		return ""
+	}
+
+	thumbnailID, err := ws.xattrForPath(path, "user.thumb.id")
+	if err != nil {
+		return ""
+	}
+	stem := ugosThumbnailStem(thumbnailID)
+	if stem == "" {
+		return ""
+	}
+
+	for _, suffix := range ugosThumbnailCandidates {
+		candidatePath := filepath.Join(thumbnailDir, stem+suffix)
+		if browserRenderableFile(candidatePath) {
+			return candidatePath
+		}
+	}
+
+	return ""
+}
+
+func (ws *WebServer) resolveLegacyThumbnailPath(path string) string {
+	if ws.thumbnailForPath == nil || len(ws.thumbnailCandidates) == 0 {
+		return ""
+	}
+
+	thumbnailBasePath := ws.thumbnailForPath(path)
+	if thumbnailBasePath == "" {
+		return ""
+	}
+
+	for _, suffix := range ws.thumbnailCandidates {
+		candidatePath := thumbnailBasePath + suffix
+		if browserRenderableFile(candidatePath) {
+			return candidatePath
+		}
+	}
+
+	return ""
+}
+
+func (ws *WebServer) prewarmThumbnailPaths(paths []string) {
+	if ws.thumbnailPathFor == nil {
+		return
+	}
+
+	uniquePaths := dedupePaths(paths)
+	if len(uniquePaths) == 0 {
+		return
+	}
+
+	workerCount := ws.prewarmWorkers
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+	if workerCount > len(uniquePaths) {
+		workerCount = len(uniquePaths)
+	}
+
+	jobs := make(chan string)
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range jobs {
+				ws.thumbnailPathFor(path)
+			}
+		}()
+	}
+
+	for _, path := range uniquePaths {
+		jobs <- path
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+func synologyVolumeRoot(path string) (string, bool) {
+	cleanPath := filepath.Clean(path)
+	if !filepath.IsAbs(cleanPath) {
+		return "", false
+	}
+
+	trimmed := strings.TrimPrefix(cleanPath, string(os.PathSeparator))
+	parts := strings.Split(trimmed, string(os.PathSeparator))
+	if len(parts) == 0 {
+		return "", false
+	}
+
+	volumeName := parts[0]
+	if !strings.HasPrefix(volumeName, "volume") {
+		return "", false
+	}
+	if _, err := strconv.Atoi(strings.TrimPrefix(volumeName, "volume")); err != nil {
+		return "", false
+	}
+
+	return filepath.Join(string(os.PathSeparator), volumeName), true
+}
+
+func synologyThumbnailBasePathFor(path string) string {
+	volumeRoot, ok := synologyVolumeRoot(path)
+	if !ok {
+		return ""
+	}
+
+	digest := md5.Sum([]byte(filepath.Clean(path)))
+	hashHex := hex.EncodeToString(digest[:])
+	if len(hashHex) < 4 {
+		return ""
+	}
+
+	return filepath.Join(volumeRoot, "@thumbnail", hashHex[:2], hashHex[2:4], hashHex)
+}
+
 // Start API server on the given host and port.
 func (ws *WebServer) Start(host string, port int, db *sql.DB) error {
+	if err := validateListenHost(host); err != nil {
+		return err
+	}
+
 	ws.db = db
 	mux := http.NewServeMux()
 
@@ -396,6 +651,7 @@ func (ws *WebServer) handleGetDuplicates(w http.ResponseWriter, r *http.Request)
 	defer rows.Close()
 
 	var groups []DuplicateGroup
+	prewarmPaths := make([]string, 0, limit*2)
 
 	type jsonMeta struct {
 		Width      int    `json:"width"`
@@ -433,6 +689,9 @@ func (ws *WebServer) handleGetDuplicates(w http.ResponseWriter, r *http.Request)
 			},
 			Duplicates: []ImageInfo{},
 		}
+		if absPath, err := ws.resolveWithinDest(masterPath); err == nil {
+			prewarmPaths = append(prewarmPaths, absPath)
+		}
 
 		type thumbObj struct {
 			Path     string   `json:"path"`
@@ -453,11 +712,16 @@ func (ws *WebServer) handleGetDuplicates(w http.ResponseWriter, r *http.Request)
 					CreateTime: thumb.Metadata.CreateTime,
 					IsMaster:   false,
 				})
+				if absPath, err := ws.resolveWithinDest(thumb.Path); err == nil {
+					prewarmPaths = append(prewarmPaths, absPath)
+				}
 			}
 		}
 
 		groups = append(groups, group)
 	}
+
+	ws.prewarmThumbnailPaths(prewarmPaths)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
@@ -724,6 +988,13 @@ func (ws *WebServer) handleImageServe(w http.ResponseWriter, r *http.Request) {
 	if _, err := os.Stat(fullPath); err != nil {
 		http.NotFound(w, r)
 		return
+	}
+
+	if ws.thumbnailPathFor != nil {
+		if thumbnailPath := ws.thumbnailPathFor(fullPath); thumbnailPath != "" {
+			http.ServeFile(w, r, thumbnailPath)
+			return
+		}
 	}
 
 	if _, ok := browserRenderableContentType(fullPath); ok {
