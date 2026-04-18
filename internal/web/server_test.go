@@ -686,6 +686,53 @@ func TestHandleGetDuplicatesReturnsPaginationMetadata(t *testing.T) {
 	require.Equal(t, "b-master.jpg", payload.Groups[0].Master.Path)
 }
 
+func TestHandleGetDuplicatesAllowsManualPageSizeWithinMax(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "web_duplicates_page_size_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	dbPath := filepath.Join(tempDir, "cache.db")
+	sqliteDB, err := sql.Open("sqlite", dbPath+"?_busy_timeout=5000")
+	require.NoError(t, err)
+	defer sqliteDB.Close()
+
+	_, err = sqliteDB.Exec(`
+		CREATE TABLE file_cache (
+			target_path TEXT PRIMARY KEY,
+			mmh3_hash TEXT,
+			phash TEXT,
+			size INTEGER,
+			metadata TEXT DEFAULT '{}',
+			thumbnails TEXT DEFAULT '[]'
+		)
+	`)
+	require.NoError(t, err)
+
+	_, err = sqliteDB.Exec(`
+		INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails)
+		VALUES
+			('a-master.jpg', 'h1', 'p1', 11, '{}', '[{"path":"a-thumb.jpg","metadata":{"size":5}}]'),
+			('b-master.jpg', 'h2', 'p2', 22, '{}', '[{"path":"b-thumb.jpg","metadata":{"size":6}}]')
+	`)
+	require.NoError(t, err)
+
+	ws := NewWebServer(nil, tempDir)
+	ws.db = sqliteDB
+
+	req := httptest.NewRequest(http.MethodGet, "/api/duplicates?page=1&limit=777", nil)
+	rr := httptest.NewRecorder()
+
+	ws.handleGetDuplicates(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	var payload struct {
+		Limit int `json:"limit"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &payload))
+	require.Equal(t, 777, payload.Limit)
+}
+
 func TestHandleGetDuplicatesPrefersRawKeepPathWhenResolutionIsWithinTolerance(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "web_duplicates_preferred_keep_test")
 	require.NoError(t, err)

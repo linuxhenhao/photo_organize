@@ -26,10 +26,7 @@ const totalGroupsEl = document.getElementById('total-groups');
 const potentialSavingsEl = document.getElementById('pot-space');
 const DEFAULT_PAGE = STATE.page;
 const DEFAULT_LIMIT = STATE.limit;
-const allowedPageSizes = new Set(
-    Array.from(pageSizeSelect.options, (option) => Number.parseInt(option.value, 10))
-        .filter((value) => Number.isInteger(value) && value > 0)
-);
+const MAX_PAGE_SIZE = 2000;
 
 const visibleGroups = () => STATE.groups.filter(Boolean);
 const allItemsForGroup = (group) => [group.master, ...group.duplicates];
@@ -54,7 +51,7 @@ const parsePositiveInt = (value, fallback) => {
 
 const sanitizeLimit = (value) => {
     const parsed = parsePositiveInt(value, DEFAULT_LIMIT);
-    return allowedPageSizes.has(parsed) ? parsed : DEFAULT_LIMIT;
+    return Math.min(parsed, MAX_PAGE_SIZE);
 };
 
 const readPaginationFromURL = () => {
@@ -683,6 +680,12 @@ nextBtn.addEventListener('click', () => fetchGroups(STATE.page + 1, { historyMod
 pageSizeSelect.addEventListener('change', (event) => {
     STATE.limit = sanitizeLimit(event.target.value);
     fetchGroups(1, { historyMode: 'push' });
+});
+
+pageSizeSelect.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    pageSizeSelect.blur();
 });
 resolvePageBtn.addEventListener('click', () => resolveCurrentPage());
 

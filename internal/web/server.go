@@ -69,6 +69,8 @@ type DuplicateGroup struct {
 	PreferredKeepPath string      `json:"preferredKeepPath,omitempty"`
 }
 
+const maxDuplicatesPageSize = 2000
+
 // NewWebServer initializes the web server backend
 func NewWebServer(cm *target.CacheManager, destDir string) *WebServer {
 	ws := &WebServer{
@@ -844,7 +846,7 @@ func (ws *WebServer) handleGetDuplicates(w http.ResponseWriter, r *http.Request)
 		page = p
 	}
 	limit := 50
-	if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 200 {
+	if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= maxDuplicatesPageSize {
 		limit = l
 	}
 
