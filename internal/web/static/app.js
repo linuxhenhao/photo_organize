@@ -33,6 +33,18 @@ const allowedPageSizes = new Set(
 
 const visibleGroups = () => STATE.groups.filter(Boolean);
 const allItemsForGroup = (group) => [group.master, ...group.duplicates];
+const orderedItemsForGroup = (group) => {
+    const items = [...allItemsForGroup(group)];
+    const preferredPath = group.selectedPaths.length === 1 ? group.selectedPaths[0] : group.autoSelectedPath;
+    items.sort((a, b) => {
+        const aPreferred = a.path === preferredPath;
+        const bPreferred = b.path === preferredPath;
+        if (aPreferred !== bPreferred) return aPreferred ? -1 : 1;
+        if (a.isMaster !== b.isMaster) return a.isMaster ? -1 : 1;
+        return a.path.localeCompare(b.path);
+    });
+    return items;
+};
 const isSelected = (group, path) => group.selectedPaths.includes(path);
 
 const parsePositiveInt = (value, fallback) => {
@@ -240,6 +252,8 @@ const updateGroupSelectionUI = (groupIndex) => {
 
     groupEl.querySelectorAll('.image-card').forEach((card) => {
         const selected = isSelected(group, card.dataset.path);
+        const singleKeepMaster = group.selectedPaths.length === 1 && card.dataset.path === group.selectedPaths[0];
+        card.dataset.isMaster = String(singleKeepMaster);
         card.classList.toggle('selected', selected);
         card.classList.toggle('auto-selected', selected && group.selectedPaths.length === 1 && card.dataset.path === group.autoSelectedPath);
     });
@@ -271,7 +285,7 @@ const renderGroups = () => {
         titleEl.textContent = `Cluster ${(STATE.page - 1) * STATE.limit + index + 1}`;
         summaryEl.textContent = selectionSummary(group);
 
-        const groupItems = allItemsForGroup(group);
+        const groupItems = orderedItemsForGroup(group);
         const groupItemCount = groupItems.length;
         const isCompactGroup = groupItemCount <= 2;
 
@@ -285,7 +299,7 @@ const renderGroups = () => {
             const imageEl = imgNode.querySelector('img');
 
             card.dataset.path = img.path;
-            card.dataset.isMaster = img.isMaster;
+            card.dataset.isMaster = String(group.selectedPaths.length === 1 && img.path === group.selectedPaths[0]);
             card.id = `card-${index}-${itemIndex}`;
 
             imageEl.src = `/image?path=${encodeURIComponent(img.path)}`;
