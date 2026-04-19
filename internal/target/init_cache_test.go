@@ -168,11 +168,59 @@ func TestInitTargetDirCacheReadOnlyRebuildsExistingThumbnailLinks(t *testing.T) 
 	require.NoError(t, json.Unmarshal([]byte(thumbnailsRaw), &thumbnails))
 	require.Len(t, thumbnails, 1)
 	require.Equal(t, thumbPath, thumbnails[0].Path)
+	require.NotEmpty(t, thumbnails[0].MMH3)
 
 	_, err = os.Stat(masterPath)
 	require.NoError(t, err)
 	_, err = os.Stat(thumbPath)
 	require.NoError(t, err)
+}
+
+func TestInitTargetDirCacheReadOnlyBackfillsThumbnailMMH3(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "initcache_readonly_thumb_mmh3_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	masterPath := filepath.Join(tempDir, "album", "img_master.jpg")
+	thumbPath := filepath.Join(tempDir, "thumbnails", "album", "img_thumb.jpg")
+	writeJPEGFixturePair(t, masterPath, thumbPath)
+
+	cm, err := NewCacheManager(tempDir, 1)
+	require.NoError(t, err)
+	defer cm.Close()
+
+	masterStat, err := os.Stat(masterPath)
+	require.NoError(t, err)
+	masterFile, err := buildTargetFile(masterPath, masterStat, fileCacheRow{}, false)
+	require.NoError(t, err)
+
+	thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
+	thumbsJSON := marshalThumbnailEntries([]thumbnailEntry{makeThumbnailEntry(thumbPath, "", thumbMeta)})
+	_, err = cm.db.Exec(
+		`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
+		masterPath,
+		masterFile.MMH3,
+		masterFile.PHashStr,
+		masterFile.Size,
+		masterFile.Metadata,
+		thumbsJSON,
+	)
+	require.NoError(t, err)
+
+	InitTargetDirCache(tempDir, cm)
+
+	var thumbnailsRaw string
+	err = cm.db.QueryRow(`SELECT thumbnails FROM file_cache WHERE target_path = ?`, masterPath).Scan(&thumbnailsRaw)
+	require.NoError(t, err)
+
+	var thumbnails []thumbnailEntry
+	require.NoError(t, json.Unmarshal([]byte(thumbnailsRaw), &thumbnails))
+	require.Len(t, thumbnails, 1)
+	require.Equal(t, thumbPath, thumbnails[0].Path)
+
+	expectedThumbHash, err := hasher.CalculateHash(thumbPath)
+	require.NoError(t, err)
+	require.Equal(t, expectedThumbHash, thumbnails[0].MMH3)
 }
 
 func TestInitTargetDirCacheMoveDuplicatesUsesExistingCache(t *testing.T) {

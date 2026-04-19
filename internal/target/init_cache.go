@@ -46,6 +46,7 @@ type targetFile struct {
 
 type thumbnailEntry struct {
 	Path     string          `json:"path"`
+	MMH3     string          `json:"mmh3_hash,omitempty"`
 	Metadata json.RawMessage `json:"metadata"`
 }
 
@@ -104,7 +105,7 @@ func InitTargetDirCacheWithContext(ctx context.Context, targetDir string, cm *Ca
 		return
 	}
 
-	if err := initTargetDirCacheReadOnly(ctx, paths, thumbnailPaths, rows, cm); err != nil && !errors.Is(err, context.Canceled) {
+	if err := initTargetDirCacheReadOnly(ctx, targetDir, paths, thumbnailPaths, rows, cm); err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("Failed read-only cache initialization: %v", err)
 	}
 }
@@ -337,7 +338,7 @@ func prepareTargetFiles(ctx context.Context, paths []string, rows map[string]fil
 	return results
 }
 
-func initTargetDirCacheReadOnly(ctx context.Context, paths []string, thumbnailPaths []string, rows map[string]fileCacheRow, cm *CacheManager) error {
+func initTargetDirCacheReadOnly(ctx context.Context, targetDir string, paths []string, thumbnailPaths []string, rows map[string]fileCacheRow, cm *CacheManager) error {
 	var refreshed int
 	prepared := prepareTargetFiles(ctx, paths, rows, true)
 	for _, entry := range prepared {
@@ -368,6 +369,16 @@ func initTargetDirCacheReadOnly(ctx context.Context, paths []string, thumbnailPa
 		refreshed++
 	}
 
+	if err := stopInitCacheAtSafePoint(ctx, "before backfilling thumbnail mmh3 hashes"); err != nil {
+		return err
+	}
+	if err := backfillThumbnailEntryHashes(ctx, targetDir, rows, cm.db); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return err
+		}
+		log.Printf("Failed to backfill thumbnail mmh3 hashes: %v", err)
+	}
+
 	if err := stopInitCacheAtSafePoint(ctx, "before rebuilding thumbnail links"); err != nil {
 		return err
 	}
@@ -379,6 +390,138 @@ func initTargetDirCacheReadOnly(ctx context.Context, paths []string, thumbnailPa
 	}
 
 	log.Printf("Finished read-only cache initialization. %d entries refreshed.", refreshed)
+	return nil
+}
+
+func backfillThumbnailEntryHashes(ctx context.Context, targetDir string, rows map[string]fileCacheRow, db *sql.DB) error {
+	type thumbnailRef struct {
+		masterPath string
+		index      int
+	}
+
+	pathRefs := make(map[string][]thumbnailRef)
+	for masterPath, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		entries := parseThumbnailEntries(row.Thumbnails)
+		for idx, entry := range entries {
+			if entry.Path == "" || entry.MMH3 != "" {
+				continue
+			}
+			pathRefs[entry.Path] = append(pathRefs[entry.Path], thumbnailRef{masterPath: masterPath, index: idx})
+		}
+	}
+
+	if len(pathRefs) == 0 {
+		return nil
+	}
+
+	type hashResult struct {
+		path string
+		mmh3 string
+		err  error
+	}
+
+	paths := make([]string, 0, len(pathRefs))
+	for path := range pathRefs {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	jobs := make(chan string, len(paths))
+	results := make(chan hashResult, len(paths))
+	workerCount := initCacheWorkers
+	if workerCount > len(paths) {
+		workerCount = len(paths)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range jobs {
+				resolved := resolveStoredPath(targetDir, path)
+				hash, err := hasher.CalculateHash(resolved)
+				results <- hashResult{path: path, mmh3: hash, err: err}
+			}
+		}()
+	}
+
+	for _, path := range paths {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			close(results)
+			return ctx.Err()
+		case jobs <- path:
+		}
+	}
+	close(jobs)
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	updatedMasters := make(map[string][]thumbnailEntry)
+	backfilled := 0
+	for result := range results {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if result.err != nil {
+			log.Printf("Failed to backfill thumbnail mmh3 for %s: %v", result.path, result.err)
+			continue
+		}
+
+		for _, ref := range pathRefs[result.path] {
+			entries, ok := updatedMasters[ref.masterPath]
+			if !ok {
+				entries = parseThumbnailEntries(rows[ref.masterPath].Thumbnails)
+			}
+			if ref.index >= len(entries) || entries[ref.index].MMH3 != "" {
+				updatedMasters[ref.masterPath] = entries
+				continue
+			}
+			entries[ref.index].MMH3 = result.mmh3
+			updatedMasters[ref.masterPath] = entries
+			backfilled++
+		}
+	}
+
+	if len(updatedMasters) == 0 {
+		return nil
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	masterPaths := make([]string, 0, len(updatedMasters))
+	for masterPath := range updatedMasters {
+		masterPaths = append(masterPaths, masterPath)
+	}
+	sort.Strings(masterPaths)
+
+	for _, masterPath := range masterPaths {
+		thumbJSON := marshalThumbnailEntries(updatedMasters[masterPath])
+		if err := setThumbnails(tx, masterPath, thumbJSON); err != nil {
+			return err
+		}
+		row := rows[masterPath]
+		row.Thumbnails = thumbJSON
+		rows[masterPath] = row
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	log.Printf("Backfilled mmh3 hashes for %d thumbnail entries in read-only initcache.", backfilled)
 	return nil
 }
 
@@ -573,26 +716,48 @@ func marshalThumbnailEntries(entries []thumbnailEntry) string {
 }
 
 func mergeThumbnailEntries(groups ...[]thumbnailEntry) []thumbnailEntry {
-	seen := make(map[string]bool)
+	indexByPath := make(map[string]int)
 	merged := make([]thumbnailEntry, 0)
 	for _, group := range groups {
 		for _, entry := range group {
-			if entry.Path == "" || seen[entry.Path] {
+			if entry.Path == "" {
 				continue
 			}
-			seen[entry.Path] = true
+			if idx, ok := indexByPath[entry.Path]; ok {
+				if merged[idx].MMH3 == "" && entry.MMH3 != "" {
+					merged[idx].MMH3 = entry.MMH3
+				}
+				if len(merged[idx].Metadata) == 0 || string(merged[idx].Metadata) == "{}" {
+					if len(entry.Metadata) > 0 && string(entry.Metadata) != "{}" {
+						merged[idx].Metadata = entry.Metadata
+					}
+				}
+				continue
+			}
+			indexByPath[entry.Path] = len(merged)
 			merged = append(merged, entry)
 		}
 	}
 	return merged
 }
 
-func makeThumbnailEntry(path string, metadataJSON string) thumbnailEntry {
+func makeThumbnailEntry(path string, parts ...string) thumbnailEntry {
+	mmh3 := ""
+	metadataJSON := ""
+	switch len(parts) {
+	case 0:
+	case 1:
+		metadataJSON = parts[0]
+	default:
+		mmh3 = parts[0]
+		metadataJSON = parts[1]
+	}
 	if metadataJSON == "" {
 		metadataJSON = "{}"
 	}
 	return thumbnailEntry{
 		Path:     path,
+		MMH3:     mmh3,
 		Metadata: json.RawMessage(metadataJSON),
 	}
 }
@@ -687,7 +852,7 @@ func rebuildThumbnailLinks(ctx context.Context, thumbnailPaths []string, rows ma
 		thumbMeta := metadata.ExtractImageMetaJson(entry.Path)
 		aggregated[match.Match.Path] = mergeThumbnailEntries(
 			aggregated[match.Match.Path],
-			[]thumbnailEntry{makeThumbnailEntry(entry.Path, thumbMeta)},
+			[]thumbnailEntry{makeThumbnailEntry(entry.Path, entry.File.MMH3, thumbMeta)},
 		)
 	}
 
@@ -731,7 +896,7 @@ func demoteCurrentFile(targetDir string, file targetFile, match hasher.MatchResu
 	mergedThumbs := mergeThumbnailEntries(
 		parseThumbnailEntries(rows[match.Path].Thumbnails),
 		parseThumbnailEntries(rows[file.Path].Thumbnails),
-		[]thumbnailEntry{makeThumbnailEntry(thumbPath, thumbMeta)},
+		[]thumbnailEntry{makeThumbnailEntry(thumbPath, file.MMH3, thumbMeta)},
 	)
 	thumbJSON := marshalThumbnailEntries(mergedThumbs)
 
