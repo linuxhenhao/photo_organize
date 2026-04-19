@@ -1224,7 +1224,7 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 		if entry.hasDHash {
 			phashStr = hasher.DHashToString(entry.dhash)
 		}
-		_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, '[]')`,
+		_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, dhash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, '[]')`,
 			entry.storedPath, entry.hash, phashStr, entry.size, entry.metadata)
 		if err != nil {
 			rollbackRenames(renames)
@@ -1239,7 +1239,7 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 		if promotedEntry.hasDHash {
 			phashStr = hasher.DHashToString(promotedEntry.dhash)
 		}
-		_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, '[]')`,
+		_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, dhash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, '[]')`,
 			promotedEntry.storedPath, promotedEntry.hash, phashStr, promotedEntry.size, promotedEntry.metadata)
 		if err != nil {
 			rollbackRenames(renames)

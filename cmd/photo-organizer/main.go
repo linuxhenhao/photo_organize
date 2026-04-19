@@ -12,10 +12,12 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	_ "modernc.org/sqlite" // Ensure sqlite driver is loaded
 
 	"github.com/linuxhenhao/photo_organize/internal/importer"
+	"github.com/linuxhenhao/photo_organize/internal/migrate"
 	"github.com/linuxhenhao/photo_organize/internal/precompute"
 	"github.com/linuxhenhao/photo_organize/internal/scanner"
 	"github.com/linuxhenhao/photo_organize/internal/target"
@@ -80,9 +82,18 @@ func main() {
 	var cleanGroupsLogPath string
 	serveCmd.StringVar(&cleanGroupsLogPath, "cleangroups-log", "", "Optional cleangroups log file for review UI; absolute paths must be provided here")
 
+	convertCmd := flag.NewFlagSet("convertdb", flag.ExitOnError)
+	var cacheDBPath string
+	var photosDBPath string
+	var backupDir string
+	convertCmd.StringVar(&destDir, "dest", "", "Target directory containing cache.db (used when -cache is not set)")
+	convertCmd.StringVar(&cacheDBPath, "cache", "", "Path to cache.db to convert (renames phash -> dhash)")
+	convertCmd.StringVar(&photosDBPath, "photos", "", "Optional photos.db path to convert (renames phash -> dhash)")
+	convertCmd.StringVar(&backupDir, "backup-dir", "", "Directory to place backups; default is alongside the DB file")
+
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: photo-organizer <command> [options]")
-		fmt.Println("Commands: scan, import, initcache, cleangroups, precompute, serve")
+		fmt.Println("Commands: scan, import, initcache, cleangroups, precompute, serve, convertdb")
 		fmt.Println("\nScan command options:")
 		scanCmd.PrintDefaults()
 		fmt.Println("\nImport command options:")
@@ -95,6 +106,8 @@ func main() {
 		precomputeCmd.PrintDefaults()
 		fmt.Println("\nServe command options:")
 		serveCmd.PrintDefaults()
+		fmt.Println("\nConvertDB command options:")
+		convertCmd.PrintDefaults()
 		os.Exit(1)
 	}
 
@@ -200,6 +213,55 @@ func main() {
 		if err := server.Start(serveHost, servePort, sqliteDB); err != nil {
 			log.Fatalf("Web Server failed: %v", err)
 		}
+	case "convertdb":
+		convertCmd.Parse(os.Args[2:])
+		ctx, stopSignals := newInitCacheContext()
+		defer stopSignals()
+
+		if cacheDBPath == "" {
+			if destDir == "" {
+				log.Fatal("ConvertDB requires either -cache or -dest.")
+			}
+			cacheDBPath = filepath.Join(destDir, "cache.db")
+		}
+
+		convertOne := func(label string, path string, migrateFn func(context.Context, *sql.DB) (bool, error)) {
+			if strings.TrimSpace(path) == "" {
+				return
+			}
+
+			db, err := sql.Open("sqlite", path+"?_busy_timeout=5000")
+			if err != nil {
+				log.Fatalf("Failed to open %s db '%s': %v", label, path, err)
+			}
+			defer db.Close()
+
+			_, _ = db.Exec(`PRAGMA synchronous = OFF`)
+			_, _ = db.Exec(`PRAGMA journal_mode = WAL`)
+
+			backupBaseDir := backupDir
+			if backupBaseDir == "" {
+				backupBaseDir = filepath.Dir(path)
+			}
+			backupPath := filepath.Join(backupBaseDir, fmt.Sprintf("%s.bak-%s", filepath.Base(path), time.Now().Format("20060102-150405")))
+			if err := migrate.BackupSQLiteDB(ctx, db, backupPath); err != nil {
+				log.Fatalf("Failed to backup %s db to '%s': %v", label, backupPath, err)
+			}
+			log.Printf("Backed up %s db to %s", label, backupPath)
+
+			changed, err := migrateFn(ctx, db)
+			if err != nil {
+				log.Fatalf("Failed to migrate %s db '%s': %v", label, path, err)
+			}
+			check, err := migrate.IntegrityCheck(ctx, db)
+			if err != nil {
+				log.Fatalf("Failed integrity_check for %s db '%s': %v", label, path, err)
+			}
+			log.Printf("Converted %s db %s (changed=%v) integrity_check=%s", label, path, changed, check)
+		}
+
+		convertOne("cache", cacheDBPath, migrate.MigrateFileCacheHashColumn)
+		convertOne("photos", photosDBPath, migrate.MigratePhotosHashColumn)
 	default:
 		log.Fatalf("Invalid command: %s\nUsage: photo-organizer <command> [options]", os.Args[1])
 	}

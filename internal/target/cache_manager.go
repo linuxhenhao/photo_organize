@@ -2,6 +2,7 @@ package target
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -13,13 +14,14 @@ import (
 
 	"github.com/linuxhenhao/photo_organize/internal/dedupe"
 	"github.com/linuxhenhao/photo_organize/internal/hasher"
+	"github.com/linuxhenhao/photo_organize/internal/migrate"
 	_ "modernc.org/sqlite"
 )
 
 // CacheInfo tracks the completion state of a cached file entry
 type CacheInfo struct {
 	MMH3 string
-	// DHash is stored in SQLite column file_cache.phash for historical reasons.
+	// DHash is stored in SQLite column file_cache.dhash.
 	DHash   string
 	Size    int64
 	HasMeta bool
@@ -29,7 +31,7 @@ type CacheInfo struct {
 type cacheEntry struct {
 	path        string
 	mmh3        string
-	phash       string // String representation for the DB
+	dhash       string // String representation for the DB
 	size        int64
 	metadata    string
 	thumbJson   string
@@ -77,27 +79,13 @@ func NewCacheManager(destDir string, batchSize int) (*CacheManager, error) {
 	db.Exec(`PRAGMA synchronous = OFF`)
 	db.Exec(`PRAGMA journal_mode = WAL`)
 
-	// Schema management
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS file_cache (
-			target_path TEXT PRIMARY KEY,
-			mmh3_hash TEXT,
-			phash TEXT,
-			size INTEGER,
-			metadata TEXT DEFAULT '{}',
-			thumbnails TEXT DEFAULT '[]'
-		);
-	`)
+	changed, err := migrate.MigrateFileCacheHashColumn(context.Background(), db)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create cache table: %w", err)
+		return nil, err
 	}
-
-	// Migrations for existing databases
-	_, _ = db.Exec(`ALTER TABLE file_cache ADD COLUMN metadata TEXT DEFAULT '{}'`)
-	_, _ = db.Exec(`ALTER TABLE file_cache ADD COLUMN thumbnails TEXT DEFAULT '[]'`)
-	_, _ = db.Exec(`UPDATE file_cache SET thumbnails = '[]' WHERE thumbnails = '' OR thumbnails IS NULL`)
-	// Attempt to drop master_path if it existed (SQLite ALTER TABLE DROP COLUMN is supported in 3.35.0+)
-	_, _ = db.Exec(`ALTER TABLE file_cache DROP COLUMN master_path`)
+	if changed {
+		log.Printf("Migrated cache.db schema: renamed file_cache.phash -> file_cache.dhash")
+	}
 
 	// 1. Check for old format migration
 	oldTxtPath := filepath.Join(destDir, "mmh3_hash_cache.txt")
@@ -107,7 +95,7 @@ func NewCacheManager(destDir string, batchSize int) (*CacheManager, error) {
 	}
 
 	// 2. Load existing DB entries
-	rows, err := db.Query("SELECT target_path, mmh3_hash, phash, size, metadata FROM file_cache")
+	rows, err := db.Query("SELECT target_path, mmh3_hash, dhash, size, metadata FROM file_cache")
 	if err == nil {
 		defer rows.Close()
 		var loaded int
@@ -271,15 +259,15 @@ func (cm *CacheManager) runWorker() {
 				}
 			} else {
 				_, err = tx.Exec(`
-					INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata)
+					INSERT INTO file_cache (target_path, mmh3_hash, dhash, size, metadata)
 					VALUES (?, ?, ?, ?, ?)
 					ON CONFLICT(target_path) DO UPDATE SET
 						mmh3_hash = excluded.mmh3_hash,
-						phash = excluded.phash,
+						dhash = excluded.dhash,
 						size = excluded.size,
 						metadata = excluded.metadata
 				`,
-					entry.path, entry.mmh3, entry.phash, entry.size, entry.metadata)
+					entry.path, entry.mmh3, entry.dhash, entry.size, entry.metadata)
 			}
 
 			if err != nil {
@@ -382,7 +370,7 @@ func (cm *CacheManager) CheckAndAddPerceptualMatchWithPresence(phash uint64, has
 	cm.entries <- cacheEntry{
 		path:     path,
 		mmh3:     mmh3,
-		phash:    phashStr,
+		dhash:    phashStr,
 		size:     size,
 		metadata: "{}",
 	}
@@ -405,7 +393,7 @@ func (cm *CacheManager) AddEntryWithPresence(path string, mmh3 string, phash uin
 	cm.entries <- cacheEntry{
 		path:     path,
 		mmh3:     mmh3,
-		phash:    phashStr,
+		dhash:    phashStr,
 		size:     size,
 		metadata: metadata,
 	}
@@ -499,7 +487,7 @@ func (cm *CacheManager) migrateOldCache(txtPath string) {
 			if err == nil {
 				size = stat.Size()
 			}
-			_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, phash, size, metadata) VALUES (?, ?, '', ?, '{}')`, path, hash, size)
+			_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, dhash, size, metadata) VALUES (?, ?, '', ?, '{}')`, path, hash, size)
 			if err == nil {
 				count++
 			}

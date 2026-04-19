@@ -1,10 +1,12 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
 
+	"github.com/linuxhenhao/photo_organize/internal/migrate"
 	_ "modernc.org/sqlite" // SQLite driver
 )
 
@@ -29,16 +31,22 @@ func InitDB(db *sql.DB) error {
 			size INTEGER,
 			create_time TEXT,
 			mmh3_hash TEXT DEFAULT '',
-			phash TEXT DEFAULT '',
+			dhash TEXT DEFAULT '',
+			mime_type TEXT DEFAULT '',
 			group_id INTEGER DEFAULT 0
 		);
 	`)
-	// Backward compatibility: add columns for existing databases
-	_, _ = db.Exec(`ALTER TABLE photos ADD COLUMN phash TEXT DEFAULT '';`)
-	_, _ = db.Exec(`ALTER TABLE photos ADD COLUMN mime_type TEXT DEFAULT '';`)
-
 	if err != nil {
 		return fmt.Errorf("failed to create database table: %w", err)
+	}
+
+	// Backward compatibility and migrations for existing databases.
+	changed, migrateErr := migrate.MigratePhotosHashColumn(context.Background(), db)
+	if migrateErr != nil {
+		return migrateErr
+	}
+	if changed {
+		log.Printf("Migrated photos db schema: renamed photos.phash -> photos.dhash")
 	}
 	return nil
 }

@@ -132,8 +132,8 @@ func decodeImageForHash(path string) (image.Image, error) {
 }
 
 // CalculateDHash computes the fast dHash used for BK-tree candidate lookup.
-// Note: historically this project stored dHash values in `phash` columns
-// (e.g. cache.db's file_cache.phash). Prefer the dHash naming in new code.
+// Note: historically this project stored dHash values in `phash` columns.
+// Modern databases use `dhash` (e.g. cache.db's file_cache.dhash). Prefer the dHash naming in new code.
 func CalculateDHash(path string) (uint64, error) {
 	img, err := decodeImageForHash(path)
 	if err != nil {
@@ -154,8 +154,8 @@ func CalculatePHash(path string) (uint64, error) {
 }
 
 // CalculateFullPerceptionHash computes the stronger full perception hash.
-// Callers should use the full name to avoid confusion with the cached `phash`
-// column, which currently stores dHash values.
+// Callers should use the full name to avoid confusion with the first-stage dHash
+// column, which was historically named `phash`.
 func CalculateFullPerceptionHash(path string) (uint64, error) {
 	img, err := decodeImageForHash(path)
 	if err != nil {

@@ -99,7 +99,7 @@ func TestHandleResolveGroupPromotesThumbnailToMaster(t *testing.T) {
 	masterMeta := metadata.ExtractImageMetaJson(masterPath)
 	thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
 
-	_, err = sqliteDB.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
+	_, err = sqliteDB.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, dhash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
 		masterPath, "old-master-hash", "0000000000000001", masterStat.Size(), masterMeta,
 		`[{"path":"`+thumbPath+`","metadata":`+thumbMeta+`}]`)
 	require.NoError(t, err)
@@ -140,7 +140,7 @@ func TestHandleResolveGroupPromotesThumbnailToMaster(t *testing.T) {
 	var gotHash string
 	var gotPHash string
 	var thumbnails string
-	err = sqliteDB.QueryRow(`SELECT mmh3_hash, phash, thumbnails FROM file_cache WHERE target_path = ?`, masterPath).Scan(&gotHash, &gotPHash, &thumbnails)
+	err = sqliteDB.QueryRow(`SELECT mmh3_hash, dhash, thumbnails FROM file_cache WHERE target_path = ?`, masterPath).Scan(&gotHash, &gotPHash, &thumbnails)
 	require.NoError(t, err)
 	require.Equal(t, expectedHash, gotHash)
 	require.Equal(t, hasher.DHashToString(expectedPHash), gotPHash)
@@ -198,7 +198,7 @@ func TestHandleResolveGroupKeepsMultipleSelectedItems(t *testing.T) {
 	keepMeta := metadata.ExtractImageMetaJson(keepThumbPath)
 	deleteMeta := metadata.ExtractImageMetaJson(deleteThumbPath)
 
-	_, err = sqliteDB.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
+	_, err = sqliteDB.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, dhash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
 		masterPath, "old-master-hash", "0000000000000001", masterStat.Size(), masterMeta,
 		`[{"path":"`+keepThumbPath+`","metadata":`+keepMeta+`},{"path":"`+deleteThumbPath+`","metadata":`+deleteMeta+`}]`)
 	require.NoError(t, err)
@@ -245,7 +245,7 @@ func TestHandleResolveGroupKeepsMultipleSelectedItems(t *testing.T) {
 	var keepHash string
 	var keepPHash string
 	var keepThumbs string
-	err = sqliteDB.QueryRow(`SELECT mmh3_hash, phash, thumbnails FROM file_cache WHERE target_path = ?`, restoredKeepPath).Scan(&keepHash, &keepPHash, &keepThumbs)
+	err = sqliteDB.QueryRow(`SELECT mmh3_hash, dhash, thumbnails FROM file_cache WHERE target_path = ?`, restoredKeepPath).Scan(&keepHash, &keepPHash, &keepThumbs)
 	require.NoError(t, err)
 	require.Equal(t, expectedHash, keepHash)
 	require.Equal(t, hasher.DHashToString(expectedPHash), keepPHash)
@@ -292,7 +292,7 @@ func TestHandleResolveGroupSerializesConcurrentDBWrites(t *testing.T) {
 		masterMeta := metadata.ExtractImageMetaJson(masterPath)
 		thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
 
-		_, err = sqliteDB.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
+		_, err = sqliteDB.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, dhash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
 			masterPath, "old-hash-"+name, "0000000000000001", masterStat.Size(), masterMeta,
 			`[{"path":"`+thumbPath+`","metadata":`+thumbMeta+`}]`)
 		require.NoError(t, err)
@@ -373,7 +373,7 @@ func TestHandleGroupArchiveDownloadIncludesManifestAndFiles(t *testing.T) {
 		CREATE TABLE file_cache (
 			target_path TEXT PRIMARY KEY,
 			mmh3_hash TEXT,
-			phash TEXT,
+			dhash TEXT,
 			size INTEGER,
 			metadata TEXT DEFAULT '{}',
 			thumbnails TEXT DEFAULT '[]'
@@ -386,7 +386,7 @@ func TestHandleGroupArchiveDownloadIncludesManifestAndFiles(t *testing.T) {
 	masterBytes := writeJPEG(t, masterPath, 12, 12, color.RGBA{255, 0, 0, 255})
 	dupBytes := writeJPEG(t, dupPath, 10, 10, color.RGBA{0, 255, 0, 255})
 
-	_, err = sqliteDB.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
+	_, err = sqliteDB.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, dhash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
 		masterPath, "master-hash", "", int64(len(masterBytes)), "{}",
 		`[{"path":"`+dupPath+`","metadata":{"size":`+fmt.Sprintf("%d", len(dupBytes))+`}}]`)
 	require.NoError(t, err)
@@ -630,7 +630,7 @@ func TestHandleGetDuplicatesReturnsPaginationMetadata(t *testing.T) {
 		CREATE TABLE file_cache (
 			target_path TEXT PRIMARY KEY,
 			mmh3_hash TEXT,
-			phash TEXT,
+			dhash TEXT,
 			size INTEGER,
 			metadata TEXT DEFAULT '{}',
 			thumbnails TEXT DEFAULT '[]'
@@ -639,7 +639,7 @@ func TestHandleGetDuplicatesReturnsPaginationMetadata(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = sqliteDB.Exec(`
-		INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails)
+		INSERT INTO file_cache (target_path, mmh3_hash, dhash, size, metadata, thumbnails)
 		VALUES
 			('b-master.jpg', 'h1', 'p1', 11, '{}', '[{"path":"b-thumb.jpg","metadata":{"size":5}}]'),
 			('a-master.jpg', 'h2', 'p2', 22, '{}', '[{"path":"a-thumb.jpg","metadata":{"size":6}}]')
@@ -686,7 +686,7 @@ func TestHandleGetDuplicatesAllowsManualPageSizeWithinMax(t *testing.T) {
 		CREATE TABLE file_cache (
 			target_path TEXT PRIMARY KEY,
 			mmh3_hash TEXT,
-			phash TEXT,
+			dhash TEXT,
 			size INTEGER,
 			metadata TEXT DEFAULT '{}',
 			thumbnails TEXT DEFAULT '[]'
@@ -695,7 +695,7 @@ func TestHandleGetDuplicatesAllowsManualPageSizeWithinMax(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = sqliteDB.Exec(`
-		INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails)
+		INSERT INTO file_cache (target_path, mmh3_hash, dhash, size, metadata, thumbnails)
 		VALUES
 			('a-master.jpg', 'h1', 'p1', 11, '{}', '[{"path":"a-thumb.jpg","metadata":{"size":5}}]'),
 			('b-master.jpg', 'h2', 'p2', 22, '{}', '[{"path":"b-thumb.jpg","metadata":{"size":6}}]')
@@ -733,7 +733,7 @@ func TestHandleGetDuplicatesPrefersRawKeepPathWhenResolutionIsWithinTolerance(t 
 		CREATE TABLE file_cache (
 			target_path TEXT PRIMARY KEY,
 			mmh3_hash TEXT,
-			phash TEXT,
+			dhash TEXT,
 			size INTEGER,
 			metadata TEXT DEFAULT '{}',
 			thumbnails TEXT DEFAULT '[]'
@@ -742,7 +742,7 @@ func TestHandleGetDuplicatesPrefersRawKeepPathWhenResolutionIsWithinTolerance(t 
 	require.NoError(t, err)
 
 	_, err = sqliteDB.Exec(`
-		INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails)
+		INSERT INTO file_cache (target_path, mmh3_hash, dhash, size, metadata, thumbnails)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`,
 		"master.jpg",

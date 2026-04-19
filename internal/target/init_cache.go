@@ -170,7 +170,7 @@ func collectTargetPaths(ctx context.Context, targetDir string) ([]string, []stri
 }
 
 func loadFileCacheRows(ctx context.Context, db *sql.DB) (map[string]fileCacheRow, error) {
-	rows, err := db.QueryContext(ctx, `SELECT target_path, mmh3_hash, phash, size, metadata, thumbnails FROM file_cache`)
+	rows, err := db.QueryContext(ctx, `SELECT target_path, mmh3_hash, dhash, size, metadata, thumbnails FROM file_cache`)
 	if err != nil {
 		return nil, err
 	}
@@ -858,11 +858,11 @@ func upsertMasterPreservingThumbnails(exec interface {
 	Exec(query string, args ...any) (sql.Result, error)
 }, file targetFile) error {
 	_, err := exec.Exec(`
-		INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata)
+		INSERT INTO file_cache (target_path, mmh3_hash, dhash, size, metadata)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(target_path) DO UPDATE SET
 			mmh3_hash = excluded.mmh3_hash,
-			phash = excluded.phash,
+			dhash = excluded.dhash,
 			size = excluded.size,
 			metadata = excluded.metadata
 	`, file.Path, file.MMH3, file.DHashStr, file.Size, file.Metadata)
@@ -871,11 +871,11 @@ func upsertMasterPreservingThumbnails(exec interface {
 
 func replaceMasterWithThumbnails(tx *sql.Tx, file targetFile, thumbnails string) error {
 	_, err := tx.Exec(`
-		INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails)
+		INSERT INTO file_cache (target_path, mmh3_hash, dhash, size, metadata, thumbnails)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(target_path) DO UPDATE SET
 			mmh3_hash = excluded.mmh3_hash,
-			phash = excluded.phash,
+			dhash = excluded.dhash,
 			size = excluded.size,
 			metadata = excluded.metadata,
 			thumbnails = excluded.thumbnails

@@ -39,7 +39,7 @@ Keep new code observable by default. Emit logs for long-running work, state tran
 Prefer structured or consistently formatted log lines over ad hoc prints. Return errors with actionable context instead of bare wrapped failures, and preserve identifiers that let operators correlate logs across steps. When adding background workers, batch jobs, or multi-step mutations, make sure success, skip, retry, and rollback outcomes are visible in logs or explicit reports.
 
 ## Cache Layers
-Keep the staged visual-matching model explicit. `file_cache.phash` is the first-stage `dHash` used broadly for candidate lookup across all cached files. Heavier second-stage features such as full perception hash, color signature, and ORB exist only to confirm thumbnail or derivative relationships and should remain conceptually separate from the base `phash` field.
+Keep the staged visual-matching model explicit. `file_cache.dhash` is the first-stage `dHash` used broadly for candidate lookup across all cached files. Heavier second-stage features such as full perception hash, color signature, and ORB exist only to confirm thumbnail or derivative relationships and should remain conceptually separate from the base `dhash` field.
 
 ## AGENTS.md Maintenance
 Keep every `AGENTS.md` aligned with the current codebase at all times. Any change to behavior, module boundaries, commands, tests, or workflow must include the matching guide updates in the same change. Before finishing work, review the repository-level guide and the nearest module guide for each edited directory and update them if they no longer match the code.

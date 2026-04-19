@@ -109,7 +109,7 @@ func TestInitTargetDirCache_Migration(t *testing.T) {
 	cm, err := NewCacheManager(tempDir, 1)
 	require.NoError(t, err)
 
-	_, err = cm.db.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, 'abc', '', 100, '{}', '[]')`, path)
+	_, err = cm.db.Exec(`INSERT INTO file_cache (target_path, mmh3_hash, dhash, size, metadata, thumbnails) VALUES (?, 'abc', '', 100, '{}', '[]')`, path)
 	require.NoError(t, err)
 	cm.Close()
 
@@ -122,8 +122,8 @@ func TestInitTargetDirCache_Migration(t *testing.T) {
 
 	// Give background worker a moment
 	require.Eventually(t, func() bool {
-		var phash, metadata string
-		err := cm2.db.QueryRow("SELECT phash, metadata FROM file_cache WHERE target_path = ?", path).Scan(&phash, &metadata)
+		var dhash, metadata string
+		err := cm2.db.QueryRow("SELECT dhash, metadata FROM file_cache WHERE target_path = ?", path).Scan(&dhash, &metadata)
 		return err == nil && metadata != "{}"
 	}, 2*time.Second, 100*time.Millisecond, "Incomplete entry should be auto-migrated")
 }

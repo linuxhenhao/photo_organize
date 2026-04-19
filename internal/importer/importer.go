@@ -167,7 +167,7 @@ func HandleImport(dbPath string, destDir string) {
 	}
 
 	rows, err := sqliteDB.Query(`
-        SELECT p.source_path, p.size, p.create_time, p.mmh3_hash, p.phash
+        SELECT p.source_path, p.size, p.create_time, p.mmh3_hash, p.dhash
         FROM photos p
         JOIN (
             SELECT group_id, MIN(source_path) as min_source_path

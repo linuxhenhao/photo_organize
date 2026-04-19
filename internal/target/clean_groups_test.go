@@ -77,7 +77,7 @@ func insertCachedMaster(t *testing.T, cm *CacheManager, path string, thumbnails 
 	require.NoError(t, err)
 
 	_, err = cm.db.Exec(
-		`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO file_cache (target_path, mmh3_hash, dhash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
 		path,
 		file.MMH3,
 		file.DHashStr,

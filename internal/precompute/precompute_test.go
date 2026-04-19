@@ -46,7 +46,7 @@ func openCacheDB(t *testing.T, dir string) *sql.DB {
 		CREATE TABLE IF NOT EXISTS file_cache (
 			target_path TEXT PRIMARY KEY,
 			mmh3_hash TEXT,
-			phash TEXT,
+			dhash TEXT,
 			size INTEGER,
 			metadata TEXT DEFAULT '{}',
 			thumbnails TEXT DEFAULT '[]'

@@ -146,7 +146,7 @@ func TestInitTargetDirCacheReadOnlyRebuildsExistingThumbnailLinks(t *testing.T) 
 	require.Equal(t, 1, count)
 
 	var masterPHash string
-	err = cm.db.QueryRow(`SELECT phash FROM file_cache WHERE target_path = ?`, masterPath).Scan(&masterPHash)
+	err = cm.db.QueryRow(`SELECT dhash FROM file_cache WHERE target_path = ?`, masterPath).Scan(&masterPHash)
 	require.NoError(t, err)
 	require.NotEmpty(t, masterPHash)
 
@@ -197,7 +197,7 @@ func TestInitTargetDirCacheReadOnlyBackfillsThumbnailMMH3(t *testing.T) {
 	thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
 	thumbsJSON := marshalThumbnailEntries([]thumbnailEntry{makeThumbnailEntry(thumbPath, "", thumbMeta)})
 	_, err = cm.db.Exec(
-		`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO file_cache (target_path, mmh3_hash, dhash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
 		masterPath,
 		masterFile.MMH3,
 		masterFile.DHashStr,
@@ -281,7 +281,7 @@ func TestInitTargetDirCacheMoveDuplicatesUsesExistingCache(t *testing.T) {
 	defer cm.Close()
 
 	_, err = cm.db.Exec(`
-		INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails)
+		INSERT INTO file_cache (target_path, mmh3_hash, dhash, size, metadata, thumbnails)
 		VALUES (?, ?, ?, ?, ?, '[]'),
 		       (?, ?, ?, ?, ?, '[]')
 	`,
@@ -324,7 +324,7 @@ func TestInitTargetDirCacheMoveDuplicatesUsesExistingCache(t *testing.T) {
 	var dbHash string
 	var dbPHash string
 	var dbMeta sql.NullString
-	err = cm.db.QueryRow(`SELECT mmh3_hash, phash, metadata FROM file_cache WHERE target_path = ?`, bigPath).Scan(&dbHash, &dbPHash, &dbMeta)
+	err = cm.db.QueryRow(`SELECT mmh3_hash, dhash, metadata FROM file_cache WHERE target_path = ?`, bigPath).Scan(&dbHash, &dbPHash, &dbMeta)
 	require.NoError(t, err)
 	require.Equal(t, bigHash, dbHash)
 	require.Equal(t, hasher.DHashToString(bigPHash), dbPHash)
@@ -390,7 +390,7 @@ func TestInitTargetDirCacheWithContextStopsBeforeMoveOnCancellation(t *testing.T
 	defer cm.Close()
 
 	_, err = cm.db.Exec(`
-		INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails)
+		INSERT INTO file_cache (target_path, mmh3_hash, dhash, size, metadata, thumbnails)
 		VALUES (?, ?, ?, ?, ?, '[]'),
 		       (?, ?, ?, ?, ?, '[]')
 	`,

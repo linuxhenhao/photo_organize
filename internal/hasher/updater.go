@@ -20,16 +20,16 @@ type hashJob struct {
 type hashResult struct {
 	path  string
 	mmh3  string
-	phash string
+	dhash string
 	err   error
 }
 
 // UpdateHashes calculates and updates hashes for files concurrently.
 func UpdateHashes(db *sql.DB) error {
 	rows, err := db.Query(`
-        SELECT source_path, mmh3_hash, phash, mime_type
+        SELECT source_path, mmh3_hash, dhash, mime_type
         FROM photos
-        WHERE mmh3_hash = '' OR phash = '' OR phash IS NULL;
+        WHERE mmh3_hash = '' OR dhash = '' OR dhash IS NULL;
     `)
 	if err != nil {
 		return fmt.Errorf("failed to query for files needing hash update: %w", err)
@@ -37,15 +37,15 @@ func UpdateHashes(db *sql.DB) error {
 
 	var jobsList []hashJob
 	for rows.Next() {
-		var path, mmh3, phash, mimeType string
-		if err := rows.Scan(&path, &mmh3, &phash, &mimeType); err != nil {
+		var path, mmh3, dhashStr, mimeType string
+		if err := rows.Scan(&path, &mmh3, &dhashStr, &mimeType); err != nil {
 			log.Printf("Failed to scan path for hash update: %v", err)
 			continue
 		}
 		jobsList = append(jobsList, hashJob{
 			path:      path,
 			calcMmh3:  mmh3 == "",
-			calcPhash: phash == "",
+			calcPhash: dhashStr == "",
 			mimeType:  strings.ToLower(mimeType),
 		})
 	}
@@ -82,12 +82,12 @@ func UpdateHashes(db *sql.DB) error {
 					if CanVisualHash(job.path, job.mimeType) {
 						p, err := CalculateDHash(job.path)
 						if err != nil {
-							res.phash = "UNSUPPORTED"
+							res.dhash = "UNSUPPORTED"
 						} else {
-							res.phash = DHashToString(p)
+							res.dhash = DHashToString(p)
 						}
 					} else {
-						res.phash = "NOT_IMAGE"
+						res.dhash = "NOT_IMAGE"
 					}
 				}
 				results <- res
@@ -118,12 +118,12 @@ func UpdateHashes(db *sql.DB) error {
 			continue
 		}
 
-		if result.mmh3 != "" && result.phash != "" {
-			_, err = tx.Exec(`UPDATE photos SET mmh3_hash = ?, phash = ? WHERE source_path = ?`, result.mmh3, result.phash, result.path)
+		if result.mmh3 != "" && result.dhash != "" {
+			_, err = tx.Exec(`UPDATE photos SET mmh3_hash = ?, dhash = ? WHERE source_path = ?`, result.mmh3, result.dhash, result.path)
 		} else if result.mmh3 != "" {
 			_, err = tx.Exec(`UPDATE photos SET mmh3_hash = ? WHERE source_path = ?`, result.mmh3, result.path)
-		} else if result.phash != "" {
-			_, err = tx.Exec(`UPDATE photos SET phash = ? WHERE source_path = ?`, result.phash, result.path)
+		} else if result.dhash != "" {
+			_, err = tx.Exec(`UPDATE photos SET dhash = ? WHERE source_path = ?`, result.dhash, result.path)
 		}
 
 		if err != nil {
