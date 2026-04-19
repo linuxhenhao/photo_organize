@@ -93,7 +93,7 @@ func classifyDerivative(childPath string, childMetaJSON string, childSize int64,
 		return DerivativeDecision{}, nil
 	}
 
-	verification, err := vision.VerifyDerivativeWithSIFT(childPath, parentPath)
+	verification, err := vision.VerifyDerivativeWithORB(childPath, parentPath)
 	if err != nil {
 		return DerivativeDecision{}, err
 	}

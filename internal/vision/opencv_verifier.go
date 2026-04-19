@@ -11,10 +11,19 @@ import (
 
 const (
 	maxImageDimension      = 1600
-	loweRatioThreshold     = 0.75
-	minGoodMatches         = 12
-	minInliers             = 8
-	minInlierRatio         = 0.35
+	minImageDimension      = 320
+	orbLoweRatioThreshold  = 0.80
+	orbFeatureCount        = 2000
+	orbScaleFactor         = 1.2
+	orbLevels              = 8
+	orbEdgeThreshold       = 31
+	orbFirstLevel          = 0
+	orbWTAK                = 2
+	orbPatchSize           = 31
+	orbFastThreshold       = 12
+	minGoodMatches         = 10
+	minInliers             = 6
+	minInlierRatio         = 0.30
 	maxCornerOverflowRatio = 0.08
 	maxScaleDeviationRatio = 0.35
 	ransacReprojThreshold  = 3.0
@@ -30,16 +39,16 @@ type DerivativeVerification struct {
 	InlierRatio float64
 }
 
-// VerifyDerivativeWithSIFT checks whether child is a derived version of parent
-// using SIFT feature matching plus RANSAC geometric verification.
-func VerifyDerivativeWithSIFT(childPath, parentPath string) (DerivativeVerification, error) {
-	child, err := loadImageForSIFT(childPath)
+// VerifyDerivativeWithORB checks whether child is a derived version of parent
+// using ORB feature matching plus RANSAC geometric verification.
+func VerifyDerivativeWithORB(childPath, parentPath string) (DerivativeVerification, error) {
+	child, err := loadImageForFeatureMatch(childPath)
 	if err != nil {
 		return DerivativeVerification{}, err
 	}
 	defer child.Close()
 
-	parent, err := loadImageForSIFT(parentPath)
+	parent, err := loadImageForFeatureMatch(parentPath)
 	if err != nil {
 		return DerivativeVerification{}, err
 	}
@@ -49,24 +58,34 @@ func VerifyDerivativeWithSIFT(childPath, parentPath string) (DerivativeVerificat
 		return DerivativeVerification{}, nil
 	}
 
-	childGray, err := normalizeForSIFT(child)
+	childGray, err := normalizeForFeatureMatch(child)
 	if err != nil {
 		return DerivativeVerification{}, err
 	}
 	defer childGray.Close()
 
-	parentGray, err := normalizeForSIFT(parent)
+	parentGray, err := normalizeForFeatureMatch(parent)
 	if err != nil {
 		return DerivativeVerification{}, err
 	}
 	defer parentGray.Close()
 
-	sift := gocv.NewSIFT()
-	defer sift.Close()
+	orb := gocv.NewORBWithParams(
+		orbFeatureCount,
+		float32(orbScaleFactor),
+		orbLevels,
+		orbEdgeThreshold,
+		orbFirstLevel,
+		orbWTAK,
+		gocv.ORBScoreTypeHarris,
+		orbPatchSize,
+		orbFastThreshold,
+	)
+	defer orb.Close()
 
-	childKeypoints, childDescriptors := sift.DetectAndCompute(childGray, gocv.NewMat())
+	childKeypoints, childDescriptors := orb.DetectAndCompute(childGray, gocv.NewMat())
 	defer childDescriptors.Close()
-	parentKeypoints, parentDescriptors := sift.DetectAndCompute(parentGray, gocv.NewMat())
+	parentKeypoints, parentDescriptors := orb.DetectAndCompute(parentGray, gocv.NewMat())
 	defer parentDescriptors.Close()
 
 	if len(childKeypoints) < minGoodMatches || len(parentKeypoints) < minGoodMatches {
@@ -76,7 +95,7 @@ func VerifyDerivativeWithSIFT(childPath, parentPath string) (DerivativeVerificat
 		return DerivativeVerification{}, nil
 	}
 
-	matcher := gocv.NewBFMatcherWithParams(gocv.NormL2, false)
+	matcher := gocv.NewBFMatcherWithParams(gocv.NormHamming, false)
 	defer matcher.Close()
 
 	knnMatches := matcher.KnnMatch(childDescriptors, parentDescriptors, 2)
@@ -85,7 +104,7 @@ func VerifyDerivativeWithSIFT(childPath, parentPath string) (DerivativeVerificat
 		if len(pair) < 2 {
 			continue
 		}
-		if pair[0].Distance < loweRatioThreshold*pair[1].Distance {
+		if pair[0].Distance < orbLoweRatioThreshold*pair[1].Distance {
 			goodMatches = append(goodMatches, pair[0])
 		}
 	}
@@ -146,7 +165,7 @@ func VerifyDerivativeWithSIFT(childPath, parentPath string) (DerivativeVerificat
 	}, nil
 }
 
-func loadImageForSIFT(path string) (gocv.Mat, error) {
+func loadImageForFeatureMatch(path string) (gocv.Mat, error) {
 	if preview, err := extractPreviewBytes(path); err == nil && len(preview) > 0 {
 		mat, decodeErr := gocv.IMDecode(preview, gocv.IMReadColor)
 		if decodeErr == nil && !mat.Empty() {
@@ -159,7 +178,7 @@ func loadImageForSIFT(path string) (gocv.Mat, error) {
 
 	mat := gocv.IMRead(path, gocv.IMReadColor)
 	if mat.Empty() {
-		return gocv.NewMat(), fmt.Errorf("failed to decode image for SIFT: %s", path)
+		return gocv.NewMat(), fmt.Errorf("failed to decode image for ORB: %s", path)
 	}
 	return mat, nil
 }
@@ -197,7 +216,7 @@ func extractPreviewBytes(path string) ([]byte, error) {
 	return nil, fmt.Errorf("no preview image found for %s", path)
 }
 
-func normalizeForSIFT(src gocv.Mat) (gocv.Mat, error) {
+func normalizeForFeatureMatch(src gocv.Mat) (gocv.Mat, error) {
 	if src.Empty() {
 		return gocv.NewMat(), nil
 	}
@@ -220,13 +239,22 @@ func normalizeForSIFT(src gocv.Mat) (gocv.Mat, error) {
 	if gray.Rows() > maxSide {
 		maxSide = gray.Rows()
 	}
-	if maxSide <= maxImageDimension {
+	if maxSide >= minImageDimension && maxSide <= maxImageDimension {
 		return gray, nil
 	}
 
-	scale := float64(maxImageDimension) / float64(maxSide)
+	scale := 1.0
+	if maxSide < minImageDimension {
+		scale = float64(minImageDimension) / float64(maxSide)
+	} else {
+		scale = float64(maxImageDimension) / float64(maxSide)
+	}
 	resized := gocv.NewMat()
-	if err := gocv.Resize(gray, &resized, image.Point{}, scale, scale, gocv.InterpolationArea); err != nil {
+	interpolation := gocv.InterpolationArea
+	if scale > 1 {
+		interpolation = gocv.InterpolationCubic
+	}
+	if err := gocv.Resize(gray, &resized, image.Point{}, scale, scale, interpolation); err != nil {
 		gray.Close()
 		resized.Close()
 		return gocv.NewMat(), err

@@ -15,6 +15,10 @@ import (
 )
 
 func writePatternJPEG(t *testing.T, path string, width int, height int, quality int) {
+	writePatternJPEGVariant(t, path, width, height, quality, 0)
+}
+
+func writePatternJPEGVariant(t *testing.T, path string, width int, height int, quality int, variant int) {
 	t.Helper()
 
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0755))
@@ -27,11 +31,19 @@ func writePatternJPEG(t *testing.T, path string, width int, height int, quality 
 			baseR := uint8(255 * rx)
 			baseG := uint8(255 * ry)
 			baseB := uint8(255 * (1 - rx*ry))
-			if ((x/9)+(y/9))%2 == 0 {
+			if ((x/9)+(y/9)+variant)%2 == 0 {
 				baseR = 255 - baseR/2
 				baseB /= 2
 			}
-			if (x-width/3)*(x-width/3)+(y-height/2)*(y-height/2) < (min(width, height)/6)*(min(width, height)/6) {
+			circleX := width / 3
+			circleY := height / 2
+			if variant%2 == 1 {
+				circleX = (2 * width) / 3
+			}
+			if variant >= 2 {
+				circleY = height / 3
+			}
+			if (x-circleX)*(x-circleX)+(y-circleY)*(y-circleY) < (min(width, height)/6)*(min(width, height)/6) {
 				baseG = 255
 			}
 			img.Set(x, y, color.RGBA{R: baseR, G: baseG, B: baseB, A: 255})
@@ -162,6 +174,28 @@ func TestClassifyDerivativeAllowsSameSizedReencode(t *testing.T) {
 	decision, err := ClassifyDerivative(childPath, childMeta, childStat.Size(), parentPath, parentMeta, parentStat.Size())
 	require.NoError(t, err)
 	require.True(t, decision.Confirmed)
+}
+
+func TestClassifyDerivativeRejectsDifferentContentSameSize(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "dedupe_thumbnail_different_content")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	parentPath := filepath.Join(tempDir, "master.jpg")
+	childPath := filepath.Join(tempDir, "different.jpg")
+	writePatternJPEGVariant(t, parentPath, 160, 120, 92, 0)
+	writePatternJPEGVariant(t, childPath, 160, 120, 72, 2)
+
+	parentMeta := metadata.ExtractImageMetaJson(parentPath)
+	childMeta := metadata.ExtractImageMetaJson(childPath)
+	childStat, err := os.Stat(childPath)
+	require.NoError(t, err)
+	parentStat, err := os.Stat(parentPath)
+	require.NoError(t, err)
+
+	decision, err := ClassifyDerivative(childPath, childMeta, childStat.Size(), parentPath, parentMeta, parentStat.Size())
+	require.NoError(t, err)
+	require.False(t, decision.Confirmed)
 }
 
 func TestClassifyDerivativeRejectsThumbnailParent(t *testing.T) {
