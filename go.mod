@@ -8,6 +8,7 @@ require (
 	github.com/stretchr/testify v1.10.0
 	github.com/twmb/murmur3 v1.1.8
 	gocv.io/x/gocv v0.43.0
+	golang.org/x/image v0.36.0
 	golang.org/x/sys v0.33.0
 	modernc.org/sqlite v1.37.1
 )

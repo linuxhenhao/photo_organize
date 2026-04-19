@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"image"
+	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png" // Basic support for now, can extend to others if needed
 	"io"
@@ -15,6 +16,9 @@ import (
 	"github.com/corona10/goimagehash"
 	projectexiftool "github.com/linuxhenhao/photo_organize/internal/exiftool"
 	"github.com/twmb/murmur3"
+	_ "golang.org/x/image/bmp"
+	_ "golang.org/x/image/tiff"
+	_ "golang.org/x/image/webp"
 )
 
 func mimeTypeWithExiftool(path string) (string, error) {
