@@ -120,7 +120,7 @@ func TestCleanThumbnailGroupsRehomesInvalidThumbnailToExistingMaster(t *testing.
 	copyFileBytes(t, masterBPath, thumbPath)
 
 	thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
-	thumbsJSON := marshalThumbnailEntries([]thumbnailEntry{makeThumbnailEntry(thumbPath, thumbMeta)})
+	thumbsJSON := marshalThumbnailEntries([]thumbnailEntry{makeThumbnailEntry(thumbPath, "", thumbMeta)})
 
 	cm, err := NewCacheManager(tempDir, 1)
 	require.NoError(t, err)
@@ -169,7 +169,7 @@ func TestCleanThumbnailGroupsDryRunDoesNotPersistChanges(t *testing.T) {
 	copyFileBytes(t, masterBPath, thumbPath)
 
 	thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
-	thumbsJSON := marshalThumbnailEntries([]thumbnailEntry{makeThumbnailEntry(thumbPath, thumbMeta)})
+	thumbsJSON := marshalThumbnailEntries([]thumbnailEntry{makeThumbnailEntry(thumbPath, "", thumbMeta)})
 
 	cm, err := NewCacheManager(tempDir, 1)
 	require.NoError(t, err)
@@ -206,7 +206,7 @@ func TestCleanThumbnailGroupsRestoresStandaloneWhenNoExistingMasterMatches(t *te
 	writePatternJPEG(t, thumbPath, 120, 90, 1)
 
 	thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
-	thumbsJSON := marshalThumbnailEntries([]thumbnailEntry{makeThumbnailEntry(thumbPath, thumbMeta)})
+	thumbsJSON := marshalThumbnailEntries([]thumbnailEntry{makeThumbnailEntry(thumbPath, "", thumbMeta)})
 
 	cm, err := NewCacheManager(tempDir, 1)
 	require.NoError(t, err)
@@ -243,7 +243,7 @@ func TestCleanThumbnailGroupsStandaloneLogIncludesCaseDetails(t *testing.T) {
 	writePatternJPEG(t, thumbPath, 120, 90, 1)
 
 	thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
-	thumbsJSON := marshalThumbnailEntries([]thumbnailEntry{makeThumbnailEntry(thumbPath, thumbMeta)})
+	thumbsJSON := marshalThumbnailEntries([]thumbnailEntry{makeThumbnailEntry(thumbPath, "", thumbMeta)})
 
 	cm, err := NewCacheManager(tempDir, 1)
 	require.NoError(t, err)

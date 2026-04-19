@@ -159,7 +159,7 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 				targetRow := rows[targetMasterPath]
 				targetRow.Thumbnails = marshalThumbnailEntries(mergeThumbnailEntries(
 					parseThumbnailEntries(targetRow.Thumbnails),
-					[]thumbnailEntry{makeThumbnailEntry(entry.Path, entryFile.Metadata)},
+					[]thumbnailEntry{makeThumbnailEntry(entry.Path, entryFile.MMH3, entryFile.Metadata)},
 				))
 				rows[targetMasterPath] = targetRow
 				changedMasters[targetMasterPath] = true

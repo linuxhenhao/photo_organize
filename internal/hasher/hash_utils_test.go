@@ -72,3 +72,14 @@ func TestCalculatePHashSupportsARWFixture(t *testing.T) {
 	require.NoError(t, err)
 	require.NotZero(t, hash)
 }
+
+func TestCalculatePHashSupportsCR2Fixture(t *testing.T) {
+	fixturePath := filepath.Join("..", "..", "test_data", "source", "IMG_5798.CR2")
+	if _, err := os.Stat(fixturePath); err != nil {
+		t.Fatalf("CR2 fixture missing: %v", err)
+	}
+
+	hash, err := CalculatePHash(fixturePath)
+	require.NoError(t, err)
+	require.NotZero(t, hash)
+}

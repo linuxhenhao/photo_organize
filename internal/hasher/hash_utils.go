@@ -131,7 +131,8 @@ func decodeImageForHash(path string) (image.Image, error) {
 	return img, nil
 }
 
-// CalculatePHash computes the fast dHash used for BK-tree candidate lookup.
+// CalculatePHash computes the fast dHash stored in cache.db's `phash` column
+// for BK-tree candidate lookup.
 func CalculatePHash(path string) (uint64, error) {
 	img, err := decodeImageForHash(path)
 	if err != nil {
@@ -145,8 +146,10 @@ func CalculatePHash(path string) (uint64, error) {
 	return hash.GetHash(), nil
 }
 
-// CalculatePerceptionHash computes a stronger perceptual hash for duplicate confirmation.
-func CalculatePerceptionHash(path string) (uint64, error) {
+// CalculateFullPerceptionHash computes the stronger full perception hash.
+// Callers should use the full name to avoid confusion with the cached `phash`
+// column, which currently stores dHash values.
+func CalculateFullPerceptionHash(path string) (uint64, error) {
 	img, err := decodeImageForHash(path)
 	if err != nil {
 		return 0, err
@@ -157,6 +160,12 @@ func CalculatePerceptionHash(path string) (uint64, error) {
 		return 0, err
 	}
 	return hash.GetHash(), nil
+}
+
+// CalculatePerceptionHash is kept as a compatibility alias for callers that
+// still use the old name.
+func CalculatePerceptionHash(path string) (uint64, error) {
+	return CalculateFullPerceptionHash(path)
 }
 
 // CalculateColorSignature samples a coarse RGB grid for color-aware duplicate confirmation.

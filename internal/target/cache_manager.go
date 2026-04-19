@@ -261,7 +261,7 @@ func (cm *CacheManager) runWorker() {
 						parseThumbnailEntries(oldThumbs),
 					)
 					if entry.thumbPath != "" {
-						merged = mergeThumbnailEntries(merged, []thumbnailEntry{makeThumbnailEntry(entry.thumbPath, entry.thumbMeta)})
+						merged = mergeThumbnailEntries(merged, []thumbnailEntry{makeThumbnailEntry(entry.thumbPath, "", entry.thumbMeta)})
 					}
 					err = setThumbnails(tx, entry.path, marshalThumbnailEntries(merged))
 				}

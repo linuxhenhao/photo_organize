@@ -1,17 +1,23 @@
 package dedupe
 
 import (
+	"bytes"
 	"fmt"
 	"image"
 	"image/color"
+	_ "image/gif"
 	"image/jpeg"
 	"os"
 	"path/filepath"
 	"testing"
 
+	projectexiftool "github.com/linuxhenhao/photo_organize/internal/exiftool"
 	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
 	"github.com/stretchr/testify/require"
+	_ "golang.org/x/image/bmp"
+	_ "golang.org/x/image/tiff"
+	_ "golang.org/x/image/webp"
 )
 
 func writePatternJPEG(t *testing.T, path string, width int, height int, quality int) {
@@ -71,9 +77,70 @@ func min(a int, b int) int {
 	return b
 }
 
+func writeRawPreviewJPEG(t *testing.T, rawPath string, outputPath string) {
+	t.Helper()
+
+	pool, err := projectexiftool.SharedPool()
+	require.NoError(t, err)
+
+	results, err := pool.Extract([]string{rawPath}, []string{
+		"PreviewImage",
+		"JpgFromRaw",
+		"ThumbnailImage",
+	}, projectexiftool.QueryOptions{
+		Binary:            true,
+		IgnoreMinorErrors: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+
+	var preview []byte
+	for _, key := range []string{"PreviewImage", "JpgFromRaw", "ThumbnailImage"} {
+		data, ok, err := results[0].GetBytes(key)
+		require.NoError(t, err)
+		if ok && len(data) > 0 {
+			preview = data
+			break
+		}
+	}
+	require.NotEmpty(t, preview, "expected embedded preview in %s", rawPath)
+
+	img, _, err := image.Decode(bytes.NewReader(preview))
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(outputPath), 0755))
+
+	file, err := os.Create(outputPath)
+	require.NoError(t, err)
+	defer file.Close()
+
+	require.NoError(t, jpeg.Encode(file, img, &jpeg.Options{Quality: 82}))
+}
+
 func TestClassifyDerivativeConfirmsRealRawThumbnail(t *testing.T) {
 	parentPath := filepath.Clean(filepath.Join("..", "..", "test_data", "source1", "DSC01075.ARW"))
 	childPath := filepath.Clean(filepath.Join("..", "..", "test_data", "source1", "DSC01075.thumb.jpg"))
+
+	parentMeta := metadata.ExtractImageMetaJson(parentPath)
+	childMeta := metadata.ExtractImageMetaJson(childPath)
+	childStat, err := os.Stat(childPath)
+	require.NoError(t, err)
+	parentStat, err := os.Stat(parentPath)
+	require.NoError(t, err)
+
+	decision, err := ClassifyDerivative(childPath, childMeta, childStat.Size(), parentPath, parentMeta, parentStat.Size())
+	require.NoError(t, err)
+	require.True(t, decision.Confirmed)
+	require.Equal(t, DerivativeVariant, decision.Kind)
+}
+
+func TestClassifyDerivativeConfirmsCR2EmbeddedPreviewDerivative(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "dedupe_cr2_preview_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	parentPath := filepath.Clean(filepath.Join("..", "..", "test_data", "source", "IMG_5798.CR2"))
+	childPath := filepath.Join(tempDir, "IMG_5798.preview.jpg")
+	writeRawPreviewJPEG(t, parentPath, childPath)
 
 	parentMeta := metadata.ExtractImageMetaJson(parentPath)
 	childMeta := metadata.ExtractImageMetaJson(childPath)
