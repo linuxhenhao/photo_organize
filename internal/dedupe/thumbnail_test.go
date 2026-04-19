@@ -14,6 +14,7 @@ import (
 	projectexiftool "github.com/linuxhenhao/photo_organize/internal/exiftool"
 	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
+	"github.com/linuxhenhao/photo_organize/internal/vision"
 	"github.com/stretchr/testify/require"
 	_ "golang.org/x/image/bmp"
 	_ "golang.org/x/image/tiff"
@@ -175,6 +176,78 @@ func TestCandidateSearchDistanceCoversRepoMockThumbnails(t *testing.T) {
 	}
 
 	require.Greater(t, maxDistance, 4, "fixtures should still exercise the tighter recall boundary")
+}
+
+func TestRevalidateDerivativeWithResolvedFeaturesDoesNotRequireFiles(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "dedupe_resolved_features")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	parentPath := filepath.Join(tempDir, "album", "master.jpg")
+	childPath := filepath.Join(tempDir, "thumbnails", "album", "thumb.jpg")
+
+	writePatternJPEG(t, parentPath, 420, 300, 0)
+	writePatternJPEG(t, childPath, 420, 300, 0)
+
+	parentMeta := metadata.ExtractImageMetaJson(parentPath)
+	childMeta := metadata.ExtractImageMetaJson(childPath)
+
+	parentStat, err := os.Stat(parentPath)
+	require.NoError(t, err)
+	childStat, err := os.Stat(childPath)
+	require.NoError(t, err)
+
+	parentDHash, err := hasher.CalculatePHash(parentPath)
+	require.NoError(t, err)
+	childDHash, err := hasher.CalculatePHash(childPath)
+	require.NoError(t, err)
+
+	parentColor, err := hasher.CalculateColorSignature(parentPath)
+	require.NoError(t, err)
+	childColor, err := hasher.CalculateColorSignature(childPath)
+	require.NoError(t, err)
+
+	parentORBSerial, err := vision.ComputeORBSerializedFeatures(parentPath)
+	require.NoError(t, err)
+	childORBSerial, err := vision.ComputeORBSerializedFeatures(childPath)
+	require.NoError(t, err)
+
+	parentORB, err := vision.DeserializeORBFeatureSet(parentORBSerial)
+	require.NoError(t, err)
+	defer parentORB.Close()
+	childORB, err := vision.DeserializeORBFeatureSet(childORBSerial)
+	require.NoError(t, err)
+	defer childORB.Close()
+
+	// Remove the files. Validation should rely only on the resolved features + JSON metadata.
+	require.NoError(t, os.Remove(parentPath))
+	require.NoError(t, os.Remove(childPath))
+
+	decision, err := RevalidateDerivativeWithResolvedFeatures(
+		childPath,
+		childMeta,
+		childStat.Size(),
+		ResolvedVisualFeatures{
+			DHash:             childDHash,
+			HasDHash:          true,
+			ColorSignature:    childColor,
+			HasColorSignature: true,
+			ORB:               &childORB,
+		},
+		parentPath,
+		parentMeta,
+		parentStat.Size(),
+		ResolvedVisualFeatures{
+			DHash:             parentDHash,
+			HasDHash:          true,
+			ColorSignature:    parentColor,
+			HasColorSignature: true,
+			ORB:               &parentORB,
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, decision.Confirmed)
+	require.Equal(t, DerivativeVariant, decision.Kind)
 }
 
 func TestClassifyDerivativeRejectsAspectRatioMismatch(t *testing.T) {

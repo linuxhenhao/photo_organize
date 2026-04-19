@@ -16,6 +16,7 @@ import (
 	_ "modernc.org/sqlite" // Ensure sqlite driver is loaded
 
 	"github.com/linuxhenhao/photo_organize/internal/importer"
+	"github.com/linuxhenhao/photo_organize/internal/precompute"
 	"github.com/linuxhenhao/photo_organize/internal/scanner"
 	"github.com/linuxhenhao/photo_organize/internal/target"
 	"github.com/linuxhenhao/photo_organize/internal/web"
@@ -54,12 +55,21 @@ func main() {
 	initCacheCmd := flag.NewFlagSet("initcache", flag.ExitOnError)
 	initCacheCmd.StringVar(&destDir, "dest", "", "Target directory for import (e.g., /path/to/organized_photos)")
 	var moveDuplicates bool
+	var skipRebuild bool
 	initCacheCmd.BoolVar(&moveDuplicates, "move-duplicates", false, "Move perceptual duplicates into thumbnails; default is read-only cache refresh")
+	initCacheCmd.BoolVar(&skipRebuild, "skip-rebuild", false, "Skip rebuilding thumbnail links from thumbnails/ (can be very slow)")
 
 	cleanGroupsCmd := flag.NewFlagSet("cleangroups", flag.ExitOnError)
 	cleanGroupsCmd.StringVar(&destDir, "dest", "", "Target directory containing deduplicated items and cache.db")
 	var applyCleanGroups bool
 	cleanGroupsCmd.BoolVar(&applyCleanGroups, "apply", false, "Persist cleanup changes; default is dry-run")
+
+	precomputeCmd := flag.NewFlagSet("precompute", flag.ExitOnError)
+	precomputeCmd.StringVar(&destDir, "dest", "", "Target directory containing deduplicated items and cache.db")
+	var precomputeWorkers int
+	var precomputeForce bool
+	precomputeCmd.IntVar(&precomputeWorkers, "workers", 0, "Worker count; default uses CPU core count")
+	precomputeCmd.BoolVar(&precomputeForce, "force", false, "Recompute features even if cache entry exists")
 
 	serveCmd := flag.NewFlagSet("serve", flag.ExitOnError)
 	serveCmd.StringVar(&destDir, "dest", "", "Target directory containing deduplicated items and cache.db")
@@ -72,7 +82,7 @@ func main() {
 
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: photo-organizer <command> [options]")
-		fmt.Println("Commands: scan, import, initcache, cleangroups, serve")
+		fmt.Println("Commands: scan, import, initcache, cleangroups, precompute, serve")
 		fmt.Println("\nScan command options:")
 		scanCmd.PrintDefaults()
 		fmt.Println("\nImport command options:")
@@ -81,6 +91,8 @@ func main() {
 		initCacheCmd.PrintDefaults()
 		fmt.Println("\nCleanGroups command options:")
 		cleanGroupsCmd.PrintDefaults()
+		fmt.Println("\nPrecompute command options:")
+		precomputeCmd.PrintDefaults()
 		fmt.Println("\nServe command options:")
 		serveCmd.PrintDefaults()
 		os.Exit(1)
@@ -118,6 +130,7 @@ func main() {
 
 		target.InitTargetDirCacheWithContext(ctx, destDir, cacheManager, target.InitCacheOptions{
 			MoveDuplicates: moveDuplicates,
+			SkipRebuild:    skipRebuild,
 		})
 	case "cleangroups":
 		cleanGroupsCmd.Parse(os.Args[2:])
@@ -138,6 +151,31 @@ func main() {
 			Apply: applyCleanGroups,
 		}); err != nil {
 			log.Fatalf("CleanGroups failed: %v", err)
+		}
+	case "precompute":
+		precomputeCmd.Parse(os.Args[2:])
+		if destDir == "" {
+			log.Fatal("Precompute command requires a target directory specified with -dest.")
+		}
+
+		dbPath := filepath.Join(destDir, "cache.db")
+		sqliteDB, err := sql.Open("sqlite", dbPath+"?_busy_timeout=5000")
+		if err != nil {
+			log.Fatalf("Failed to open cache.db: %v", err)
+		}
+		defer sqliteDB.Close()
+
+		_, _ = sqliteDB.Exec(`PRAGMA synchronous = OFF`)
+		_, _ = sqliteDB.Exec(`PRAGMA journal_mode = WAL`)
+
+		ctx, stopSignals := newInitCacheContext()
+		defer stopSignals()
+
+		if err := precompute.Run(ctx, destDir, sqliteDB, precompute.Options{
+			Workers: precomputeWorkers,
+			Force:   precomputeForce,
+		}); err != nil {
+			log.Fatalf("Precompute failed: %v", err)
 		}
 	case "serve":
 		serveCmd.Parse(os.Args[2:])

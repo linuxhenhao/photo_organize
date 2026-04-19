@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`cmd/photo-organizer/` contains the main CLI entrypoint. `cmd/xattr-probe/` is a small utility command. Core packages live under `internal/`, grouped by responsibility such as `scanner`, `metadata`, `importer`, `target`, `web`, and `hasher`. Static assets for the web UI are in `internal/web/static/`. Test fixtures and sample outputs live in `test_data/`. Helper scripts, including fixture generation, are under `scripts/`.
+`cmd/photo-organizer/` contains the main CLI entrypoint. `cmd/xattr-probe/` is a small utility command. Core packages live under `internal/`, grouped by responsibility such as `scanner`, `metadata`, `importer`, `target`, `precompute`, `web`, and `hasher`. Static assets for the web UI are in `internal/web/static/`. Test fixtures and sample outputs live in `test_data/`. Helper scripts, including fixture generation, are under `scripts/`.
 
 Each `internal/<module>/` directory also has its own `AGENTS.md`. Read this repository-level guide first, then read the nearest module guide before changing code in that package. When a task spans multiple modules, follow the most specific guide for each edited directory.
 
@@ -13,10 +13,11 @@ go build -o photo-organizer ./cmd/photo-organizer
 ./build.sh
 go test ./...
 ./integration_test.sh
+./photo-organizer precompute -dest /path/to/repo
 go run ./scripts/gen_test_images/main.go -output-root /tmp/photo-fixtures
 ```
 
-`go build` produces a local binary. `./build.sh` writes the binary to `output/photo_organize`. `go test ./...` runs unit tests across `internal/...`. `./integration_test.sh` builds the app, generates fixtures, and validates `scan`, `import`, and `initcache` end to end.
+`go build` produces a local binary. `./build.sh` writes the binary to `output/photo_organize`. `go test ./...` runs unit tests across `internal/...`. `./integration_test.sh` builds the app, generates fixtures, and validates `scan`, `import`, and `initcache` end to end. `precompute` populates `cache.db` with persisted visual features for faster cleanup workflows.
 
 ## Coding Style & Naming Conventions
 Follow standard Go formatting: run `gofmt` on every changed file and keep imports organized by `go fmt`. Use tabs for indentation in Go files. Prefer short, package-scoped names that match existing patterns (`cache_manager.go`, `clean_groups.go`, `server_test.go`). Keep new commands under `cmd/<tool-name>/` and new internal packages focused on one responsibility.
@@ -36,6 +37,9 @@ SQLite databases, generated tar files, and local outputs appear in the repo root
 Keep new code observable by default. Emit logs for long-running work, state transitions, recovery paths, and user-visible failures, and include enough context to identify the affected file, group, request, or destination path. Follow existing patterns such as `resolve_id` in web flows and summary/report logging in cleanup and import paths.
 
 Prefer structured or consistently formatted log lines over ad hoc prints. Return errors with actionable context instead of bare wrapped failures, and preserve identifiers that let operators correlate logs across steps. When adding background workers, batch jobs, or multi-step mutations, make sure success, skip, retry, and rollback outcomes are visible in logs or explicit reports.
+
+## Cache Layers
+Keep the staged visual-matching model explicit. `file_cache.phash` is the first-stage `dHash` used broadly for candidate lookup across all cached files. Heavier second-stage features such as full perception hash, color signature, and ORB exist only to confirm thumbnail or derivative relationships and should remain conceptually separate from the base `phash` field.
 
 ## AGENTS.md Maintenance
 Keep every `AGENTS.md` aligned with the current codebase at all times. Any change to behavior, module boundaries, commands, tests, or workflow must include the matching guide updates in the same change. Before finishing work, review the repository-level guide and the nearest module guide for each edited directory and update them if they no longer match the code.

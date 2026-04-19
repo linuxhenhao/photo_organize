@@ -1,6 +1,7 @@
 package importer
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/linuxhenhao/photo_organize/internal/db"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
+	"github.com/linuxhenhao/photo_organize/internal/precompute"
 	"github.com/linuxhenhao/photo_organize/internal/target"
 )
 
@@ -56,6 +58,7 @@ func copyFile(src, dst string) error {
 
 func importWorker(tasks <-chan ImportTask, wg *sync.WaitGroup, successCount *int32, failCount *int32, coordinator *importCoordinator) {
 	defer wg.Done()
+	ctx := context.Background()
 	for task := range tasks {
 		sourceMeta := ""
 		if _, hasPHash := parseTaskPHash(task); hasPHash {
@@ -63,7 +66,7 @@ func importWorker(tasks <-chan ImportTask, wg *sync.WaitGroup, successCount *int
 		}
 
 		for {
-			plan := coordinator.planTask(task, sourceMeta)
+			plan := coordinator.planTask(ctx, task, sourceMeta)
 			switch plan.action {
 			case importPlanSkip:
 				goto nextTask
@@ -96,8 +99,8 @@ func importWorker(tasks <-chan ImportTask, wg *sync.WaitGroup, successCount *int
 				}
 			}
 
-			coordinator.commitReservation(plan.reservation)
-			log.Printf("Successfully imported: [%s] -> [%s]", task.SourcePath, finalTargetPath)
+			committedPath := coordinator.commitReservation(plan.reservation)
+			log.Printf("Successfully imported: [%s] -> [%s]", task.SourcePath, committedPath)
 			atomic.AddInt32(successCount, 1)
 			goto nextTask
 		}
@@ -132,6 +135,23 @@ func HandleImport(dbPath string, destDir string) {
 	}
 	defer cacheManager.Close()
 
+	// Visual feature cache shares the same SQLite file but uses its own
+	// connection so CacheManager can keep its async writer semantics.
+	cacheDBPath := filepath.Join(destDir, "cache.db")
+	cacheDB, err := sql.Open("sqlite", cacheDBPath+"?_busy_timeout=5000")
+	if err != nil {
+		log.Fatalf("Failed to open cache db '%s' for feature resolver: %v", cacheDBPath, err)
+	}
+	cacheDB.Exec(`PRAGMA synchronous = OFF`)
+	cacheDB.Exec(`PRAGMA journal_mode = WAL`)
+	defer cacheDB.Close()
+
+	featureResolver, err := precompute.NewResolver(context.Background(), cacheDB)
+	if err != nil {
+		log.Fatalf("Failed to create feature resolver: %v", err)
+	}
+	defer featureResolver.Close()
+
 	if err := db.InitDB(sqliteDB); err != nil {
 		log.Fatalf("Warning: couldn't apply db migrations during import: %v", err)
 	}
@@ -139,7 +159,7 @@ func HandleImport(dbPath string, destDir string) {
 	tasks := make(chan ImportTask, copyWorkers*2)
 	var wg sync.WaitGroup
 	var successCount, failCount int32
-	coordinator := newImportCoordinator(cacheManager)
+	coordinator := newImportCoordinator(cacheManager, featureResolver)
 
 	for i := 0; i < copyWorkers; i++ {
 		wg.Add(1)

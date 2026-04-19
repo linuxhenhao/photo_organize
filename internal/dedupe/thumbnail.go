@@ -35,6 +35,14 @@ type DerivativeDecision struct {
 	Confirmed bool
 }
 
+type ResolvedVisualFeatures struct {
+	DHash             uint64
+	HasDHash          bool
+	ColorSignature    []uint8
+	HasColorSignature bool
+	ORB               *vision.ORBFeatureSet
+}
+
 // RevalidateDerivative checks whether child belongs under parent without
 // applying repository-path heuristics. This is intended for cleaning existing
 // historical cache relationships rather than creating new ones.
@@ -42,10 +50,18 @@ func RevalidateDerivative(childPath string, childMetaJSON string, childSize int6
 	return classifyDerivative(childPath, childMetaJSON, childSize, parentPath, parentMetaJSON, parentSize, false)
 }
 
+func RevalidateDerivativeWithResolvedFeatures(childPath string, childMetaJSON string, childSize int64, childFeatures ResolvedVisualFeatures, parentPath string, parentMetaJSON string, parentSize int64, parentFeatures ResolvedVisualFeatures) (DerivativeDecision, error) {
+	return classifyDerivativeResolved(childPath, childMetaJSON, childSize, childFeatures, parentPath, parentMetaJSON, parentSize, parentFeatures, false)
+}
+
 // ClassifyDerivative confirms whether child should be treated as a derived
 // thumbnail/export of parent. The relationship is directional.
 func ClassifyDerivative(childPath string, childMetaJSON string, childSize int64, parentPath string, parentMetaJSON string, parentSize int64) (DerivativeDecision, error) {
 	return classifyDerivative(childPath, childMetaJSON, childSize, parentPath, parentMetaJSON, parentSize, true)
+}
+
+func ClassifyDerivativeWithResolvedFeatures(childPath string, childMetaJSON string, childSize int64, childFeatures ResolvedVisualFeatures, parentPath string, parentMetaJSON string, parentSize int64, parentFeatures ResolvedVisualFeatures) (DerivativeDecision, error) {
+	return classifyDerivativeResolved(childPath, childMetaJSON, childSize, childFeatures, parentPath, parentMetaJSON, parentSize, parentFeatures, true)
 }
 
 func classifyDerivative(childPath string, childMetaJSON string, childSize int64, parentPath string, parentMetaJSON string, parentSize int64, enforcePathPolicy bool) (DerivativeDecision, error) {
@@ -102,6 +118,84 @@ func classifyDerivative(childPath string, childMetaJSON string, childSize int64,
 	}
 
 	return DerivativeDecision{}, nil
+}
+
+func classifyDerivativeResolved(childPath string, childMetaJSON string, childSize int64, childFeatures ResolvedVisualFeatures, parentPath string, parentMetaJSON string, parentSize int64, parentFeatures ResolvedVisualFeatures, enforcePathPolicy bool) (DerivativeDecision, error) {
+	if enforcePathPolicy && !CanAutoGroupUnderParent(childPath, parentPath) {
+		return DerivativeDecision{}, nil
+	}
+
+	childMeta := loadComparableMeta(childPath, childMetaJSON)
+	parentMeta := loadComparableMeta(parentPath, parentMetaJSON)
+
+	if !hasComparableDimensions(childMeta, parentMeta) {
+		return DerivativeDecision{}, nil
+	}
+	if !aspectRatioCompatible(childMeta, parentMeta) {
+		return DerivativeDecision{}, nil
+	}
+	if !childFitsWithinParent(childMeta, parentMeta) {
+		return DerivativeDecision{}, nil
+	}
+
+	childHash, err := resolvedDHash(childPath, childFeatures)
+	if err != nil {
+		return DerivativeDecision{}, fmt.Errorf("failed to calculate child candidate hash %s: %w", childPath, err)
+	}
+	parentHash, err := resolvedDHash(parentPath, parentFeatures)
+	if err != nil {
+		return DerivativeDecision{}, fmt.Errorf("failed to calculate parent candidate hash %s: %w", parentPath, err)
+	}
+
+	hashDistance := hasher.HammingDistance(childHash, parentHash)
+	if hashDistance > maxAssistPHashDistance {
+		return DerivativeDecision{}, nil
+	}
+
+	childSignature, err := resolvedColorSignature(childPath, childFeatures)
+	if err != nil {
+		return DerivativeDecision{}, fmt.Errorf("failed to calculate color signature for %s: %w", childPath, err)
+	}
+	parentSignature, err := resolvedColorSignature(parentPath, parentFeatures)
+	if err != nil {
+		return DerivativeDecision{}, fmt.Errorf("failed to calculate color signature for %s: %w", parentPath, err)
+	}
+	colorDistance := hasher.ColorSignatureDistance(childSignature, parentSignature)
+	if hashDistance > maxConfirmPHashDistance && colorDistance > maxColorSignatureDelta {
+		return DerivativeDecision{}, nil
+	}
+
+	if childFeatures.ORB != nil && parentFeatures.ORB != nil {
+		verification := vision.VerifyDerivativeWithORBFeatures(*childFeatures.ORB, *parentFeatures.ORB)
+		if verification.Confirmed {
+			return DerivativeDecision{Kind: DerivativeVariant, Confirmed: true}, nil
+		}
+		return DerivativeDecision{}, nil
+	}
+
+	verification, err := vision.VerifyDerivativeWithORB(childPath, parentPath)
+	if err != nil {
+		return DerivativeDecision{}, err
+	}
+	if verification.Confirmed {
+		return DerivativeDecision{Kind: DerivativeVariant, Confirmed: true}, nil
+	}
+
+	return DerivativeDecision{}, nil
+}
+
+func resolvedDHash(path string, features ResolvedVisualFeatures) (uint64, error) {
+	if features.HasDHash {
+		return features.DHash, nil
+	}
+	return hasher.CalculatePHash(path)
+}
+
+func resolvedColorSignature(path string, features ResolvedVisualFeatures) ([]uint8, error) {
+	if features.HasColorSignature {
+		return features.ColorSignature, nil
+	}
+	return hasher.CalculateColorSignature(path)
 }
 
 // CompareMasterPreference chooses which of two files is a better canonical

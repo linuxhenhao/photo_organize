@@ -1,6 +1,8 @@
 package importer
 
 import (
+	"context"
+	"database/sql"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
+	"github.com/linuxhenhao/photo_organize/internal/precompute"
 	"github.com/linuxhenhao/photo_organize/internal/target"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -119,7 +122,7 @@ func TestImportWorkerRollsBackReservedEntryOnCopyFailure(t *testing.T) {
 	cacheManager, err := target.NewCacheManager(tempDir, 1)
 	require.NoError(t, err)
 	defer cacheManager.Close()
-	coordinator := newImportCoordinator(cacheManager)
+	coordinator := newImportCoordinator(cacheManager, nil)
 
 	tasks := make(chan ImportTask, 1)
 	var wg sync.WaitGroup
@@ -163,15 +166,15 @@ func TestImportCoordinatorWaitsForSimilarInFlightTask(t *testing.T) {
 	masterSource := filepath.Join(tempDir, "source", "master.jpg")
 	writeJPEGFixturePair(t, masterSource, thumbSource)
 
-	coordinator := newImportCoordinator(cacheManager)
+	coordinator := newImportCoordinator(cacheManager, nil)
 	targetDir := filepath.Join(tempDir, "2023", "05", "01")
 	thumbTask := buildTaskFromPath(t, thumbSource, targetDir)
 	masterTask := buildTaskFromPath(t, masterSource, targetDir)
 
-	firstPlan := coordinator.planTask(thumbTask, metadata.ExtractImageMetaJson(thumbTask.SourcePath))
+	firstPlan := coordinator.planTask(context.Background(), thumbTask, metadata.ExtractImageMetaJson(thumbTask.SourcePath))
 	require.Equal(t, importPlanCopyMaster, firstPlan.action)
 
-	secondPlan := coordinator.planTask(masterTask, metadata.ExtractImageMetaJson(masterTask.SourcePath))
+	secondPlan := coordinator.planTask(context.Background(), masterTask, metadata.ExtractImageMetaJson(masterTask.SourcePath))
 	require.Equal(t, importPlanCopyMaster, secondPlan.action)
 	require.NotNil(t, secondPlan.reservation)
 
@@ -193,8 +196,8 @@ func TestImportCoordinatorDropsMissingCommittedExactMatch(t *testing.T) {
 	task := buildTaskFromPath(t, sourcePath, filepath.Join(tempDir, "2023", "05", "01"))
 	cacheManager.AddEntryWithPresence(filepath.Join(tempDir, "missing.jpg"), task.MMH3Hash, 0, false, task.Size, "{}")
 
-	coordinator := newImportCoordinator(cacheManager)
-	plan := coordinator.planTask(task, metadata.ExtractImageMetaJson(task.SourcePath))
+	coordinator := newImportCoordinator(cacheManager, nil)
+	plan := coordinator.planTask(context.Background(), task, metadata.ExtractImageMetaJson(task.SourcePath))
 	require.Equal(t, importPlanCopyMaster, plan.action)
 	require.NotNil(t, plan.reservation)
 
@@ -202,4 +205,53 @@ func TestImportCoordinatorDropsMissingCommittedExactMatch(t *testing.T) {
 	require.False(t, found)
 
 	coordinator.cancelReservation(plan.reservation)
+}
+
+func TestImportCoordinatorBackfillsFeatureCacheOnVisualMatchAttempt(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "photo_organize_import_feature_cache_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	cacheManager, err := target.NewCacheManager(tempDir, 1)
+	require.NoError(t, err)
+	defer cacheManager.Close()
+
+	cacheDB, err := sql.Open("sqlite", filepath.Join(tempDir, "cache.db")+"?_busy_timeout=5000")
+	require.NoError(t, err)
+	cacheDB.Exec(`PRAGMA synchronous = OFF`)
+	cacheDB.Exec(`PRAGMA journal_mode = WAL`)
+	defer cacheDB.Close()
+
+	resolver, err := precompute.NewResolver(context.Background(), cacheDB)
+	require.NoError(t, err)
+	defer resolver.Close()
+
+	coordinator := newImportCoordinator(cacheManager, resolver)
+
+	targetDir := filepath.Join(tempDir, "2023", "05", "01")
+	masterPath := filepath.Join(targetDir, "master.jpg")
+	thumbSource := filepath.Join(tempDir, "source", "thumb.jpg")
+	writeJPEGFixturePair(t, masterPath, thumbSource)
+
+	masterStat, err := os.Stat(masterPath)
+	require.NoError(t, err)
+	masterMMH3, err := hasher.CalculateHash(masterPath)
+	require.NoError(t, err)
+	masterPHash, err := hasher.CalculatePHash(masterPath)
+	require.NoError(t, err)
+	masterMeta := metadata.ExtractImageMetaJson(masterPath)
+
+	cacheManager.AddEntryWithPresence(masterPath, masterMMH3, masterPHash, true, masterStat.Size(), masterMeta)
+
+	task := buildTaskFromPath(t, thumbSource, targetDir)
+	_ = coordinator.planTask(context.Background(), task, metadata.ExtractImageMetaJson(task.SourcePath))
+
+	var count int
+	err = cacheDB.QueryRow(`SELECT COUNT(1) FROM visual_feature_cache WHERE mmh3_hash = ?`, masterMMH3).Scan(&count)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, count, 1)
+
+	err = cacheDB.QueryRow(`SELECT COUNT(1) FROM visual_feature_cache WHERE mmh3_hash = ?`, task.MMH3Hash).Scan(&count)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, count, 1)
 }

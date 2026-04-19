@@ -39,66 +39,57 @@ type DerivativeVerification struct {
 	InlierRatio float64
 }
 
+type ORBSerializedFeatures struct {
+	Keypoints   []byte
+	Descriptors []byte
+	Rows        int
+	Cols        int
+	MatType     int
+	ImgWidth    int
+	ImgHeight   int
+}
+
+type ORBFeatureSet struct {
+	Keypoints   []gocv.KeyPoint
+	Descriptors gocv.Mat
+	ImageWidth  int
+	ImageHeight int
+}
+
+func (f *ORBFeatureSet) Close() {
+	if f == nil {
+		return
+	}
+	if !f.Descriptors.Empty() {
+		f.Descriptors.Close()
+	}
+}
+
 // VerifyDerivativeWithORB checks whether child is a derived version of parent
 // using ORB feature matching plus RANSAC geometric verification.
 func VerifyDerivativeWithORB(childPath, parentPath string) (DerivativeVerification, error) {
-	child, err := loadImageForFeatureMatch(childPath)
+	childFeatures, parentFeatures, err := computeORBFeatureSets(childPath, parentPath)
 	if err != nil {
 		return DerivativeVerification{}, err
 	}
-	defer child.Close()
+	defer childFeatures.Close()
+	defer parentFeatures.Close()
 
-	parent, err := loadImageForFeatureMatch(parentPath)
-	if err != nil {
-		return DerivativeVerification{}, err
+	return VerifyDerivativeWithORBFeatures(childFeatures, parentFeatures), nil
+}
+
+func VerifyDerivativeWithORBFeatures(child ORBFeatureSet, parent ORBFeatureSet) DerivativeVerification {
+	if len(child.Keypoints) < minGoodMatches || len(parent.Keypoints) < minGoodMatches {
+		return DerivativeVerification{}
 	}
-	defer parent.Close()
-
-	if child.Empty() || parent.Empty() {
-		return DerivativeVerification{}, nil
-	}
-
-	childGray, err := normalizeForFeatureMatch(child)
-	if err != nil {
-		return DerivativeVerification{}, err
-	}
-	defer childGray.Close()
-
-	parentGray, err := normalizeForFeatureMatch(parent)
-	if err != nil {
-		return DerivativeVerification{}, err
-	}
-	defer parentGray.Close()
-
-	orb := gocv.NewORBWithParams(
-		orbFeatureCount,
-		float32(orbScaleFactor),
-		orbLevels,
-		orbEdgeThreshold,
-		orbFirstLevel,
-		orbWTAK,
-		gocv.ORBScoreTypeHarris,
-		orbPatchSize,
-		orbFastThreshold,
-	)
-	defer orb.Close()
-
-	childKeypoints, childDescriptors := orb.DetectAndCompute(childGray, gocv.NewMat())
-	defer childDescriptors.Close()
-	parentKeypoints, parentDescriptors := orb.DetectAndCompute(parentGray, gocv.NewMat())
-	defer parentDescriptors.Close()
-
-	if len(childKeypoints) < minGoodMatches || len(parentKeypoints) < minGoodMatches {
-		return DerivativeVerification{}, nil
-	}
-	if childDescriptors.Empty() || parentDescriptors.Empty() {
-		return DerivativeVerification{}, nil
+	if child.Descriptors.Empty() || parent.Descriptors.Empty() {
+		return DerivativeVerification{}
 	}
 
 	matcher := gocv.NewBFMatcherWithParams(gocv.NormHamming, false)
 	defer matcher.Close()
 
-	knnMatches := matcher.KnnMatch(childDescriptors, parentDescriptors, 2)
+	knnMatches := matcher.KnnMatch(child.Descriptors, parent.Descriptors, 2)
 	goodMatches := make([]gocv.DMatch, 0, len(knnMatches))
 	for _, pair := range knnMatches {
 		if len(pair) < 2 {
@@ -109,14 +100,14 @@ func VerifyDerivativeWithORB(childPath, parentPath string) (DerivativeVerificati
 		}
 	}
 	if len(goodMatches) < minGoodMatches {
-		return DerivativeVerification{GoodMatches: len(goodMatches)}, nil
+		return DerivativeVerification{GoodMatches: len(goodMatches)}
 	}
 
 	fromPoints := make([]gocv.Point2f, 0, len(goodMatches))
 	toPoints := make([]gocv.Point2f, 0, len(goodMatches))
 	for _, match := range goodMatches {
-		fromPoints = append(fromPoints, gocv.NewPoint2f(float32(childKeypoints[match.QueryIdx].X), float32(childKeypoints[match.QueryIdx].Y)))
-		toPoints = append(toPoints, gocv.NewPoint2f(float32(parentKeypoints[match.TrainIdx].X), float32(parentKeypoints[match.TrainIdx].Y)))
+		fromPoints = append(fromPoints, gocv.NewPoint2f(float32(child.Keypoints[match.QueryIdx].X), float32(child.Keypoints[match.QueryIdx].Y)))
+		toPoints = append(toPoints, gocv.NewPoint2f(float32(parent.Keypoints[match.TrainIdx].X), float32(parent.Keypoints[match.TrainIdx].Y)))
 	}
 
 	fromVec := gocv.NewPoint2fVectorFromPoints(fromPoints)
@@ -140,21 +131,21 @@ func VerifyDerivativeWithORB(childPath, parentPath string) (DerivativeVerificati
 	defer transform.Close()
 
 	if transform.Empty() || transform.Rows() != 2 || transform.Cols() != 3 {
-		return DerivativeVerification{GoodMatches: len(goodMatches)}, nil
+		return DerivativeVerification{GoodMatches: len(goodMatches)}
 	}
 
 	inlierCount := countInliers(inliers)
 	inlierRatio := float64(inlierCount) / float64(len(goodMatches))
 	if inlierCount < minInliers || inlierRatio < minInlierRatio {
-		return DerivativeVerification{GoodMatches: len(goodMatches), Inliers: inlierCount, InlierRatio: inlierRatio}, nil
+		return DerivativeVerification{GoodMatches: len(goodMatches), Inliers: inlierCount, InlierRatio: inlierRatio}
 	}
 
-	if !scaleLooksReasonable(transform, childGray.Cols(), childGray.Rows(), parentGray.Cols(), parentGray.Rows()) {
-		return DerivativeVerification{GoodMatches: len(goodMatches), Inliers: inlierCount, InlierRatio: inlierRatio}, nil
+	if !scaleLooksReasonable(transform, child.ImageWidth, child.ImageHeight, parent.ImageWidth, parent.ImageHeight) {
+		return DerivativeVerification{GoodMatches: len(goodMatches), Inliers: inlierCount, InlierRatio: inlierRatio}
 	}
 
-	if !cornersFitInsideParent(transform, childGray.Cols(), childGray.Rows(), parentGray.Cols(), parentGray.Rows()) {
-		return DerivativeVerification{GoodMatches: len(goodMatches), Inliers: inlierCount, InlierRatio: inlierRatio}, nil
+	if !cornersFitInsideParent(transform, child.ImageWidth, child.ImageHeight, parent.ImageWidth, parent.ImageHeight) {
+		return DerivativeVerification{GoodMatches: len(goodMatches), Inliers: inlierCount, InlierRatio: inlierRatio}
 	}
 
 	return DerivativeVerification{
@@ -162,6 +153,122 @@ func VerifyDerivativeWithORB(childPath, parentPath string) (DerivativeVerificati
 		GoodMatches: len(goodMatches),
 		Inliers:     inlierCount,
 		InlierRatio: inlierRatio,
+	}
+}
+
+func computeORBFeatureSets(childPath string, parentPath string) (ORBFeatureSet, ORBFeatureSet, error) {
+	child, err := loadImageForFeatureMatch(childPath)
+	if err != nil {
+		return ORBFeatureSet{}, ORBFeatureSet{}, err
+	}
+	defer child.Close()
+
+	parent, err := loadImageForFeatureMatch(parentPath)
+	if err != nil {
+		return ORBFeatureSet{}, ORBFeatureSet{}, err
+	}
+	defer parent.Close()
+
+	if child.Empty() || parent.Empty() {
+		return ORBFeatureSet{}, ORBFeatureSet{}, nil
+	}
+
+	childGray, err := normalizeForFeatureMatch(child)
+	if err != nil {
+		return ORBFeatureSet{}, ORBFeatureSet{}, err
+	}
+	defer childGray.Close()
+
+	parentGray, err := normalizeForFeatureMatch(parent)
+	if err != nil {
+		return ORBFeatureSet{}, ORBFeatureSet{}, err
+	}
+	defer parentGray.Close()
+
+	orb := gocv.NewORBWithParams(
+		orbFeatureCount,
+		float32(orbScaleFactor),
+		orbLevels,
+		orbEdgeThreshold,
+		orbFirstLevel,
+		orbWTAK,
+		gocv.ORBScoreTypeHarris,
+		orbPatchSize,
+		orbFastThreshold,
+	)
+	defer orb.Close()
+
+	childKeypoints, childDescriptors := orb.DetectAndCompute(childGray, gocv.NewMat())
+	parentKeypoints, parentDescriptors := orb.DetectAndCompute(parentGray, gocv.NewMat())
+	return ORBFeatureSet{
+			Keypoints:   childKeypoints,
+			Descriptors: childDescriptors,
+			ImageWidth:  childGray.Cols(),
+			ImageHeight: childGray.Rows(),
+		}, ORBFeatureSet{
+			Keypoints:   parentKeypoints,
+			Descriptors: parentDescriptors,
+			ImageWidth:  parentGray.Cols(),
+			ImageHeight: parentGray.Rows(),
+		}, nil
+}
+
+// ComputeORBSerializedFeatures extracts ORB keypoints/descriptors for a single image and
+// returns a serialized representation suitable for persistence.
+func ComputeORBSerializedFeatures(path string) (ORBSerializedFeatures, error) {
+	src, err := loadImageForFeatureMatch(path)
+	if err != nil {
+		return ORBSerializedFeatures{}, err
+	}
+	defer src.Close()
+
+	if src.Empty() {
+		return ORBSerializedFeatures{}, nil
+	}
+
+	gray, err := normalizeForFeatureMatch(src)
+	if err != nil {
+		return ORBSerializedFeatures{}, err
+	}
+	defer gray.Close()
+
+	if gray.Empty() {
+		return ORBSerializedFeatures{}, nil
+	}
+
+	orb := gocv.NewORBWithParams(
+		orbFeatureCount,
+		float32(orbScaleFactor),
+		orbLevels,
+		orbEdgeThreshold,
+		orbFirstLevel,
+		orbWTAK,
+		gocv.ORBScoreTypeHarris,
+		orbPatchSize,
+		orbFastThreshold,
+	)
+	defer orb.Close()
+
+	keypoints, descriptors := orb.DetectAndCompute(gray, gocv.NewMat())
+	defer descriptors.Close()
+
+	if len(keypoints) == 0 || descriptors.Empty() {
+		return ORBSerializedFeatures{}, nil
+	}
+
+	encodedKeypoints, err := SerializeORBKeypoints(keypoints)
+	if err != nil {
+		return ORBSerializedFeatures{}, fmt.Errorf("serialize ORB keypoints: %w", err)
+	}
+
+	return ORBSerializedFeatures{
+		Keypoints:   encodedKeypoints,
+		Descriptors: descriptors.ToBytes(),
+		Rows:        descriptors.Rows(),
+		Cols:        descriptors.Cols(),
+		MatType:     int(descriptors.Type()),
+		ImgWidth:    gray.Cols(),
+		ImgHeight:   gray.Rows(),
 	}, nil
 }
 

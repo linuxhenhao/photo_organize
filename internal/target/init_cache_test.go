@@ -223,6 +223,32 @@ func TestInitTargetDirCacheReadOnlyBackfillsThumbnailMMH3(t *testing.T) {
 	require.Equal(t, expectedThumbHash, thumbnails[0].MMH3)
 }
 
+func TestInitTargetDirCacheSkipRebuildLeavesThumbnailsUnchanged(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "initcache_skip_rebuild_test")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	masterPath := filepath.Join(tempDir, "album-a", "master.jpg")
+	thumbPath := filepath.Join(tempDir, "thumbnails", "album-a", "thumb.jpg")
+	writeSizedJPEGWithQuality(t, masterPath, 240, 180, 90)
+	writeSizedJPEGWithQuality(t, thumbPath, 240, 180, 90)
+
+	cm, err := NewCacheManager(tempDir, 1)
+	require.NoError(t, err)
+	defer cm.Close()
+
+	InitTargetDirCacheWithContext(context.Background(), tempDir, cm, InitCacheOptions{SkipRebuild: true})
+
+	var thumbsRaw string
+	require.NoError(t, cm.db.QueryRow(`SELECT thumbnails FROM file_cache WHERE target_path = ?`, masterPath).Scan(&thumbsRaw))
+	require.Equal(t, "[]", thumbsRaw)
+
+	InitTargetDirCacheWithContext(context.Background(), tempDir, cm, InitCacheOptions{})
+
+	require.NoError(t, cm.db.QueryRow(`SELECT thumbnails FROM file_cache WHERE target_path = ?`, masterPath).Scan(&thumbsRaw))
+	require.NotEqual(t, "[]", thumbsRaw)
+}
+
 func TestInitTargetDirCacheMoveDuplicatesUsesExistingCache(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "initcache_move_test")
 	require.NoError(t, err)

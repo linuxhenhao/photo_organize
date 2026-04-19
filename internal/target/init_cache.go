@@ -17,6 +17,7 @@ import (
 	"github.com/linuxhenhao/photo_organize/internal/fsutil"
 	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
+	"github.com/linuxhenhao/photo_organize/internal/precompute"
 )
 
 const initCacheWorkers = 10
@@ -24,6 +25,7 @@ const initCacheWorkers = 10
 // InitCacheOptions controls how initcache reconciles the target directory.
 type InitCacheOptions struct {
 	MoveDuplicates bool
+	SkipRebuild    bool
 }
 
 type fileCacheRow struct {
@@ -47,6 +49,7 @@ type targetFile struct {
 type thumbnailEntry struct {
 	Path     string          `json:"path"`
 	MMH3     string          `json:"mmh3_hash,omitempty"`
+	PHash    string          `json:"phash,omitempty"`
 	Metadata json.RawMessage `json:"metadata"`
 }
 
@@ -99,13 +102,13 @@ func InitTargetDirCacheWithContext(ctx context.Context, targetDir string, cm *Ca
 	}
 
 	if options.MoveDuplicates {
-		if err := initTargetDirCacheMove(ctx, targetDir, paths, thumbnailPaths, rows, cm); err != nil && !errors.Is(err, context.Canceled) {
+		if err := initTargetDirCacheMove(ctx, targetDir, paths, thumbnailPaths, rows, cm, options.SkipRebuild); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("Failed duplicate-moving cache initialization: %v", err)
 		}
 		return
 	}
 
-	if err := initTargetDirCacheReadOnly(ctx, targetDir, paths, thumbnailPaths, rows, cm); err != nil && !errors.Is(err, context.Canceled) {
+	if err := initTargetDirCacheReadOnly(ctx, targetDir, paths, thumbnailPaths, rows, cm, options.SkipRebuild); err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("Failed read-only cache initialization: %v", err)
 	}
 }
@@ -338,7 +341,7 @@ func prepareTargetFiles(ctx context.Context, paths []string, rows map[string]fil
 	return results
 }
 
-func initTargetDirCacheReadOnly(ctx context.Context, targetDir string, paths []string, thumbnailPaths []string, rows map[string]fileCacheRow, cm *CacheManager) error {
+func initTargetDirCacheReadOnly(ctx context.Context, targetDir string, paths []string, thumbnailPaths []string, rows map[string]fileCacheRow, cm *CacheManager, skipRebuild bool) error {
 	var refreshed int
 	prepared := prepareTargetFiles(ctx, paths, rows, true)
 	for _, entry := range prepared {
@@ -382,6 +385,11 @@ func initTargetDirCacheReadOnly(ctx context.Context, targetDir string, paths []s
 	if err := stopInitCacheAtSafePoint(ctx, "before rebuilding thumbnail links"); err != nil {
 		return err
 	}
+	if skipRebuild {
+		log.Printf("Skipping rebuildThumbnailLinks during initcache.")
+		log.Printf("Finished read-only cache initialization. %d entries refreshed.", refreshed)
+		return nil
+	}
 	if err := rebuildThumbnailLinks(ctx, thumbnailPaths, rows, cm); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return err
@@ -406,7 +414,7 @@ func backfillThumbnailEntryHashes(ctx context.Context, targetDir string, rows ma
 		}
 		entries := parseThumbnailEntries(row.Thumbnails)
 		for idx, entry := range entries {
-			if entry.Path == "" || entry.MMH3 != "" {
+			if entry.Path == "" || (entry.MMH3 != "" && entry.PHash != "") {
 				continue
 			}
 			pathRefs[entry.Path] = append(pathRefs[entry.Path], thumbnailRef{masterPath: masterPath, index: idx})
@@ -418,9 +426,10 @@ func backfillThumbnailEntryHashes(ctx context.Context, targetDir string, rows ma
 	}
 
 	type hashResult struct {
-		path string
-		mmh3 string
-		err  error
+		path  string
+		mmh3  string
+		phash string
+		err   error
 	}
 
 	paths := make([]string, 0, len(pathRefs))
@@ -443,8 +452,19 @@ func backfillThumbnailEntryHashes(ctx context.Context, targetDir string, rows ma
 			defer wg.Done()
 			for path := range jobs {
 				resolved := resolveStoredPath(targetDir, path)
-				hash, err := hasher.CalculateHash(resolved)
-				results <- hashResult{path: path, mmh3: hash, err: err}
+				mmh3, mmh3Err := hasher.CalculateHash(resolved)
+				if mmh3Err != nil {
+					results <- hashResult{path: path, err: mmh3Err}
+					continue
+				}
+
+				phash := ""
+				if hasher.CanVisualHash(resolved, "") {
+					if dhash, dhashErr := hasher.CalculatePHash(resolved); dhashErr == nil {
+						phash = hasher.PHashToString(dhash)
+					}
+				}
+				results <- hashResult{path: path, mmh3: mmh3, phash: phash, err: nil}
 			}
 		}()
 	}
@@ -481,13 +501,23 @@ func backfillThumbnailEntryHashes(ctx context.Context, targetDir string, rows ma
 			if !ok {
 				entries = parseThumbnailEntries(rows[ref.masterPath].Thumbnails)
 			}
-			if ref.index >= len(entries) || entries[ref.index].MMH3 != "" {
+			if ref.index >= len(entries) {
 				updatedMasters[ref.masterPath] = entries
 				continue
 			}
-			entries[ref.index].MMH3 = result.mmh3
+			changed := false
+			if entries[ref.index].MMH3 == "" && result.mmh3 != "" {
+				entries[ref.index].MMH3 = result.mmh3
+				changed = true
+			}
+			if entries[ref.index].PHash == "" && result.phash != "" {
+				entries[ref.index].PHash = result.phash
+				changed = true
+			}
 			updatedMasters[ref.masterPath] = entries
-			backfilled++
+			if changed {
+				backfilled++
+			}
 		}
 	}
 
@@ -521,12 +551,18 @@ func backfillThumbnailEntryHashes(ctx context.Context, targetDir string, rows ma
 		return err
 	}
 
-	log.Printf("Backfilled mmh3 hashes for %d thumbnail entries in read-only initcache.", backfilled)
+	log.Printf("Backfilled identifiers for %d thumbnail entries in read-only initcache.", backfilled)
 	return nil
 }
 
-func initTargetDirCacheMove(ctx context.Context, targetDir string, paths []string, thumbnailPaths []string, rows map[string]fileCacheRow, cm *CacheManager) error {
+func initTargetDirCacheMove(ctx context.Context, targetDir string, paths []string, thumbnailPaths []string, rows map[string]fileCacheRow, cm *CacheManager, skipRebuild bool) error {
 	var processed int
+	featureResolver, err := precompute.NewResolver(ctx, cm.db)
+	if err != nil {
+		return err
+	}
+	defer featureResolver.Close()
+
 	prepared := prepareTargetFiles(ctx, paths, rows, false)
 	for _, entry := range prepared {
 		if err := stopInitCacheAtSafePoint(ctx, "before processing the next duplicate candidate"); err != nil {
@@ -544,8 +580,7 @@ func initTargetDirCacheMove(ctx context.Context, targetDir string, paths []strin
 
 		var match *confirmedDuplicateMatch
 		if file.HasPHash {
-			var err error
-			match, err = findConfirmedDuplicateMatch(ctx, file, rows, cm)
+			match, err = findConfirmedDuplicateMatch(ctx, file, rows, cm, featureResolver)
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
 					return err
@@ -585,6 +620,11 @@ func initTargetDirCacheMove(ctx context.Context, targetDir string, paths []strin
 	if err := stopInitCacheAtSafePoint(ctx, "before rebuilding thumbnail links"); err != nil {
 		return err
 	}
+	if skipRebuild {
+		log.Printf("Skipping rebuildThumbnailLinks during initcache.")
+		log.Printf("Finished duplicate-moving cache initialization. %d files processed.", processed)
+		return nil
+	}
 	if err := rebuildThumbnailLinks(ctx, thumbnailPaths, rows, cm); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return err
@@ -596,11 +636,12 @@ func initTargetDirCacheMove(ctx context.Context, targetDir string, paths []strin
 	return nil
 }
 
-func findConfirmedDuplicateMatch(ctx context.Context, file targetFile, rows map[string]fileCacheRow, cm *CacheManager) (*confirmedDuplicateMatch, error) {
+func findConfirmedDuplicateMatch(ctx context.Context, file targetFile, rows map[string]fileCacheRow, cm *CacheManager, featureResolver *precompute.Resolver) (*confirmedDuplicateMatch, error) {
 	matches := cm.SearchPHash(file.PHash, dedupe.CandidateSearchDistance)
 	var best *confirmedDuplicateMatch
 	var bestMeta metadata.MediaMeta
 	ambiguous := false
+	childFeatures := resolveDedupeFeatures(ctx, featureResolver, file.MMH3, file.PHash, file.HasPHash, file.Path)
 	for _, candidate := range matches {
 		if err := stopInitCacheAtSafePoint(ctx, fmt.Sprintf("before confirming duplicate candidates for %s", file.Path)); err != nil {
 			return nil, err
@@ -621,7 +662,20 @@ func findConfirmedDuplicateMatch(ctx context.Context, file targetFile, rows map[
 		}
 
 		row := rows[candidate.Path]
-		decision, err := dedupe.ClassifyDerivative(file.Path, file.Metadata, file.Size, candidate.Path, row.Metadata, candidate.Size)
+		parentDHash := uint64(0)
+		parentHasDHash := false
+		if row.PHash != "" {
+			if parsed, parseErr := hasher.StringToPHash(row.PHash); parseErr == nil {
+				parentDHash = parsed
+				parentHasDHash = true
+			}
+		}
+		parentFeatures := resolveDedupeFeatures(ctx, featureResolver, row.MMH3, parentDHash, parentHasDHash, candidate.Path)
+
+		decision, err := dedupe.ClassifyDerivativeWithResolvedFeatures(
+			file.Path, file.Metadata, file.Size, childFeatures,
+			candidate.Path, row.Metadata, candidate.Size, parentFeatures,
+		)
 		if err != nil {
 			log.Printf("Failed to confirm visual duplicate %s against %s: %v", file.Path, candidate.Path, err)
 			continue
@@ -727,6 +781,9 @@ func mergeThumbnailEntries(groups ...[]thumbnailEntry) []thumbnailEntry {
 				if merged[idx].MMH3 == "" && entry.MMH3 != "" {
 					merged[idx].MMH3 = entry.MMH3
 				}
+				if merged[idx].PHash == "" && entry.PHash != "" {
+					merged[idx].PHash = entry.PHash
+				}
 				if len(merged[idx].Metadata) == 0 || string(merged[idx].Metadata) == "{}" {
 					if len(entry.Metadata) > 0 && string(entry.Metadata) != "{}" {
 						merged[idx].Metadata = entry.Metadata
@@ -743,14 +800,19 @@ func mergeThumbnailEntries(groups ...[]thumbnailEntry) []thumbnailEntry {
 
 func makeThumbnailEntry(path string, parts ...string) thumbnailEntry {
 	mmh3 := ""
+	phash := ""
 	metadataJSON := ""
 	switch len(parts) {
 	case 0:
 	case 1:
 		metadataJSON = parts[0]
-	default:
+	case 2:
 		mmh3 = parts[0]
 		metadataJSON = parts[1]
+	default:
+		mmh3 = parts[0]
+		phash = parts[1]
+		metadataJSON = parts[2]
 	}
 	if metadataJSON == "" {
 		metadataJSON = "{}"
@@ -758,6 +820,7 @@ func makeThumbnailEntry(path string, parts ...string) thumbnailEntry {
 	return thumbnailEntry{
 		Path:     path,
 		MMH3:     mmh3,
+		PHash:    phash,
 		Metadata: json.RawMessage(metadataJSON),
 	}
 }
@@ -821,6 +884,12 @@ func rebuildThumbnailLinks(ctx context.Context, thumbnailPaths []string, rows ma
 		return nil
 	}
 
+	featureResolver, err := precompute.NewResolver(ctx, cm.db)
+	if err != nil {
+		return err
+	}
+	defer featureResolver.Close()
+
 	aggregated := make(map[string][]thumbnailEntry)
 	for masterPath, row := range rows {
 		if err := stopInitCacheAtSafePoint(ctx, "while gathering existing thumbnail links"); err != nil {
@@ -841,7 +910,7 @@ func rebuildThumbnailLinks(ctx context.Context, thumbnailPaths []string, rows ma
 		}
 
 		file := entry.File
-		match, err := findConfirmedDuplicateMatch(ctx, file, rows, cm)
+		match, err := findConfirmedDuplicateMatch(ctx, file, rows, cm, featureResolver)
 		if err != nil {
 			return err
 		}
@@ -852,7 +921,7 @@ func rebuildThumbnailLinks(ctx context.Context, thumbnailPaths []string, rows ma
 		thumbMeta := metadata.ExtractImageMetaJson(entry.Path)
 		aggregated[match.Match.Path] = mergeThumbnailEntries(
 			aggregated[match.Match.Path],
-			[]thumbnailEntry{makeThumbnailEntry(entry.Path, entry.File.MMH3, thumbMeta)},
+			[]thumbnailEntry{makeThumbnailEntry(entry.Path, entry.File.MMH3, entry.File.PHashStr, thumbMeta)},
 		)
 	}
 
@@ -896,7 +965,7 @@ func demoteCurrentFile(targetDir string, file targetFile, match hasher.MatchResu
 	mergedThumbs := mergeThumbnailEntries(
 		parseThumbnailEntries(rows[match.Path].Thumbnails),
 		parseThumbnailEntries(rows[file.Path].Thumbnails),
-		[]thumbnailEntry{makeThumbnailEntry(thumbPath, file.MMH3, thumbMeta)},
+		[]thumbnailEntry{makeThumbnailEntry(thumbPath, file.MMH3, file.PHashStr, thumbMeta)},
 	)
 	thumbJSON := marshalThumbnailEntries(mergedThumbs)
 

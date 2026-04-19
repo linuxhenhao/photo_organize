@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/linuxhenhao/photo_organize/internal/dedupe"
+	"github.com/linuxhenhao/photo_organize/internal/hasher"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
+	"github.com/linuxhenhao/photo_organize/internal/precompute"
 )
 
 // CleanGroupsOptions controls how thumbnail-group cleanup is executed.
@@ -46,6 +48,12 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 	if err != nil {
 		return CleanGroupsReport{}, err
 	}
+
+	featureResolver, err := precompute.NewResolver(ctx, cm.db)
+	if err != nil {
+		return CleanGroupsReport{}, err
+	}
+	defer featureResolver.Close()
 
 	masters := make([]string, 0)
 	for path, row := range rows {
@@ -83,6 +91,8 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 			continue
 		}
 
+		masterResolved := resolveDedupeFeatures(ctx, featureResolver, masterFile.MMH3, masterFile.PHash, masterFile.HasPHash, masterFile.Path)
+
 		originalEntries := parseThumbnailEntries(row.Thumbnails)
 		keptEntries := make([]thumbnailEntry, 0, len(originalEntries))
 		groupChanged := false
@@ -109,13 +119,31 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 				continue
 			}
 
-			decision, err := dedupe.RevalidateDerivative(
+			entryMMH3 := entry.MMH3
+			if entryMMH3 == "" {
+				if computed, hashErr := hasher.CalculateHash(entryAbsPath); hashErr == nil {
+					entryMMH3 = computed
+				}
+			}
+			entryDHash := uint64(0)
+			entryHasDHash := false
+			if entry.PHash != "" {
+				if parsed, parseErr := hasher.StringToPHash(entry.PHash); parseErr == nil {
+					entryDHash = parsed
+					entryHasDHash = true
+				}
+			}
+			entryResolved := resolveDedupeFeatures(ctx, featureResolver, entryMMH3, entryDHash, entryHasDHash, entryAbsPath)
+
+			decision, err := dedupe.RevalidateDerivativeWithResolvedFeatures(
 				entryAbsPath,
 				string(entry.Metadata),
 				entryStat.Size(),
+				entryResolved,
 				masterFile.Path,
 				masterFile.Metadata,
 				masterFile.Size,
+				masterResolved,
 			)
 			if err != nil {
 				report.ValidationFailures++
@@ -150,7 +178,7 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 				continue
 			}
 
-			rehomeResult, err := findCleanupRehomeTarget(ctx, targetDir, cm, rows, prepared, entryFile, masterPath)
+			rehomeResult, err := findCleanupRehomeTarget(ctx, targetDir, cm, rows, prepared, featureResolver, entryFile, masterPath)
 			if err != nil {
 				return report, err
 			}
@@ -159,7 +187,7 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 				targetRow := rows[targetMasterPath]
 				targetRow.Thumbnails = marshalThumbnailEntries(mergeThumbnailEntries(
 					parseThumbnailEntries(targetRow.Thumbnails),
-					[]thumbnailEntry{makeThumbnailEntry(entry.Path, entryFile.MMH3, entryFile.Metadata)},
+					[]thumbnailEntry{makeThumbnailEntry(entry.Path, entryFile.MMH3, entryFile.PHashStr, entryFile.Metadata)},
 				))
 				rows[targetMasterPath] = targetRow
 				changedMasters[targetMasterPath] = true
@@ -209,6 +237,14 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 			report.GroupsChanged++
 		}
 	}
+
+	hits, misses, invalid := featureResolver.Snapshot()
+	logCleanGroups("feature_cache",
+		"mode", cleanGroupsMode(options.Apply),
+		"hits", hits,
+		"misses", misses,
+		"invalid", invalid,
+	)
 
 	if !options.Apply {
 		logCleanGroupsSummary(report, options.Apply)
@@ -272,7 +308,7 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 	return report, nil
 }
 
-func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheManager, rows map[string]fileCacheRow, prepared map[string]targetFile, candidate targetFile, excludedMaster string) (cleanupRehomeResult, error) {
+func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheManager, rows map[string]fileCacheRow, prepared map[string]targetFile, featureResolver *precompute.Resolver, candidate targetFile, excludedMaster string) (cleanupRehomeResult, error) {
 	if err := ctx.Err(); err != nil {
 		return cleanupRehomeResult{}, err
 	}
@@ -292,6 +328,7 @@ func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheMan
 	bestDistance := 0
 	ambiguous := false
 	validatedCandidate := false
+	candidateResolved := resolveDedupeFeatures(ctx, featureResolver, candidate.MMH3, candidate.PHash, candidate.HasPHash, candidate.Path)
 	for _, match := range cm.SearchPHash(candidate.PHash, dedupe.CandidateSearchDistance) {
 		if match.Path == excludedMaster || match.Path == candidate.Path {
 			continue
@@ -312,13 +349,16 @@ func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheMan
 			continue
 		}
 
-		decision, err := dedupe.RevalidateDerivative(
+		existingResolved := resolveDedupeFeatures(ctx, featureResolver, existingFile.MMH3, existingFile.PHash, existingFile.HasPHash, existingFile.Path)
+		decision, err := dedupe.RevalidateDerivativeWithResolvedFeatures(
 			candidate.Path,
 			candidate.Metadata,
 			candidate.Size,
+			candidateResolved,
 			existingFile.Path,
 			existingFile.Metadata,
 			existingFile.Size,
+			existingResolved,
 		)
 		if err != nil {
 			logCleanGroups("rehome_validation_failed",
