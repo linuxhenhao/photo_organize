@@ -1,13 +1,16 @@
 package target
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"image"
 	"image/color"
 	"image/jpeg"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/linuxhenhao/photo_organize/internal/hasher"
@@ -85,6 +88,22 @@ func insertCachedMaster(t *testing.T, cm *CacheManager, path string, thumbnails 
 	require.NoError(t, err)
 
 	cm.SetEntryMemoryWithPresence(path, file.MMH3, file.PHash, file.HasPHash, file.Size, file.Metadata)
+}
+
+func captureLogs(t *testing.T, fn func()) string {
+	t.Helper()
+
+	var buf bytes.Buffer
+	originalWriter := log.Writer()
+	originalFlags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer log.SetOutput(originalWriter)
+	defer log.SetFlags(originalFlags)
+
+	fn()
+
+	return buf.String()
 }
 
 func TestCleanThumbnailGroupsRehomesInvalidThumbnailToExistingMaster(t *testing.T) {
@@ -210,4 +229,38 @@ func TestCleanThumbnailGroupsRestoresStandaloneWhenNoExistingMasterMatches(t *te
 	foundPath, found := cm.FindExactMatch(thumbHash)
 	require.True(t, found)
 	require.Equal(t, thumbPath, foundPath)
+}
+
+func TestCleanThumbnailGroupsStandaloneLogIncludesCaseDetails(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "clean_groups_standalone_log")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	masterPath := filepath.Join(tempDir, "album-a", "master.jpg")
+	thumbPath := filepath.Join(tempDir, "thumbnails", "orphan", "thumb.jpg")
+
+	writePatternJPEG(t, masterPath, 96, 72, 0)
+	writePatternJPEG(t, thumbPath, 120, 90, 1)
+
+	thumbMeta := metadata.ExtractImageMetaJson(thumbPath)
+	thumbsJSON := marshalThumbnailEntries([]thumbnailEntry{makeThumbnailEntry(thumbPath, thumbMeta)})
+
+	cm, err := NewCacheManager(tempDir, 1)
+	require.NoError(t, err)
+	defer cm.Close()
+
+	insertCachedMaster(t, cm, masterPath, thumbsJSON)
+
+	logs := captureLogs(t, func() {
+		_, err = CleanThumbnailGroupsWithContext(context.Background(), tempDir, cm, CleanGroupsOptions{})
+	})
+	require.NoError(t, err)
+
+	require.Contains(t, logs, `cleangroups: event="standalone"`)
+	require.Contains(t, logs, `action="restore_standalone"`)
+	require.Contains(t, logs, `mode="dry-run"`)
+	require.Contains(t, logs, `source_master="`+masterPath+`"`)
+	require.Contains(t, logs, `path="`+thumbPath+`"`)
+	require.Contains(t, logs, `rehome_reason="no_match_found"`)
+	require.True(t, strings.Contains(logs, `dimensions="120x90"`) || strings.Contains(logs, `dimensions="90x120"`))
 }

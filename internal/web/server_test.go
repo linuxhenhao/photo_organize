@@ -53,20 +53,6 @@ func TestListenAddrUsesConfiguredHost(t *testing.T) {
 	require.Equal(t, "0.0.0.0:9090", listenAddr("0.0.0.0", 9090))
 }
 
-func TestValidateListenHostRejectsUnspecifiedAddresses(t *testing.T) {
-	for _, host := range []string{"0.0.0.0", "::", "[::]"} {
-		err := validateListenHost(host)
-		require.Error(t, err, host)
-	}
-}
-
-func TestValidateListenHostAllowsScopedAddresses(t *testing.T) {
-	for _, host := range []string{"127.0.0.1", "192.168.1.10", "localhost"} {
-		err := validateListenHost(host)
-		require.NoError(t, err, host)
-	}
-}
-
 func TestHandleImageServeRejectsPathEscape(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "web_image_escape_test")
 	require.NoError(t, err)

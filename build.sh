@@ -9,6 +9,6 @@ OUTPUT_BIN="$OUTPUT_DIR/photo_organize"
 mkdir -p "$OUTPUT_DIR"
 
 cd "$ROOT_DIR"
-go build -o "$OUTPUT_BIN" ./cmd/photo-organizer
+go build -buildvcs=false -o "$OUTPUT_BIN" ./cmd/photo-organizer
 
 echo "Built $OUTPUT_BIN"

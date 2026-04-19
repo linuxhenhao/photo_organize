@@ -60,7 +60,7 @@ Launch the interactive web interface to resolve visual duplicates.
 ```bash
 ./photo-organizer serve -dest /path/to/organized_photos -host 0.0.0.0 -port 8080
 ```
-The server binds to `127.0.0.1` by default. Set `-host` to a specific IP such as `0.0.0.0` to listen on another interface.
+The server binds to `127.0.0.1` by default. Set `-host 0.0.0.0` or another address to listen on other interfaces.
 
 ## Development
 - **Test Data**: Use `test_data/` for local experimentation.

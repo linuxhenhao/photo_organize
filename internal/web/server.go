@@ -39,6 +39,7 @@ type WebServer struct {
 	cm                  *target.CacheManager
 	db                  *sql.DB
 	destDir             string
+	cleanGroupsLogPath  string
 	previewForPath      func(string) ([]byte, string, error)
 	thumbnailPathFor    func(string) string
 	thumbnailForPath    func(string) string
@@ -94,22 +95,12 @@ func NewWebServer(cm *target.CacheManager, destDir string) *WebServer {
 	return ws
 }
 
-func listenAddr(host string, port int) string {
-	return net.JoinHostPort(host, strconv.Itoa(port))
+func (ws *WebServer) SetCleanGroupsLogPath(path string) {
+	ws.cleanGroupsLogPath = strings.TrimSpace(path)
 }
 
-func validateListenHost(host string) error {
-	trimmed := strings.TrimSpace(host)
-	if trimmed == "" {
-		return fmt.Errorf("listen host is required")
-	}
-
-	unwrapped := strings.TrimPrefix(strings.TrimSuffix(trimmed, "]"), "[")
-	if ip := net.ParseIP(unwrapped); ip != nil && ip.IsUnspecified() {
-		return fmt.Errorf("refusing to listen on unrestricted host %q; bind to a specific LAN address instead", host)
-	}
-
-	return nil
+func listenAddr(host string, port int) string {
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 func pathWithinRoot(root string, candidate string) bool {
@@ -816,10 +807,6 @@ func synologyThumbnailBasePathFor(path string) string {
 
 // Start API server on the given host and port.
 func (ws *WebServer) Start(host string, port int, db *sql.DB) error {
-	if err := validateListenHost(host); err != nil {
-		return err
-	}
-
 	ws.db = db
 	mux := http.NewServeMux()
 
@@ -829,6 +816,7 @@ func (ws *WebServer) Start(host string, port int, db *sql.DB) error {
 	// API Endpoints
 	mux.HandleFunc("/api/duplicates", ws.handleGetDuplicates)
 	mux.HandleFunc("/api/group-archive", ws.handleGroupArchiveDownload)
+	mux.HandleFunc("/api/cleangroups-log", ws.handleGetCleanGroupsLog)
 	mux.HandleFunc("/api/resolve", ws.handleResolveGroup)
 	mux.HandleFunc("/image", ws.handleImageServe)
 

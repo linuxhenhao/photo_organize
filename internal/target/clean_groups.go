@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/linuxhenhao/photo_organize/internal/dedupe"
 	"github.com/linuxhenhao/photo_organize/internal/metadata"
@@ -30,6 +32,11 @@ type CleanGroupsReport struct {
 	StandaloneDeleted  int
 	SkippedGroups      int
 	ValidationFailures int
+}
+
+type cleanupRehomeResult struct {
+	TargetPath string
+	Reason     string
 }
 
 // CleanThumbnailGroupsWithContext revalidates thumbnail links in cache.db and
@@ -68,7 +75,11 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 		masterFile, err := loadStoredTargetFile(targetDir, masterPath, row, prepared)
 		if err != nil {
 			report.SkippedGroups++
-			log.Printf("cleangroups: skipping master %s: %v", masterPath, err)
+			logCleanGroups("skip_master",
+				"mode", cleanGroupsMode(options.Apply),
+				"master_path", masterPath,
+				"error", err,
+			)
 			continue
 		}
 
@@ -88,7 +99,13 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 				groupChanged = true
 				report.ThumbnailsRemoved++
 				report.MissingRemoved++
-				log.Printf("cleangroups: removing missing thumbnail %s from %s", entry.Path, masterPath)
+				logCleanGroups("missing_thumbnail",
+					"mode", cleanGroupsMode(options.Apply),
+					"action", "remove_missing_thumbnail",
+					"master_path", masterPath,
+					"thumbnail_path", entry.Path,
+					"error", statErr,
+				)
 				continue
 			}
 
@@ -103,7 +120,13 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 			if err != nil {
 				report.ValidationFailures++
 				keptEntries = append(keptEntries, entry)
-				log.Printf("cleangroups: keeping %s under %s because validation failed: %v", entry.Path, masterPath, err)
+				logCleanGroups("validation_failed",
+					"mode", cleanGroupsMode(options.Apply),
+					"action", "keep_thumbnail",
+					"master_path", masterPath,
+					"thumbnail_path", entry.Path,
+					"error", err,
+				)
 				continue
 			}
 			if decision.Confirmed {
@@ -117,14 +140,21 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 			entryFile, err := loadStoredTargetFile(targetDir, entry.Path, fileCacheRow{}, prepared)
 			if err != nil {
 				report.ValidationFailures++
-				log.Printf("cleangroups: dropping %s from %s but failed to prepare rehome target: %v", entry.Path, masterPath, err)
+				logCleanGroups("prepare_rehome_failed",
+					"mode", cleanGroupsMode(options.Apply),
+					"action", "drop_thumbnail",
+					"master_path", masterPath,
+					"thumbnail_path", entry.Path,
+					"error", err,
+				)
 				continue
 			}
 
-			targetMasterPath, err := findCleanupRehomeTarget(ctx, targetDir, cm, rows, prepared, entryFile, masterPath)
+			rehomeResult, err := findCleanupRehomeTarget(ctx, targetDir, cm, rows, prepared, entryFile, masterPath)
 			if err != nil {
 				return report, err
 			}
+			targetMasterPath := rehomeResult.TargetPath
 			if targetMasterPath != "" {
 				targetRow := rows[targetMasterPath]
 				targetRow.Thumbnails = marshalThumbnailEntries(mergeThumbnailEntries(
@@ -143,10 +173,18 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 					report.StandaloneDeleted++
 				}
 
-				log.Printf("cleangroups: rehomed %s from %s to %s", entry.Path, masterPath, targetMasterPath)
+				logCleanGroups("rehome",
+					"mode", cleanGroupsMode(options.Apply),
+					"thumbnail_path", entry.Path,
+					"source_master", masterPath,
+					"target_master", targetMasterPath,
+					"rehome_reason", rehomeResult.Reason,
+					"standalone_deleted", deletedStandalone[entry.Path],
+				)
 				continue
 			}
 
+			standaloneAction := "would_keep_existing_standalone"
 			if _, exists := rows[entry.Path]; !exists {
 				rows[entry.Path] = fileCacheRow{
 					MMH3:       entryFile.MMH3,
@@ -159,8 +197,9 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 				createdStandalone[entry.Path] = true
 				cm.SetEntryMemoryWithPresence(entry.Path, entryFile.MMH3, entryFile.PHash, entryFile.HasPHash, entryFile.Size, entryFile.Metadata)
 				report.StandaloneCreated++
-				log.Printf("cleangroups: restored %s as standalone master", entry.Path)
+				standaloneAction = "restore_standalone"
 			}
+			logStandaloneDecision(entry.Path, masterPath, standaloneAction, rehomeResult.Reason, entryFile, options.Apply)
 		}
 
 		if groupChanged {
@@ -172,19 +211,7 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 	}
 
 	if !options.Apply {
-		log.Printf(
-			"cleangroups dry-run: groups_scanned=%d groups_changed=%d thumbnails_scanned=%d removed=%d rehomed=%d standalone_created=%d missing_removed=%d standalone_deleted=%d validation_failures=%d skipped_groups=%d",
-			report.GroupsScanned,
-			report.GroupsChanged,
-			report.ThumbnailsScanned,
-			report.ThumbnailsRemoved,
-			report.ThumbnailsRehomed,
-			report.StandaloneCreated,
-			report.MissingRemoved,
-			report.StandaloneDeleted,
-			report.ValidationFailures,
-			report.SkippedGroups,
-		)
+		logCleanGroupsSummary(report, options.Apply)
 		return report, nil
 	}
 
@@ -240,42 +267,31 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 		return report, err
 	}
 
-	log.Printf(
-		"cleangroups apply: groups_scanned=%d groups_changed=%d thumbnails_scanned=%d removed=%d rehomed=%d standalone_created=%d missing_removed=%d standalone_deleted=%d validation_failures=%d skipped_groups=%d",
-		report.GroupsScanned,
-		report.GroupsChanged,
-		report.ThumbnailsScanned,
-		report.ThumbnailsRemoved,
-		report.ThumbnailsRehomed,
-		report.StandaloneCreated,
-		report.MissingRemoved,
-		report.StandaloneDeleted,
-		report.ValidationFailures,
-		report.SkippedGroups,
-	)
+	logCleanGroupsSummary(report, options.Apply)
 
 	return report, nil
 }
 
-func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheManager, rows map[string]fileCacheRow, prepared map[string]targetFile, candidate targetFile, excludedMaster string) (string, error) {
+func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheManager, rows map[string]fileCacheRow, prepared map[string]targetFile, candidate targetFile, excludedMaster string) (cleanupRehomeResult, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return cleanupRehomeResult{}, err
 	}
 
 	if exactPath, ok := cm.FindExactMatch(candidate.MMH3); ok && exactPath != "" && exactPath != excludedMaster && exactPath != candidate.Path {
 		if _, exists := rows[exactPath]; exists {
-			return exactPath, nil
+			return cleanupRehomeResult{TargetPath: exactPath, Reason: "exact_hash_match"}, nil
 		}
 	}
 
 	if !candidate.HasPHash {
-		return "", nil
+		return cleanupRehomeResult{Reason: "no_phash"}, nil
 	}
 
 	bestPath := ""
 	bestMeta := metadata.MediaMeta{}
 	bestDistance := 0
 	ambiguous := false
+	validatedCandidate := false
 	for _, match := range cm.SearchPHash(candidate.PHash, dedupe.CandidateSearchDistance) {
 		if match.Path == excludedMaster || match.Path == candidate.Path {
 			continue
@@ -288,7 +304,11 @@ func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheMan
 
 		existingFile, err := loadStoredTargetFile(targetDir, match.Path, row, prepared)
 		if err != nil {
-			log.Printf("cleangroups: skipping candidate master %s during rehome: %v", match.Path, err)
+			logCleanGroups("skip_rehome_candidate",
+				"candidate_path", candidate.Path,
+				"match_path", match.Path,
+				"error", err,
+			)
 			continue
 		}
 
@@ -301,9 +321,14 @@ func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheMan
 			existingFile.Size,
 		)
 		if err != nil {
-			log.Printf("cleangroups: rehome validation failed for %s -> %s: %v", candidate.Path, match.Path, err)
+			logCleanGroups("rehome_validation_failed",
+				"candidate_path", candidate.Path,
+				"match_path", match.Path,
+				"error", err,
+			)
 			continue
 		}
+		validatedCandidate = true
 		if decision.Confirmed {
 			matchMeta := metadata.ParseMediaMetaJSON(existingFile.Metadata)
 			if bestPath == "" {
@@ -329,9 +354,114 @@ func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheMan
 	}
 
 	if ambiguous {
-		return "", nil
+		return cleanupRehomeResult{Reason: "ambiguous_phash_match"}, nil
 	}
-	return bestPath, nil
+	if bestPath != "" {
+		return cleanupRehomeResult{TargetPath: bestPath, Reason: "validated_phash_match"}, nil
+	}
+	if validatedCandidate {
+		return cleanupRehomeResult{Reason: "validated_candidates_rejected"}, nil
+	}
+	return cleanupRehomeResult{Reason: "no_match_found"}, nil
+}
+
+func logStandaloneDecision(path, sourceMaster, action, rehomeReason string, file targetFile, apply bool) {
+	meta := metadata.ParseMediaMetaJSON(file.Metadata)
+	logCleanGroups("standalone",
+		"mode", cleanGroupsMode(apply),
+		"action", action,
+		"path", path,
+		"source_master", sourceMaster,
+		"rehome_reason", rehomeReason,
+		"size", file.Size,
+		"dimensions", formatStandaloneDimensions(meta),
+		"create_time", standaloneLogValue(meta.CreateTime),
+		"has_phash", file.HasPHash,
+	)
+}
+
+func logCleanGroupsSummary(report CleanGroupsReport, apply bool) {
+	logCleanGroups("summary",
+		"mode", cleanGroupsMode(apply),
+		"groups_scanned", report.GroupsScanned,
+		"groups_changed", report.GroupsChanged,
+		"thumbnails_scanned", report.ThumbnailsScanned,
+		"removed", report.ThumbnailsRemoved,
+		"rehomed", report.ThumbnailsRehomed,
+		"standalone_created", report.StandaloneCreated,
+		"missing_removed", report.MissingRemoved,
+		"standalone_deleted", report.StandaloneDeleted,
+		"validation_failures", report.ValidationFailures,
+		"skipped_groups", report.SkippedGroups,
+	)
+}
+
+func cleanGroupsMode(apply bool) string {
+	if apply {
+		return "apply"
+	}
+	return "dry-run"
+}
+
+func logCleanGroups(event string, fields ...any) {
+	var b strings.Builder
+	b.WriteString("cleangroups:")
+	b.WriteString(" event=")
+	b.WriteString(strconv.Quote(event))
+	for i := 0; i+1 < len(fields); i += 2 {
+		key, ok := fields[i].(string)
+		if !ok || key == "" {
+			continue
+		}
+		b.WriteByte(' ')
+		b.WriteString(key)
+		b.WriteByte('=')
+		b.WriteString(formatCleanGroupsLogValue(fields[i+1]))
+	}
+	_ = log.Output(2, b.String())
+}
+
+func formatCleanGroupsLogValue(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return strconv.Quote("unknown")
+	case string:
+		return strconv.Quote(standaloneLogValue(v))
+	case error:
+		if v == nil {
+			return strconv.Quote("unknown")
+		}
+		return strconv.Quote(v.Error())
+	case bool:
+		return strconv.FormatBool(v)
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case uint64:
+		return strconv.FormatUint(v, 10)
+	case time.Time:
+		if v.IsZero() {
+			return strconv.Quote("unknown")
+		}
+		return strconv.Quote(v.Format(time.RFC3339))
+	default:
+		return strconv.Quote(fmt.Sprint(v))
+	}
+}
+
+func formatStandaloneDimensions(meta metadata.MediaMeta) string {
+	if meta.Width <= 0 && meta.Height <= 0 {
+		return "unknown"
+	}
+	return strconv.Itoa(meta.Width) + "x" + strconv.Itoa(meta.Height)
+}
+
+func standaloneLogValue(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "unknown"
+	}
+	return value
 }
 
 func loadStoredTargetFile(targetDir, storedPath string, row fileCacheRow, prepared map[string]targetFile) (targetFile, error) {

@@ -37,6 +37,8 @@ func (s *stringArrayFlag) Set(value string) error {
 }
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
 	var dbPath string  // SQLite database path
 	var destDir string // Target directory for import
 
@@ -65,6 +67,8 @@ func main() {
 	var servePort int
 	serveCmd.StringVar(&serveHost, "host", "127.0.0.1", "IP address to bind the web server to")
 	serveCmd.IntVar(&servePort, "port", 8080, "Port for the web server")
+	var cleanGroupsLogPath string
+	serveCmd.StringVar(&cleanGroupsLogPath, "cleangroups-log", "", "Optional cleangroups log file for review UI; absolute paths must be provided here")
 
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: photo-organizer <command> [options]")
@@ -154,6 +158,7 @@ func main() {
 		defer cm.Close()
 
 		server := web.NewWebServer(cm, destDir)
+		server.SetCleanGroupsLogPath(cleanGroupsLogPath)
 		if err := server.Start(serveHost, servePort, sqliteDB); err != nil {
 			log.Fatalf("Web Server failed: %v", err)
 		}
