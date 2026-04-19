@@ -80,11 +80,11 @@ func UpdateHashes(db *sql.DB) error {
 				}
 				if job.calcPhash && res.err == nil {
 					if CanVisualHash(job.path, job.mimeType) {
-						p, err := CalculatePHash(job.path)
+						p, err := CalculateDHash(job.path)
 						if err != nil {
 							res.phash = "UNSUPPORTED"
 						} else {
-							res.phash = PHashToString(p)
+							res.phash = DHashToString(p)
 						}
 					} else {
 						res.phash = "NOT_IMAGE"

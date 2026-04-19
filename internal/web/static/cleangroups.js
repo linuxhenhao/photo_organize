@@ -167,6 +167,11 @@ const describeEvent = (event) => {
 };
 
 const buildFieldEntries = (event) => {
+    const fields = { ...event.fields };
+    if (fields.has_dhash !== undefined) {
+        delete fields.has_phash;
+    }
+
     const preferredOrder = [
         'action',
         'mode',
@@ -179,6 +184,7 @@ const buildFieldEntries = (event) => {
         'dimensions',
         'size',
         'create_time',
+        'has_dhash',
         'has_phash',
         'standalone_deleted',
         'error',
@@ -186,16 +192,16 @@ const buildFieldEntries = (event) => {
 
     const entries = [];
     preferredOrder.forEach((key) => {
-        if (event.fields[key] !== undefined) {
-            entries.push([key, event.fields[key]]);
+        if (fields[key] !== undefined) {
+            entries.push([key, fields[key]]);
         }
     });
 
-    Object.keys(event.fields)
+    Object.keys(fields)
         .sort()
         .forEach((key) => {
             if (preferredOrder.includes(key) || key === 'event') return;
-            entries.push([key, event.fields[key]]);
+            entries.push([key, fields[key]]);
         });
 
     return entries;

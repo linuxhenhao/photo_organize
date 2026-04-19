@@ -135,8 +135,8 @@ func TestInitTargetDirCacheReadOnlyRebuildsExistingThumbnailLinks(t *testing.T) 
 	require.NoError(t, err)
 	masterFile, err := buildTargetFile(masterPath, masterStat, fileCacheRow{}, false)
 	require.NoError(t, err)
-	require.True(t, masterFile.HasPHash)
-	require.NotEmpty(t, masterFile.PHashStr)
+	require.True(t, masterFile.HasDHash)
+	require.NotEmpty(t, masterFile.DHashStr)
 
 	InitTargetDirCache(tempDir, cm)
 
@@ -150,13 +150,13 @@ func TestInitTargetDirCacheReadOnlyRebuildsExistingThumbnailLinks(t *testing.T) 
 	require.NoError(t, err)
 	require.NotEmpty(t, masterPHash)
 
-	thumbPHash, err := hasher.CalculatePHash(thumbPath)
+	thumbPHash, err := hasher.CalculateDHash(thumbPath)
 	require.NoError(t, err)
-	masterPHashVal, err := hasher.StringToPHash(masterPHash)
+	masterPHashVal, err := hasher.StringToDHash(masterPHash)
 	require.NoError(t, err)
 	distance := hasher.HammingDistance(masterPHashVal, thumbPHash)
 	require.LessOrEqual(t, distance, dedupe.CandidateSearchDistance)
-	matches := cm.SearchPHash(thumbPHash, dedupe.CandidateSearchDistance)
+	matches := cm.SearchDHash(thumbPHash, dedupe.CandidateSearchDistance)
 	require.NotEmpty(t, matches)
 	require.Equal(t, masterPath, matches[0].Path)
 
@@ -200,7 +200,7 @@ func TestInitTargetDirCacheReadOnlyBackfillsThumbnailMMH3(t *testing.T) {
 		`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
 		masterPath,
 		masterFile.MMH3,
-		masterFile.PHashStr,
+		masterFile.DHashStr,
 		masterFile.Size,
 		masterFile.Metadata,
 		thumbsJSON,
@@ -266,13 +266,13 @@ func TestInitTargetDirCacheMoveDuplicatesUsesExistingCache(t *testing.T) {
 
 	bigHash, err := hasher.CalculateHash(bigPath)
 	require.NoError(t, err)
-	bigPHash, err := hasher.CalculatePHash(bigPath)
+	bigPHash, err := hasher.CalculateDHash(bigPath)
 	require.NoError(t, err)
 	bigMeta := metadata.ExtractImageMetaJson(bigPath)
 
 	smallHash, err := hasher.CalculateHash(smallPath)
 	require.NoError(t, err)
-	smallPHash, err := hasher.CalculatePHash(smallPath)
+	smallPHash, err := hasher.CalculateDHash(smallPath)
 	require.NoError(t, err)
 	smallMeta := metadata.ExtractImageMetaJson(smallPath)
 
@@ -285,8 +285,8 @@ func TestInitTargetDirCacheMoveDuplicatesUsesExistingCache(t *testing.T) {
 		VALUES (?, ?, ?, ?, ?, '[]'),
 		       (?, ?, ?, ?, ?, '[]')
 	`,
-		bigPath, bigHash, hasher.PHashToString(bigPHash), bigStat.Size(), bigMeta,
-		smallPath, smallHash, hasher.PHashToString(smallPHash), smallStat.Size(), smallMeta,
+		bigPath, bigHash, hasher.DHashToString(bigPHash), bigStat.Size(), bigMeta,
+		smallPath, smallHash, hasher.DHashToString(smallPHash), smallStat.Size(), smallMeta,
 	)
 	require.NoError(t, err)
 	cm.SetEntryMemoryWithPresence(bigPath, bigHash, bigPHash, true, bigStat.Size(), bigMeta)
@@ -327,7 +327,7 @@ func TestInitTargetDirCacheMoveDuplicatesUsesExistingCache(t *testing.T) {
 	err = cm.db.QueryRow(`SELECT mmh3_hash, phash, metadata FROM file_cache WHERE target_path = ?`, bigPath).Scan(&dbHash, &dbPHash, &dbMeta)
 	require.NoError(t, err)
 	require.Equal(t, bigHash, dbHash)
-	require.Equal(t, hasher.PHashToString(bigPHash), dbPHash)
+	require.Equal(t, hasher.DHashToString(bigPHash), dbPHash)
 	require.Equal(t, bigMeta, dbMeta.String)
 }
 
@@ -375,13 +375,13 @@ func TestInitTargetDirCacheWithContextStopsBeforeMoveOnCancellation(t *testing.T
 
 	bigHash, err := hasher.CalculateHash(bigPath)
 	require.NoError(t, err)
-	bigPHash, err := hasher.CalculatePHash(bigPath)
+	bigPHash, err := hasher.CalculateDHash(bigPath)
 	require.NoError(t, err)
 	bigMeta := metadata.ExtractImageMetaJson(bigPath)
 
 	smallHash, err := hasher.CalculateHash(smallPath)
 	require.NoError(t, err)
-	smallPHash, err := hasher.CalculatePHash(smallPath)
+	smallPHash, err := hasher.CalculateDHash(smallPath)
 	require.NoError(t, err)
 	smallMeta := metadata.ExtractImageMetaJson(smallPath)
 
@@ -394,8 +394,8 @@ func TestInitTargetDirCacheWithContextStopsBeforeMoveOnCancellation(t *testing.T
 		VALUES (?, ?, ?, ?, ?, '[]'),
 		       (?, ?, ?, ?, ?, '[]')
 	`,
-		bigPath, bigHash, hasher.PHashToString(bigPHash), bigStat.Size(), bigMeta,
-		smallPath, smallHash, hasher.PHashToString(smallPHash), smallStat.Size(), smallMeta,
+		bigPath, bigHash, hasher.DHashToString(bigPHash), bigStat.Size(), bigMeta,
+		smallPath, smallHash, hasher.DHashToString(smallPHash), smallStat.Size(), smallMeta,
 	)
 	require.NoError(t, err)
 	cm.SetEntryMemoryWithPresence(bigPath, bigHash, bigPHash, true, bigStat.Size(), bigMeta)

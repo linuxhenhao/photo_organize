@@ -160,12 +160,12 @@ func hashFileForCache(path string) (string, uint64, bool, error) {
 		return "", 0, false, err
 	}
 
-	phash, err := hasher.CalculatePHash(path)
+	dhash, err := hasher.CalculateDHash(path)
 	if err != nil {
 		return mmh3, 0, false, nil
 	}
 
-	return mmh3, phash, true, nil
+	return mmh3, dhash, true, nil
 }
 
 type groupMember struct {
@@ -195,8 +195,8 @@ type renameRecord struct {
 type resolvedStandaloneEntry struct {
 	storedPath string
 	hash       string
-	phash      uint64
-	hasPHash   bool
+	dhash      uint64
+	hasDHash   bool
 	size       int64
 	metadata   string
 }
@@ -1159,7 +1159,7 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 		}
 
 		meta := metadata.ExtractImageMetaJson(finalAbs)
-		hash, phash, hasPHash, err := hashFileForCache(finalAbs)
+		hash, dhash, hasDHash, err := hashFileForCache(finalAbs)
 		if err != nil {
 			rollbackRenames(renames)
 			failResolve(http.StatusInternalServerError, "Failed to hash kept file", "hash kept file", fmt.Sprintf("path=%q", finalAbs), err)
@@ -1169,8 +1169,8 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 		entry := resolvedStandaloneEntry{
 			storedPath: storedPath,
 			hash:       hash,
-			phash:      phash,
-			hasPHash:   hasPHash,
+			dhash:      dhash,
+			hasDHash:   hasDHash,
 			size:       stat.Size(),
 			metadata:   meta,
 		}
@@ -1221,8 +1221,8 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 
 	for _, entry := range standaloneEntries {
 		phashStr := ""
-		if entry.hasPHash {
-			phashStr = hasher.PHashToString(entry.phash)
+		if entry.hasDHash {
+			phashStr = hasher.DHashToString(entry.dhash)
 		}
 		_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, '[]')`,
 			entry.storedPath, entry.hash, phashStr, entry.size, entry.metadata)
@@ -1236,8 +1236,8 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 
 	if promoteSingle && promotedEntry != nil {
 		phashStr := ""
-		if promotedEntry.hasPHash {
-			phashStr = hasher.PHashToString(promotedEntry.phash)
+		if promotedEntry.hasDHash {
+			phashStr = hasher.DHashToString(promotedEntry.dhash)
 		}
 		_, err = tx.Exec(`INSERT OR REPLACE INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, '[]')`,
 			promotedEntry.storedPath, promotedEntry.hash, phashStr, promotedEntry.size, promotedEntry.metadata)
@@ -1259,14 +1259,14 @@ func (ws *WebServer) handleResolveGroup(w http.ResponseWriter, r *http.Request) 
 		if promoteSingle {
 			ws.cm.DeleteEntryMemory(req.MasterPath)
 			if promotedEntry != nil {
-				ws.cm.SetEntryMemoryWithPresence(promotedEntry.storedPath, promotedEntry.hash, promotedEntry.phash, promotedEntry.hasPHash, promotedEntry.size, promotedEntry.metadata)
+				ws.cm.SetEntryMemoryWithPresence(promotedEntry.storedPath, promotedEntry.hash, promotedEntry.dhash, promotedEntry.hasDHash, promotedEntry.size, promotedEntry.metadata)
 			}
 		} else {
 			if !keepMaster {
 				ws.cm.DeleteEntryMemory(req.MasterPath)
 			}
 			for _, entry := range standaloneEntries {
-				ws.cm.SetEntryMemoryWithPresence(entry.storedPath, entry.hash, entry.phash, entry.hasPHash, entry.size, entry.metadata)
+				ws.cm.SetEntryMemoryWithPresence(entry.storedPath, entry.hash, entry.dhash, entry.hasDHash, entry.size, entry.metadata)
 			}
 		}
 	}

@@ -36,7 +36,7 @@ func InitDB(db *sql.DB) error {
 	// Backward compatibility: add columns for existing databases
 	_, _ = db.Exec(`ALTER TABLE photos ADD COLUMN phash TEXT DEFAULT '';`)
 	_, _ = db.Exec(`ALTER TABLE photos ADD COLUMN mime_type TEXT DEFAULT '';`)
-	
+
 	if err != nil {
 		return fmt.Errorf("failed to create database table: %w", err)
 	}

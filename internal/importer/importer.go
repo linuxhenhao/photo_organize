@@ -26,7 +26,7 @@ type ImportTask struct {
 	FileName   string
 	Size       int64
 	MMH3Hash   string
-	PHash      string
+	DHash      string
 }
 
 // copyFile copies a single file from src to dst.
@@ -61,7 +61,7 @@ func importWorker(tasks <-chan ImportTask, wg *sync.WaitGroup, successCount *int
 	ctx := context.Background()
 	for task := range tasks {
 		sourceMeta := ""
-		if _, hasPHash := parseTaskPHash(task); hasPHash {
+		if _, hasDHash := parseTaskDHash(task); hasDHash {
 			sourceMeta = metadata.ExtractImageMetaJson(task.SourcePath)
 		}
 
@@ -181,9 +181,9 @@ func HandleImport(dbPath string, destDir string) {
 	defer rows.Close()
 
 	for rows.Next() {
-		var sourcePath, createTimeStr, mmh3Hash, phash string
+		var sourcePath, createTimeStr, mmh3Hash, dhashStr string
 		var size int64
-		if err := rows.Scan(&sourcePath, &size, &createTimeStr, &mmh3Hash, &phash); err != nil {
+		if err := rows.Scan(&sourcePath, &size, &createTimeStr, &mmh3Hash, &dhashStr); err != nil {
 			log.Printf("Failed to scan row: %v", err)
 			continue
 		}
@@ -217,7 +217,7 @@ func HandleImport(dbPath string, destDir string) {
 			FileName:   fileName,
 			Size:       size,
 			MMH3Hash:   mmh3Hash,
-			PHash:      phash,
+			DHash:      dhashStr,
 		}
 	}
 

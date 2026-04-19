@@ -57,7 +57,7 @@ func TestCalculatePHashSupportsTIFF(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, file.Close())
 
-	hash, err := CalculatePHash(filePath)
+	hash, err := CalculateDHash(filePath)
 	require.NoError(t, err)
 	require.NotZero(t, hash)
 }
@@ -68,7 +68,7 @@ func TestCalculatePHashSupportsARWFixture(t *testing.T) {
 		t.Fatalf("ARW fixture missing: %v", err)
 	}
 
-	hash, err := CalculatePHash(fixturePath)
+	hash, err := CalculateDHash(fixturePath)
 	require.NoError(t, err)
 	require.NotZero(t, hash)
 }
@@ -79,7 +79,7 @@ func TestCalculatePHashSupportsCR2Fixture(t *testing.T) {
 		t.Fatalf("CR2 fixture missing: %v", err)
 	}
 
-	hash, err := CalculatePHash(fixturePath)
+	hash, err := CalculateDHash(fixturePath)
 	require.NoError(t, err)
 	require.NotZero(t, hash)
 }

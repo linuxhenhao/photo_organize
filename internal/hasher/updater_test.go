@@ -64,7 +64,7 @@ func TestAssignGroupIDs(t *testing.T) {
 	assert.Equal(t, groups["path4.jpg"], groups["path5.jpg"])
 	assert.NotEqual(t, groups["path1.jpg"], groups["path4.jpg"])
 
-	// path3 is unique, it should still get a group ID or remain unique depending on implementation. 
+	// path3 is unique, it should still get a group ID or remain unique depending on implementation.
 	// Our implementation assigns dense MIN(id) for groups having count > 1.
 	// Actually, wait, the implementation of AssignGroupIDs:
 	// It finds duplicates explicitly... Wait let's see what the logic expects.

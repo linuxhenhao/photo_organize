@@ -82,11 +82,11 @@ func classifyDerivative(childPath string, childMetaJSON string, childSize int64,
 		return DerivativeDecision{}, nil
 	}
 
-	childHash, err := hasher.CalculatePHash(childPath)
+	childHash, err := hasher.CalculateDHash(childPath)
 	if err != nil {
 		return DerivativeDecision{}, fmt.Errorf("failed to calculate child candidate hash %s: %w", childPath, err)
 	}
-	parentHash, err := hasher.CalculatePHash(parentPath)
+	parentHash, err := hasher.CalculateDHash(parentPath)
 	if err != nil {
 		return DerivativeDecision{}, fmt.Errorf("failed to calculate parent candidate hash %s: %w", parentPath, err)
 	}
@@ -188,7 +188,7 @@ func resolvedDHash(path string, features ResolvedVisualFeatures) (uint64, error)
 	if features.HasDHash {
 		return features.DHash, nil
 	}
-	return hasher.CalculatePHash(path)
+	return hasher.CalculateDHash(path)
 }
 
 func resolvedColorSignature(path string, features ResolvedVisualFeatures) ([]uint8, error) {

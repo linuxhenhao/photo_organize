@@ -35,8 +35,8 @@ type importReservation struct {
 	seq                uint64
 	task               ImportTask
 	finalPath          string
-	hasPHash           bool
-	phash              uint64
+	hasDHash           bool
+	dhash              uint64
 	sourceMeta         string
 	action             importPlanAction
 	committedMatchPath string
@@ -79,19 +79,19 @@ func newImportCoordinator(cacheManager *target.CacheManager, featureResolver *pr
 	}
 }
 
-func parseTaskPHash(task ImportTask) (uint64, bool) {
-	if task.PHash == "" || task.PHash == "UNSUPPORTED" || task.PHash == "NOT_IMAGE" {
+func parseTaskDHash(task ImportTask) (uint64, bool) {
+	if task.DHash == "" || task.DHash == "UNSUPPORTED" || task.DHash == "NOT_IMAGE" {
 		return 0, false
 	}
-	phash, err := hasher.StringToPHash(task.PHash)
+	dhash, err := hasher.StringToDHash(task.DHash)
 	if err != nil {
 		return 0, false
 	}
-	return phash, true
+	return dhash, true
 }
 
 func (c *importCoordinator) planTask(ctx context.Context, task ImportTask, sourceMeta string) importPlan {
-	phash, hasPHash := parseTaskPHash(task)
+	dhash, hasDHash := parseTaskDHash(task)
 
 	var inflightCandidates []inflightCompareCandidate
 	for {
@@ -108,22 +108,22 @@ func (c *importCoordinator) planTask(ctx context.Context, task ImportTask, sourc
 			}
 		}
 
-		if hasPHash {
-			inflightCandidates = c.snapshotInflightCandidatesLocked(phash)
+		if hasDHash {
+			inflightCandidates = c.snapshotInflightCandidatesLocked(dhash)
 		} else {
 			inflightCandidates = nil
 		}
 		c.mutex.Unlock()
 
-		if hasPHash {
-			if waitCh := c.findInflightVisualMatch(ctx, task, sourceMeta, phash, inflightCandidates); waitCh != nil {
+		if hasDHash {
+			if waitCh := c.findInflightVisualMatch(ctx, task, sourceMeta, dhash, inflightCandidates); waitCh != nil {
 				return importPlan{action: importPlanWait, waitCh: waitCh}
 			}
 		}
 
 		var committedMatch *confirmedImportMatch
-		if hasPHash {
-			committedMatch = c.findCommittedVisualMatch(ctx, task, sourceMeta, phash)
+		if hasDHash {
+			committedMatch = c.findCommittedVisualMatch(ctx, task, sourceMeta, dhash)
 		}
 
 		c.mutex.Lock()
@@ -149,25 +149,25 @@ func (c *importCoordinator) planTask(ctx context.Context, task ImportTask, sourc
 				filepath.Base(task.TargetDir),
 			)
 			thumbTargetPath := c.resolveAvailableTargetPathLocked(thumbDir, task.FileName)
-			reservation := c.reserveLocked(task, sourceMeta, thumbTargetPath, phash, true, importPlanCopyThumbnail, committedMatch.match.Path)
+			reservation := c.reserveLocked(task, sourceMeta, thumbTargetPath, dhash, true, importPlanCopyThumbnail, committedMatch.match.Path)
 			c.mutex.Unlock()
 			return importPlan{action: importPlanCopyThumbnail, reservation: reservation}
 		}
 
-		reservation := c.reserveLocked(task, sourceMeta, masterTargetPath, phash, hasPHash, importPlanCopyMaster, "")
+		reservation := c.reserveLocked(task, sourceMeta, masterTargetPath, dhash, hasDHash, importPlanCopyMaster, "")
 		c.mutex.Unlock()
 		return importPlan{action: importPlanCopyMaster, reservation: reservation}
 	}
 }
 
-func (c *importCoordinator) reserveLocked(task ImportTask, sourceMeta string, finalPath string, phash uint64, hasPHash bool, action importPlanAction, committedMatchPath string) *importReservation {
+func (c *importCoordinator) reserveLocked(task ImportTask, sourceMeta string, finalPath string, dhash uint64, hasDHash bool, action importPlanAction, committedMatchPath string) *importReservation {
 	c.nextSeq++
 	reservation := &importReservation{
 		seq:                c.nextSeq,
 		task:               task,
 		finalPath:          finalPath,
-		hasPHash:           hasPHash,
-		phash:              phash,
+		hasDHash:           hasDHash,
+		dhash:              dhash,
 		sourceMeta:         sourceMeta,
 		action:             action,
 		committedMatchPath: committedMatchPath,
@@ -200,8 +200,8 @@ func (c *importCoordinator) commitReservation(reservation *importReservation) st
 		c.cacheManager.AddEntryWithPresence(
 			finalPath,
 			reservation.task.MMH3Hash,
-			reservation.phash,
-			reservation.hasPHash,
+			reservation.dhash,
+			reservation.hasDHash,
 			reservation.task.Size,
 			reservation.sourceMeta,
 		)
@@ -222,8 +222,8 @@ func (c *importCoordinator) commitReservation(reservation *importReservation) st
 			c.cacheManager.AddEntryWithPresence(
 				finalPath,
 				reservation.task.MMH3Hash,
-				reservation.phash,
-				reservation.hasPHash,
+				reservation.dhash,
+				reservation.hasDHash,
 				reservation.task.Size,
 				reservation.sourceMeta,
 			)
@@ -334,13 +334,13 @@ func resolveImportFeatures(ctx context.Context, resolver *precompute.Resolver, m
 	return features
 }
 
-func (c *importCoordinator) findCommittedVisualMatch(ctx context.Context, task ImportTask, sourceMeta string, phash uint64) *confirmedImportMatch {
-	matches := c.cacheManager.SearchPHash(phash, dedupe.CandidateSearchDistance)
+func (c *importCoordinator) findCommittedVisualMatch(ctx context.Context, task ImportTask, sourceMeta string, dhash uint64) *confirmedImportMatch {
+	matches := c.cacheManager.SearchDHash(dhash, dedupe.CandidateSearchDistance)
 	var best *confirmedImportMatch
 	var bestMeta metadata.MediaMeta
 	ambiguous := false
 
-	childFeatures := resolveImportFeatures(ctx, c.featureResolver, task.MMH3Hash, phash, true, task.SourcePath)
+	childFeatures := resolveImportFeatures(ctx, c.featureResolver, task.MMH3Hash, dhash, true, task.SourcePath)
 	for _, candidate := range matches {
 		if _, err := os.Stat(candidate.Path); err != nil {
 			log.Printf("Removing stale perceptual match entry for missing path [%s]", candidate.Path)
@@ -396,13 +396,13 @@ func (c *importCoordinator) findCommittedVisualMatch(ctx context.Context, task I
 	return best
 }
 
-func (c *importCoordinator) snapshotInflightCandidatesLocked(phash uint64) []inflightCompareCandidate {
+func (c *importCoordinator) snapshotInflightCandidatesLocked(dhash uint64) []inflightCompareCandidate {
 	candidates := make([]inflightCompareCandidate, 0, len(c.inflight))
 	for _, reservation := range c.inflight {
-		if !reservation.hasPHash {
+		if !reservation.hasDHash {
 			continue
 		}
-		distance := hasher.HammingDistance(phash, reservation.phash)
+		distance := hasher.HammingDistance(dhash, reservation.dhash)
 		if distance > dedupe.CandidateSearchDistance {
 			continue
 		}
@@ -411,8 +411,8 @@ func (c *importCoordinator) snapshotInflightCandidatesLocked(phash uint64) []inf
 		compareMeta := reservation.sourceMeta
 		compareSize := reservation.task.Size
 		compareMMH3 := reservation.task.MMH3Hash
-		compareDHash := reservation.phash
-		compareHasDHash := reservation.hasPHash
+		compareDHash := reservation.dhash
+		compareHasDHash := reservation.hasDHash
 
 		if reservation.action == importPlanCopyThumbnail && reservation.committedMatchPath != "" {
 			comparePath = reservation.committedMatchPath
@@ -437,12 +437,12 @@ func (c *importCoordinator) snapshotInflightCandidatesLocked(phash uint64) []inf
 	return candidates
 }
 
-func (c *importCoordinator) findInflightVisualMatch(ctx context.Context, task ImportTask, sourceMeta string, phash uint64, candidates []inflightCompareCandidate) <-chan struct{} {
+func (c *importCoordinator) findInflightVisualMatch(ctx context.Context, task ImportTask, sourceMeta string, dhash uint64, candidates []inflightCompareCandidate) <-chan struct{} {
 	if len(candidates) == 0 {
 		return nil
 	}
 
-	childFeatures := resolveImportFeatures(ctx, c.featureResolver, task.MMH3Hash, phash, true, task.SourcePath)
+	childFeatures := resolveImportFeatures(ctx, c.featureResolver, task.MMH3Hash, dhash, true, task.SourcePath)
 
 	for idx := range candidates {
 		if candidates[idx].compareMetaJSON == "" || candidates[idx].compareSize == 0 || candidates[idx].compareMMH3 == "" || !candidates[idx].compareHasDHash {
@@ -456,8 +456,8 @@ func (c *importCoordinator) findInflightVisualMatch(ctx context.Context, task Im
 			info, ok := c.cacheManager.GetCachedInfo(candidates[idx].comparePath)
 			if ok {
 				candidates[idx].compareMMH3 = info.MMH3
-				if info.PHash != "" {
-					if parsed, parseErr := hasher.StringToPHash(info.PHash); parseErr == nil {
+				if info.DHash != "" {
+					if parsed, parseErr := hasher.StringToDHash(info.DHash); parseErr == nil {
 						candidates[idx].compareDHash = parsed
 						candidates[idx].compareHasDHash = true
 					}
@@ -469,7 +469,7 @@ func (c *importCoordinator) findInflightVisualMatch(ctx context.Context, task Im
 				}
 			}
 			if !candidates[idx].compareHasDHash {
-				if computed, computeErr := hasher.CalculatePHash(candidates[idx].comparePath); computeErr == nil {
+				if computed, computeErr := hasher.CalculateDHash(candidates[idx].comparePath); computeErr == nil {
 					candidates[idx].compareDHash = computed
 					candidates[idx].compareHasDHash = true
 				}

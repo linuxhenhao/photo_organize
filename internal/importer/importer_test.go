@@ -60,7 +60,7 @@ func buildTaskFromPath(t *testing.T, sourcePath string, targetDir string) Import
 	require.NoError(t, err)
 	mmh3, err := hasher.CalculateHash(sourcePath)
 	require.NoError(t, err)
-	phash, err := hasher.CalculatePHash(sourcePath)
+	dhash, err := hasher.CalculateDHash(sourcePath)
 	require.NoError(t, err)
 
 	return ImportTask{
@@ -69,7 +69,7 @@ func buildTaskFromPath(t *testing.T, sourcePath string, targetDir string) Import
 		FileName:   filepath.Base(sourcePath),
 		Size:       stat.Size(),
 		MMH3Hash:   mmh3,
-		PHash:      hasher.PHashToString(phash),
+		DHash:      hasher.DHashToString(dhash),
 	}
 }
 
@@ -138,7 +138,7 @@ func TestImportWorkerRollsBackReservedEntryOnCopyFailure(t *testing.T) {
 		FileName:   "missing.jpg",
 		Size:       42,
 		MMH3Hash:   "missing-hash",
-		PHash:      "00000000000000ff",
+		DHash:      "00000000000000ff",
 	}
 	close(tasks)
 	wg.Wait()
@@ -150,7 +150,7 @@ func TestImportWorkerRollsBackReservedEntryOnCopyFailure(t *testing.T) {
 
 	_, found := cacheManager.FindExactMatch("missing-hash")
 	require.False(t, found)
-	require.Empty(t, cacheManager.SearchPHash(0xff, 0))
+	require.Empty(t, cacheManager.SearchDHash(0xff, 0))
 }
 
 func TestImportCoordinatorWaitsForSimilarInFlightTask(t *testing.T) {
@@ -237,11 +237,11 @@ func TestImportCoordinatorBackfillsFeatureCacheOnVisualMatchAttempt(t *testing.T
 	require.NoError(t, err)
 	masterMMH3, err := hasher.CalculateHash(masterPath)
 	require.NoError(t, err)
-	masterPHash, err := hasher.CalculatePHash(masterPath)
+	masterDHash, err := hasher.CalculateDHash(masterPath)
 	require.NoError(t, err)
 	masterMeta := metadata.ExtractImageMetaJson(masterPath)
 
-	cacheManager.AddEntryWithPresence(masterPath, masterMMH3, masterPHash, true, masterStat.Size(), masterMeta)
+	cacheManager.AddEntryWithPresence(masterPath, masterMMH3, masterDHash, true, masterStat.Size(), masterMeta)
 
 	task := buildTaskFromPath(t, thumbSource, targetDir)
 	_ = coordinator.planTask(context.Background(), task, metadata.ExtractImageMetaJson(task.SourcePath))

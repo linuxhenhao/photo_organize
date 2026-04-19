@@ -21,7 +21,7 @@ func TestCacheManager_Concurrency(t *testing.T) {
 
 	const numWorkers = 100
 	const phash = uint64(0xDEADBEEF)
-	
+
 	var uniqueCount int32
 	var matchCount int32
 	var wg sync.WaitGroup
@@ -63,7 +63,7 @@ func TestBKTree_Concurrency(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			cm.AddEntry("path", "", uint64(id), 100, "{}")
-			_ = cm.PHashTree.Search(uint64(id), 0)
+			_ = cm.DHashTree.Search(uint64(id), 0)
 		}(i)
 	}
 

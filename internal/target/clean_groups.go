@@ -91,7 +91,7 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 			continue
 		}
 
-		masterResolved := resolveDedupeFeatures(ctx, featureResolver, masterFile.MMH3, masterFile.PHash, masterFile.HasPHash, masterFile.Path)
+		masterResolved := resolveDedupeFeatures(ctx, featureResolver, masterFile.MMH3, masterFile.DHash, masterFile.HasDHash, masterFile.Path)
 
 		originalEntries := parseThumbnailEntries(row.Thumbnails)
 		keptEntries := make([]thumbnailEntry, 0, len(originalEntries))
@@ -127,8 +127,12 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 			}
 			entryDHash := uint64(0)
 			entryHasDHash := false
-			if entry.PHash != "" {
-				if parsed, parseErr := hasher.StringToPHash(entry.PHash); parseErr == nil {
+			entryDHashStr := entry.DHash
+			if entryDHashStr == "" {
+				entryDHashStr = entry.PHash
+			}
+			if entryDHashStr != "" {
+				if parsed, parseErr := hasher.StringToDHash(entryDHashStr); parseErr == nil {
 					entryDHash = parsed
 					entryHasDHash = true
 				}
@@ -187,7 +191,7 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 				targetRow := rows[targetMasterPath]
 				targetRow.Thumbnails = marshalThumbnailEntries(mergeThumbnailEntries(
 					parseThumbnailEntries(targetRow.Thumbnails),
-					[]thumbnailEntry{makeThumbnailEntry(entry.Path, entryFile.MMH3, entryFile.PHashStr, entryFile.Metadata)},
+					[]thumbnailEntry{makeThumbnailEntry(entry.Path, entryFile.MMH3, entryFile.DHashStr, entryFile.Metadata)},
 				))
 				rows[targetMasterPath] = targetRow
 				changedMasters[targetMasterPath] = true
@@ -216,14 +220,14 @@ func CleanThumbnailGroupsWithContext(ctx context.Context, targetDir string, cm *
 			if _, exists := rows[entry.Path]; !exists {
 				rows[entry.Path] = fileCacheRow{
 					MMH3:       entryFile.MMH3,
-					PHash:      entryFile.PHashStr,
+					DHash:      entryFile.DHashStr,
 					Size:       entryFile.Size,
 					Metadata:   entryFile.Metadata,
 					Thumbnails: "[]",
 				}
 				prepared[entry.Path] = entryFile
 				createdStandalone[entry.Path] = true
-				cm.SetEntryMemoryWithPresence(entry.Path, entryFile.MMH3, entryFile.PHash, entryFile.HasPHash, entryFile.Size, entryFile.Metadata)
+				cm.SetEntryMemoryWithPresence(entry.Path, entryFile.MMH3, entryFile.DHash, entryFile.HasDHash, entryFile.Size, entryFile.Metadata)
 				report.StandaloneCreated++
 				standaloneAction = "restore_standalone"
 			}
@@ -319,7 +323,7 @@ func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheMan
 		}
 	}
 
-	if !candidate.HasPHash {
+	if !candidate.HasDHash {
 		return cleanupRehomeResult{Reason: "no_phash"}, nil
 	}
 
@@ -328,8 +332,8 @@ func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheMan
 	bestDistance := 0
 	ambiguous := false
 	validatedCandidate := false
-	candidateResolved := resolveDedupeFeatures(ctx, featureResolver, candidate.MMH3, candidate.PHash, candidate.HasPHash, candidate.Path)
-	for _, match := range cm.SearchPHash(candidate.PHash, dedupe.CandidateSearchDistance) {
+	candidateResolved := resolveDedupeFeatures(ctx, featureResolver, candidate.MMH3, candidate.DHash, candidate.HasDHash, candidate.Path)
+	for _, match := range cm.SearchDHash(candidate.DHash, dedupe.CandidateSearchDistance) {
 		if match.Path == excludedMaster || match.Path == candidate.Path {
 			continue
 		}
@@ -349,7 +353,7 @@ func findCleanupRehomeTarget(ctx context.Context, targetDir string, cm *CacheMan
 			continue
 		}
 
-		existingResolved := resolveDedupeFeatures(ctx, featureResolver, existingFile.MMH3, existingFile.PHash, existingFile.HasPHash, existingFile.Path)
+		existingResolved := resolveDedupeFeatures(ctx, featureResolver, existingFile.MMH3, existingFile.DHash, existingFile.HasDHash, existingFile.Path)
 		decision, err := dedupe.RevalidateDerivativeWithResolvedFeatures(
 			candidate.Path,
 			candidate.Metadata,
@@ -416,7 +420,8 @@ func logStandaloneDecision(path, sourceMaster, action, rehomeReason string, file
 		"size", file.Size,
 		"dimensions", formatStandaloneDimensions(meta),
 		"create_time", standaloneLogValue(meta.CreateTime),
-		"has_phash", file.HasPHash,
+		"has_dhash", file.HasDHash,
+		"has_phash", file.HasDHash,
 	)
 }
 
@@ -515,7 +520,7 @@ func loadStoredTargetFile(targetDir, storedPath string, row fileCacheRow, prepar
 		return targetFile{}, err
 	}
 
-	file, err := buildTargetFile(resolved, stat, row, row.MMH3 != "" || row.PHash != "" || row.Metadata != "" || row.Size != 0)
+	file, err := buildTargetFile(resolved, stat, row, row.MMH3 != "" || row.DHash != "" || row.Metadata != "" || row.Size != 0)
 	if err != nil {
 		return targetFile{}, err
 	}

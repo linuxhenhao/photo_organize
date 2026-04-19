@@ -18,8 +18,9 @@ import (
 
 // CacheInfo tracks the completion state of a cached file entry
 type CacheInfo struct {
-	MMH3    string
-	PHash   string
+	MMH3 string
+	// DHash is stored in SQLite column file_cache.phash for historical reasons.
+	DHash   string
 	Size    int64
 	HasMeta bool
 }
@@ -48,7 +49,7 @@ type CacheManager struct {
 	mutex     sync.Mutex // Protects consistent access to in-memory state
 	mmh3Cache sync.Map   // In-memory cache: mmh3_hash -> targetFilePath
 	paths     sync.Map   // In-memory cache: targetFilePath -> CacheInfo
-	PHashTree *hasher.BKTree
+	DHashTree *hasher.BKTree
 	batchSize int
 
 	entries  chan cacheEntry
@@ -60,7 +61,7 @@ func NewCacheManager(destDir string, batchSize int) (*CacheManager, error) {
 	cm := &CacheManager{
 		mmh3Cache: sync.Map{},
 		paths:     sync.Map{},
-		PHashTree: hasher.NewBKTree(),
+		DHashTree: hasher.NewBKTree(),
 		batchSize: batchSize,
 		entries:   make(chan cacheEntry, 1000),
 	}
@@ -111,22 +112,22 @@ func NewCacheManager(destDir string, batchSize int) (*CacheManager, error) {
 		defer rows.Close()
 		var loaded int
 		for rows.Next() {
-			var path, mmh3, phash, metadataStr string
+			var path, mmh3, dhashStr, metadataStr string
 			var size int64
-			if err := rows.Scan(&path, &mmh3, &phash, &size, &metadataStr); err == nil {
+			if err := rows.Scan(&path, &mmh3, &dhashStr, &size, &metadataStr); err == nil {
 				// Initialize memory representation
 				cm.paths.Store(path, CacheInfo{
 					MMH3:    mmh3,
-					PHash:   phash,
+					DHash:   dhashStr,
 					Size:    size,
 					HasMeta: metadataStr != "" && metadataStr != "{}",
 				})
 				if mmh3 != "" {
 					cm.mmh3Cache.Store(mmh3, path)
 				}
-				if phash != "" {
-					if hashVal, parseErr := hasher.StringToPHash(phash); parseErr == nil {
-						cm.PHashTree.Add(hashVal, path, size)
+				if dhashStr != "" {
+					if hashVal, parseErr := hasher.StringToDHash(dhashStr); parseErr == nil {
+						cm.DHashTree.Add(hashVal, path, size)
 					}
 				}
 				loaded++
@@ -142,10 +143,10 @@ func NewCacheManager(destDir string, batchSize int) (*CacheManager, error) {
 	return cm, nil
 }
 
-func (cm *CacheManager) setEntryLocked(path string, mmh3 string, phash uint64, hasPHash bool, size int64, hasMeta bool) string {
-	phashStr := ""
-	if hasPHash {
-		phashStr = hasher.PHashToString(phash)
+func (cm *CacheManager) setEntryLocked(path string, mmh3 string, dhash uint64, hasDHash bool, size int64, hasMeta bool) string {
+	dhashStr := ""
+	if hasDHash {
+		dhashStr = hasher.DHashToString(dhash)
 	}
 
 	if prevVal, ok := cm.paths.Load(path); ok {
@@ -159,18 +160,18 @@ func (cm *CacheManager) setEntryLocked(path string, mmh3 string, phash uint64, h
 
 	cm.paths.Store(path, CacheInfo{
 		MMH3:    mmh3,
-		PHash:   phashStr,
+		DHash:   dhashStr,
 		Size:    size,
 		HasMeta: hasMeta,
 	})
 	if mmh3 != "" {
 		cm.mmh3Cache.Store(mmh3, path)
 	}
-	if hasPHash {
-		cm.PHashTree.Add(phash, path, size)
+	if hasDHash {
+		cm.DHashTree.Add(dhash, path, size)
 	}
 
-	return phashStr
+	return dhashStr
 }
 
 func (cm *CacheManager) removeEntryLocked(path string) {
@@ -197,7 +198,7 @@ func (cm *CacheManager) filterLiveMatchesLocked(matches []hasher.MatchResult) []
 		}
 
 		info := val.(CacheInfo)
-		if info.PHash == "" || info.PHash != hasher.PHashToString(match.Hash) {
+		if info.DHash == "" || info.DHash != hasher.DHashToString(match.Hash) {
 			continue
 		}
 
@@ -341,13 +342,19 @@ func (cm *CacheManager) FindExactMatch(mmh3 string) (string, bool) {
 	return "", false
 }
 
-// SearchPHash performs a search on the BKTree.
-func (cm *CacheManager) SearchPHash(phash uint64, maxDistance int) []hasher.MatchResult {
+// SearchDHash performs a search on the BKTree using first-stage dHash values.
+func (cm *CacheManager) SearchDHash(dhash uint64, maxDistance int) []hasher.MatchResult {
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
-	matches := cm.filterLiveMatchesLocked(cm.PHashTree.Search(phash, maxDistance))
+	matches := cm.filterLiveMatchesLocked(cm.DHashTree.Search(dhash, maxDistance))
 	rankMatches(matches)
 	return matches
+}
+
+// SearchPHash is a compatibility alias for SearchDHash.
+// Deprecated: this project uses dHash for first-stage lookup.
+func (cm *CacheManager) SearchPHash(phash uint64, maxDistance int) []hasher.MatchResult {
+	return cm.SearchDHash(phash, maxDistance)
 }
 
 // CheckAndAddPerceptualMatch atomically searches for a match and adds the entry if no match is found.
@@ -359,7 +366,7 @@ func (cm *CacheManager) CheckAndAddPerceptualMatch(phash uint64, path string, si
 // CheckAndAddPerceptualMatchWithPresence behaves like CheckAndAddPerceptualMatch but allows zero-valued hashes.
 func (cm *CacheManager) CheckAndAddPerceptualMatchWithPresence(phash uint64, hasPHash bool, path string, size int64, mmh3 string) *hasher.MatchResult {
 	cm.mutex.Lock()
-	matches := cm.filterLiveMatchesLocked(cm.PHashTree.Search(phash, dedupe.CandidateSearchDistance))
+	matches := cm.filterLiveMatchesLocked(cm.DHashTree.Search(phash, dedupe.CandidateSearchDistance))
 	rankMatches(matches)
 	if len(matches) > 0 {
 		match := matches[0]

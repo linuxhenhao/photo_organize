@@ -20,7 +20,7 @@ func TestExtractImageMeta_Image(t *testing.T) {
 	// Create a mock JPEG
 	img := image.NewRGBA(image.Rect(0, 0, 100, 200))
 	img.Set(0, 0, color.RGBA{255, 0, 0, 255})
-	
+
 	imgPath := filepath.Join(tempDir, "test.jpg")
 	f, err := os.Create(imgPath)
 	require.NoError(t, err)
@@ -54,12 +54,12 @@ func TestExtractImageMeta_Video(t *testing.T) {
 	// Use exiftool to set some metadata so we can read it back
 	// Note: some exiftool versions might not allow writing to a completely fake mp4,
 	// but we are testing our reading logic which parses the output.
-	// A better way is to mock the command if we want to be 100% sure, 
+	// A better way is to mock the command if we want to be 100% sure,
 	// but let's try a real call first.
 	exec.Command("exiftool", "-overwrite_original", "-VideoSize=1920x1080", "-CreateDate=2023:05:01 12:00:00", videoPath).Run()
 
 	meta := ExtractImageMeta(videoPath)
-	
+
 	// If exiftool succeeded in writing/reading the dummy file:
 	if meta.Width == 1920 && meta.Height == 1080 {
 		require.Equal(t, 1920, meta.Width)

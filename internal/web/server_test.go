@@ -134,7 +134,7 @@ func TestHandleResolveGroupPromotesThumbnailToMaster(t *testing.T) {
 
 	expectedHash, err := hasher.CalculateHash(masterPath)
 	require.NoError(t, err)
-	expectedPHash, err := hasher.CalculatePHash(masterPath)
+	expectedPHash, err := hasher.CalculateDHash(masterPath)
 	require.NoError(t, err)
 
 	var gotHash string
@@ -143,7 +143,7 @@ func TestHandleResolveGroupPromotesThumbnailToMaster(t *testing.T) {
 	err = sqliteDB.QueryRow(`SELECT mmh3_hash, phash, thumbnails FROM file_cache WHERE target_path = ?`, masterPath).Scan(&gotHash, &gotPHash, &thumbnails)
 	require.NoError(t, err)
 	require.Equal(t, expectedHash, gotHash)
-	require.Equal(t, hasher.PHashToString(expectedPHash), gotPHash)
+	require.Equal(t, hasher.DHashToString(expectedPHash), gotPHash)
 	require.Equal(t, "[]", thumbnails)
 
 	foundPath, found := cacheManager.FindExactMatch(expectedHash)
@@ -239,7 +239,7 @@ func TestHandleResolveGroupKeepsMultipleSelectedItems(t *testing.T) {
 
 	expectedHash, err := hasher.CalculateHash(restoredKeepPath)
 	require.NoError(t, err)
-	expectedPHash, err := hasher.CalculatePHash(restoredKeepPath)
+	expectedPHash, err := hasher.CalculateDHash(restoredKeepPath)
 	require.NoError(t, err)
 
 	var keepHash string
@@ -248,7 +248,7 @@ func TestHandleResolveGroupKeepsMultipleSelectedItems(t *testing.T) {
 	err = sqliteDB.QueryRow(`SELECT mmh3_hash, phash, thumbnails FROM file_cache WHERE target_path = ?`, restoredKeepPath).Scan(&keepHash, &keepPHash, &keepThumbs)
 	require.NoError(t, err)
 	require.Equal(t, expectedHash, keepHash)
-	require.Equal(t, hasher.PHashToString(expectedPHash), keepPHash)
+	require.Equal(t, hasher.DHashToString(expectedPHash), keepPHash)
 	require.Equal(t, "[]", keepThumbs)
 
 	var deletedCount int

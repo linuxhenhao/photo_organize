@@ -163,9 +163,9 @@ func TestCandidateSearchDistanceCoversRepoMockThumbnails(t *testing.T) {
 		parentPath := filepath.Clean(filepath.Join("..", "..", "test_data", "source_mock", fmt.Sprintf("img_2023_05_%02d.jpg", i)))
 		childPath := filepath.Clean(filepath.Join("..", "..", "test_data", "source_mock_thumbs", fmt.Sprintf("thumb_2023_05_%02d.jpg", i)))
 
-		parentHash, err := hasher.CalculatePHash(parentPath)
+		parentHash, err := hasher.CalculateDHash(parentPath)
 		require.NoError(t, err)
-		childHash, err := hasher.CalculatePHash(childPath)
+		childHash, err := hasher.CalculateDHash(childPath)
 		require.NoError(t, err)
 
 		distance := hasher.HammingDistance(parentHash, childHash)
@@ -197,9 +197,9 @@ func TestRevalidateDerivativeWithResolvedFeaturesDoesNotRequireFiles(t *testing.
 	childStat, err := os.Stat(childPath)
 	require.NoError(t, err)
 
-	parentDHash, err := hasher.CalculatePHash(parentPath)
+	parentDHash, err := hasher.CalculateDHash(parentPath)
 	require.NoError(t, err)
-	childDHash, err := hasher.CalculatePHash(childPath)
+	childDHash, err := hasher.CalculateDHash(childPath)
 	require.NoError(t, err)
 
 	parentColor, err := hasher.CalculateColorSignature(parentPath)

@@ -77,7 +77,7 @@ func TestCacheManager_Persistence(t *testing.T) {
 	require.True(t, found)
 	require.Equal(t, path, foundPath)
 
-	matches := cm2.SearchPHash(phash, 0)
+	matches := cm2.SearchDHash(phash, 0)
 	require.Len(t, matches, 1)
 	require.Equal(t, path, matches[0].Path)
 
@@ -148,7 +148,7 @@ func TestCacheManager_DeleteEntryFiltersStaleHashesAndPHashes(t *testing.T) {
 
 	_, found := cm.FindExactMatch(oldHash)
 	require.False(t, found)
-	require.Empty(t, cm.SearchPHash(oldPHash, 0))
+	require.Empty(t, cm.SearchDHash(oldPHash, 0))
 
 	cm.AddEntry(path, newHash, newPHash, 120, `{"width":2}`)
 
@@ -157,9 +157,9 @@ func TestCacheManager_DeleteEntryFiltersStaleHashesAndPHashes(t *testing.T) {
 	foundPath, found := cm.FindExactMatch(newHash)
 	require.True(t, found)
 	require.Equal(t, path, foundPath)
-	require.Empty(t, cm.SearchPHash(oldPHash, 0))
+	require.Empty(t, cm.SearchDHash(oldPHash, 0))
 
-	matches := cm.SearchPHash(newPHash, 0)
+	matches := cm.SearchDHash(newPHash, 0)
 	require.Len(t, matches, 1)
 	require.Equal(t, path, matches[0].Path)
 }
@@ -176,11 +176,11 @@ func TestCacheManager_ZeroValuedPHashIsSearchable(t *testing.T) {
 	path := filepath.Join(tempDir, "flat.jpg")
 	cm.AddEntryWithPresence(path, "zero-hash", 0, true, 64, `{"width":32}`)
 
-	matches := cm.SearchPHash(0, 0)
+	matches := cm.SearchDHash(0, 0)
 	require.Len(t, matches, 1)
 	require.Equal(t, path, matches[0].Path)
 
 	info, ok := cm.GetCachedInfo(path)
 	require.True(t, ok)
-	require.Equal(t, "0000000000000000", info.PHash)
+	require.Equal(t, "0000000000000000", info.DHash)
 }

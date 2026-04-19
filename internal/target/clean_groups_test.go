@@ -80,14 +80,14 @@ func insertCachedMaster(t *testing.T, cm *CacheManager, path string, thumbnails 
 		`INSERT INTO file_cache (target_path, mmh3_hash, phash, size, metadata, thumbnails) VALUES (?, ?, ?, ?, ?, ?)`,
 		path,
 		file.MMH3,
-		file.PHashStr,
+		file.DHashStr,
 		file.Size,
 		file.Metadata,
 		thumbnails,
 	)
 	require.NoError(t, err)
 
-	cm.SetEntryMemoryWithPresence(path, file.MMH3, file.PHash, file.HasPHash, file.Size, file.Metadata)
+	cm.SetEntryMemoryWithPresence(path, file.MMH3, file.DHash, file.HasDHash, file.Size, file.Metadata)
 }
 
 func captureLogs(t *testing.T, fn func()) string {

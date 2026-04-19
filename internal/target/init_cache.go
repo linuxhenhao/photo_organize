@@ -30,7 +30,7 @@ type InitCacheOptions struct {
 
 type fileCacheRow struct {
 	MMH3       string
-	PHash      string
+	DHash      string
 	Size       int64
 	Metadata   string
 	Thumbnails string
@@ -39,16 +39,19 @@ type fileCacheRow struct {
 type targetFile struct {
 	Path     string
 	MMH3     string
-	PHash    uint64
-	PHashStr string
-	HasPHash bool
+	DHash    uint64
+	DHashStr string
+	HasDHash bool
 	Size     int64
 	Metadata string
 }
 
 type thumbnailEntry struct {
-	Path     string          `json:"path"`
-	MMH3     string          `json:"mmh3_hash,omitempty"`
+	Path string `json:"path"`
+	MMH3 string `json:"mmh3_hash,omitempty"`
+	// DHash is the canonical field written by modern code.
+	DHash string `json:"dhash,omitempty"`
+	// PHash is a legacy field name that historically held dHash values.
 	PHash    string          `json:"phash,omitempty"`
 	Metadata json.RawMessage `json:"metadata"`
 }
@@ -178,14 +181,14 @@ func loadFileCacheRows(ctx context.Context, db *sql.DB) (map[string]fileCacheRow
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		var path, mmh3, phash, metadataStr, thumbnails string
+		var path, mmh3, dhashStr, metadataStr, thumbnails string
 		var size int64
-		if err := rows.Scan(&path, &mmh3, &phash, &size, &metadataStr, &thumbnails); err != nil {
+		if err := rows.Scan(&path, &mmh3, &dhashStr, &size, &metadataStr, &thumbnails); err != nil {
 			return nil, err
 		}
 		result[path] = fileCacheRow{
 			MMH3:       mmh3,
-			PHash:      phash,
+			DHash:      dhashStr,
 			Size:       size,
 			Metadata:   metadataStr,
 			Thumbnails: thumbnails,
@@ -208,7 +211,7 @@ func shouldRefreshPath(path string, row fileCacheRow, exists bool, stat os.FileI
 	if row.Metadata == "" || row.Metadata == "{}" {
 		return true
 	}
-	if row.PHash != "" {
+	if row.DHash != "" {
 		return false
 	}
 	return hasher.CanVisualHash(path, "")
@@ -243,21 +246,21 @@ func buildTargetFile(path string, stat os.FileInfo, row fileCacheRow, exists boo
 		file.Metadata = metadata.ExtractImageMetaJson(path)
 	}
 
-	if row.PHash != "" {
-		hashVal, err := hasher.StringToPHash(row.PHash)
+	if row.DHash != "" {
+		hashVal, err := hasher.StringToDHash(row.DHash)
 		if err == nil {
-			file.PHash = hashVal
-			file.PHashStr = row.PHash
-			file.HasPHash = true
+			file.DHash = hashVal
+			file.DHashStr = row.DHash
+			file.HasDHash = true
 		}
 	}
 
-	if !file.HasPHash && hasher.CanVisualHash(path, "") {
-		hashVal, err := hasher.CalculatePHash(path)
+	if !file.HasDHash && hasher.CanVisualHash(path, "") {
+		hashVal, err := hasher.CalculateDHash(path)
 		if err == nil {
-			file.PHash = hashVal
-			file.PHashStr = hasher.PHashToString(hashVal)
-			file.HasPHash = true
+			file.DHash = hashVal
+			file.DHashStr = hasher.DHashToString(hashVal)
+			file.HasDHash = true
 		}
 	}
 
@@ -361,10 +364,10 @@ func initTargetDirCacheReadOnly(ctx context.Context, targetDir string, paths []s
 			log.Printf("Failed to upsert cache entry for %s: %v", file.Path, err)
 			continue
 		}
-		cm.SetEntryMemoryWithPresence(file.Path, file.MMH3, file.PHash, file.HasPHash, file.Size, file.Metadata)
+		cm.SetEntryMemoryWithPresence(file.Path, file.MMH3, file.DHash, file.HasDHash, file.Size, file.Metadata)
 		rows[file.Path] = fileCacheRow{
 			MMH3:       file.MMH3,
-			PHash:      file.PHashStr,
+			DHash:      file.DHashStr,
 			Size:       file.Size,
 			Metadata:   file.Metadata,
 			Thumbnails: entry.Row.Thumbnails,
@@ -414,7 +417,11 @@ func backfillThumbnailEntryHashes(ctx context.Context, targetDir string, rows ma
 		}
 		entries := parseThumbnailEntries(row.Thumbnails)
 		for idx, entry := range entries {
-			if entry.Path == "" || (entry.MMH3 != "" && entry.PHash != "") {
+			entryDHash := entry.DHash
+			if entryDHash == "" {
+				entryDHash = entry.PHash
+			}
+			if entry.Path == "" || (entry.MMH3 != "" && entryDHash != "") {
 				continue
 			}
 			pathRefs[entry.Path] = append(pathRefs[entry.Path], thumbnailRef{masterPath: masterPath, index: idx})
@@ -460,8 +467,8 @@ func backfillThumbnailEntryHashes(ctx context.Context, targetDir string, rows ma
 
 				phash := ""
 				if hasher.CanVisualHash(resolved, "") {
-					if dhash, dhashErr := hasher.CalculatePHash(resolved); dhashErr == nil {
-						phash = hasher.PHashToString(dhash)
+					if dhash, dhashErr := hasher.CalculateDHash(resolved); dhashErr == nil {
+						phash = hasher.DHashToString(dhash)
 					}
 				}
 				results <- hashResult{path: path, mmh3: mmh3, phash: phash, err: nil}
@@ -510,8 +517,13 @@ func backfillThumbnailEntryHashes(ctx context.Context, targetDir string, rows ma
 				entries[ref.index].MMH3 = result.mmh3
 				changed = true
 			}
-			if entries[ref.index].PHash == "" && result.phash != "" {
-				entries[ref.index].PHash = result.phash
+			entryDHash := entries[ref.index].DHash
+			if entryDHash == "" {
+				entryDHash = entries[ref.index].PHash
+			}
+			if entryDHash == "" && result.phash != "" {
+				entries[ref.index].DHash = result.phash
+				entries[ref.index].PHash = ""
 				changed = true
 			}
 			updatedMasters[ref.masterPath] = entries
@@ -579,7 +591,7 @@ func initTargetDirCacheMove(ctx context.Context, targetDir string, paths []strin
 		}
 
 		var match *confirmedDuplicateMatch
-		if file.HasPHash {
+		if file.HasDHash {
 			match, err = findConfirmedDuplicateMatch(ctx, file, rows, cm, featureResolver)
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
@@ -597,12 +609,12 @@ func initTargetDirCacheMove(ctx context.Context, targetDir string, paths []strin
 			}
 			rows[file.Path] = fileCacheRow{
 				MMH3:       file.MMH3,
-				PHash:      file.PHashStr,
+				DHash:      file.DHashStr,
 				Size:       file.Size,
 				Metadata:   file.Metadata,
 				Thumbnails: entry.Row.Thumbnails,
 			}
-			cm.SetEntryMemoryWithPresence(file.Path, file.MMH3, file.PHash, file.HasPHash, file.Size, file.Metadata)
+			cm.SetEntryMemoryWithPresence(file.Path, file.MMH3, file.DHash, file.HasDHash, file.Size, file.Metadata)
 			processed++
 			continue
 		}
@@ -637,11 +649,11 @@ func initTargetDirCacheMove(ctx context.Context, targetDir string, paths []strin
 }
 
 func findConfirmedDuplicateMatch(ctx context.Context, file targetFile, rows map[string]fileCacheRow, cm *CacheManager, featureResolver *precompute.Resolver) (*confirmedDuplicateMatch, error) {
-	matches := cm.SearchPHash(file.PHash, dedupe.CandidateSearchDistance)
+	matches := cm.SearchDHash(file.DHash, dedupe.CandidateSearchDistance)
 	var best *confirmedDuplicateMatch
 	var bestMeta metadata.MediaMeta
 	ambiguous := false
-	childFeatures := resolveDedupeFeatures(ctx, featureResolver, file.MMH3, file.PHash, file.HasPHash, file.Path)
+	childFeatures := resolveDedupeFeatures(ctx, featureResolver, file.MMH3, file.DHash, file.HasDHash, file.Path)
 	for _, candidate := range matches {
 		if err := stopInitCacheAtSafePoint(ctx, fmt.Sprintf("before confirming duplicate candidates for %s", file.Path)); err != nil {
 			return nil, err
@@ -664,8 +676,8 @@ func findConfirmedDuplicateMatch(ctx context.Context, file targetFile, rows map[
 		row := rows[candidate.Path]
 		parentDHash := uint64(0)
 		parentHasDHash := false
-		if row.PHash != "" {
-			if parsed, parseErr := hasher.StringToPHash(row.PHash); parseErr == nil {
+		if row.DHash != "" {
+			if parsed, parseErr := hasher.StringToDHash(row.DHash); parseErr == nil {
 				parentDHash = parsed
 				parentHasDHash = true
 			}
@@ -781,8 +793,17 @@ func mergeThumbnailEntries(groups ...[]thumbnailEntry) []thumbnailEntry {
 				if merged[idx].MMH3 == "" && entry.MMH3 != "" {
 					merged[idx].MMH3 = entry.MMH3
 				}
-				if merged[idx].PHash == "" && entry.PHash != "" {
-					merged[idx].PHash = entry.PHash
+				mergedDHash := merged[idx].DHash
+				if mergedDHash == "" {
+					mergedDHash = merged[idx].PHash
+				}
+				entryDHash := entry.DHash
+				if entryDHash == "" {
+					entryDHash = entry.PHash
+				}
+				if mergedDHash == "" && entryDHash != "" {
+					merged[idx].DHash = entryDHash
+					merged[idx].PHash = ""
 				}
 				if len(merged[idx].Metadata) == 0 || string(merged[idx].Metadata) == "{}" {
 					if len(entry.Metadata) > 0 && string(entry.Metadata) != "{}" {
@@ -820,7 +841,8 @@ func makeThumbnailEntry(path string, parts ...string) thumbnailEntry {
 	return thumbnailEntry{
 		Path:     path,
 		MMH3:     mmh3,
-		PHash:    phash,
+		DHash:    phash,
+		PHash:    "",
 		Metadata: json.RawMessage(metadataJSON),
 	}
 }
@@ -843,7 +865,7 @@ func upsertMasterPreservingThumbnails(exec interface {
 			phash = excluded.phash,
 			size = excluded.size,
 			metadata = excluded.metadata
-	`, file.Path, file.MMH3, file.PHashStr, file.Size, file.Metadata)
+	`, file.Path, file.MMH3, file.DHashStr, file.Size, file.Metadata)
 	return err
 }
 
@@ -857,7 +879,7 @@ func replaceMasterWithThumbnails(tx *sql.Tx, file targetFile, thumbnails string)
 			size = excluded.size,
 			metadata = excluded.metadata,
 			thumbnails = excluded.thumbnails
-	`, file.Path, file.MMH3, file.PHashStr, file.Size, file.Metadata, thumbnails)
+	`, file.Path, file.MMH3, file.DHashStr, file.Size, file.Metadata, thumbnails)
 	return err
 }
 
@@ -905,7 +927,7 @@ func rebuildThumbnailLinks(ctx context.Context, thumbnailPaths []string, rows ma
 		if err := stopInitCacheAtSafePoint(ctx, "before matching the next thumbnail"); err != nil {
 			return err
 		}
-		if entry.Err != nil || !entry.File.HasPHash {
+		if entry.Err != nil || !entry.File.HasDHash {
 			continue
 		}
 
@@ -921,7 +943,7 @@ func rebuildThumbnailLinks(ctx context.Context, thumbnailPaths []string, rows ma
 		thumbMeta := metadata.ExtractImageMetaJson(entry.Path)
 		aggregated[match.Match.Path] = mergeThumbnailEntries(
 			aggregated[match.Match.Path],
-			[]thumbnailEntry{makeThumbnailEntry(entry.Path, entry.File.MMH3, entry.File.PHashStr, thumbMeta)},
+			[]thumbnailEntry{makeThumbnailEntry(entry.Path, entry.File.MMH3, entry.File.DHashStr, thumbMeta)},
 		)
 	}
 
@@ -965,7 +987,7 @@ func demoteCurrentFile(targetDir string, file targetFile, match hasher.MatchResu
 	mergedThumbs := mergeThumbnailEntries(
 		parseThumbnailEntries(rows[match.Path].Thumbnails),
 		parseThumbnailEntries(rows[file.Path].Thumbnails),
-		[]thumbnailEntry{makeThumbnailEntry(thumbPath, file.MMH3, file.PHashStr, thumbMeta)},
+		[]thumbnailEntry{makeThumbnailEntry(thumbPath, file.MMH3, file.DHashStr, thumbMeta)},
 	)
 	thumbJSON := marshalThumbnailEntries(mergedThumbs)
 

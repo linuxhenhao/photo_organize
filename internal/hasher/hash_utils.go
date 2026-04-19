@@ -119,21 +119,22 @@ func decodeImageForHash(path string) (image.Image, error) {
 	if img == nil {
 		file, openErr := os.Open(path)
 		if openErr != nil {
-			return nil, fmt.Errorf("failed to open file for phash [%s]: %w", path, openErr)
+			return nil, fmt.Errorf("failed to open file for dhash [%s]: %w", path, openErr)
 		}
 		defer file.Close()
 		img, _, err = image.Decode(file)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decode image for phash [%s]: %w", path, err)
+			return nil, fmt.Errorf("failed to decode image for dhash [%s]: %w", path, err)
 		}
 	}
 
 	return img, nil
 }
 
-// CalculatePHash computes the fast dHash stored in cache.db's `phash` column
-// for BK-tree candidate lookup.
-func CalculatePHash(path string) (uint64, error) {
+// CalculateDHash computes the fast dHash used for BK-tree candidate lookup.
+// Note: historically this project stored dHash values in `phash` columns
+// (e.g. cache.db's file_cache.phash). Prefer the dHash naming in new code.
+func CalculateDHash(path string) (uint64, error) {
 	img, err := decodeImageForHash(path)
 	if err != nil {
 		return 0, err
@@ -144,6 +145,12 @@ func CalculatePHash(path string) (uint64, error) {
 		return 0, err
 	}
 	return hash.GetHash(), nil
+}
+
+// CalculatePHash is a compatibility alias for CalculateDHash.
+// Deprecated: the stored value is dHash, not pHash.
+func CalculatePHash(path string) (uint64, error) {
+	return CalculateDHash(path)
 }
 
 // CalculateFullPerceptionHash computes the stronger full perception hash.
@@ -230,17 +237,29 @@ func ColorSignatureDistance(a []uint8, b []uint8) float64 {
 	return sum / float64(len(a))
 }
 
-// PHashToString formats a uint64 phash as a 16-character hex string.
-func PHashToString(hash uint64) string {
+// DHashToString formats a uint64 dHash as a 16-character hex string.
+func DHashToString(hash uint64) string {
 	return fmt.Sprintf("%016x", hash)
 }
 
-// StringToPHash parses a 16-character hex string back to a uint64 phash.
-func StringToPHash(s string) (uint64, error) {
+// StringToDHash parses a 16-character hex string back to a uint64 dHash.
+func StringToDHash(s string) (uint64, error) {
 	if s == "" {
 		return 0, nil
 	}
 	return strconv.ParseUint(s, 16, 64)
+}
+
+// PHashToString is a compatibility alias for DHashToString.
+// Deprecated: these strings represent dHash values.
+func PHashToString(hash uint64) string {
+	return DHashToString(hash)
+}
+
+// StringToPHash is a compatibility alias for StringToDHash.
+// Deprecated: these strings represent dHash values.
+func StringToPHash(s string) (uint64, error) {
+	return StringToDHash(s)
 }
 
 // CalculateHash generates the murmur3 mmh3_hash for a file

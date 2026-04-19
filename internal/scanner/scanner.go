@@ -48,7 +48,7 @@ func HandleScan(dbPath string, dirs []string) {
 	var insertWg sync.WaitGroup
 	log.Printf("Starting %d worker goroutines for scanning...", dbWorkers)
 	insertChan := make(chan Insert, 100)
-	
+
 	for i := 0; i < dbWorkers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
@@ -58,10 +58,10 @@ func HandleScan(dbPath string, dirs []string) {
 			}
 		}(i)
 	}
-	
+
 	insertWg.Add(1)
 	go insertData(sqliteDB, insertChan, &insertWg)
-	
+
 	var skipCnt int32
 	for _, dir := range dirs {
 		log.Printf("Scanning directory: %s", dir)
@@ -94,12 +94,12 @@ func HandleScan(dbPath string, dirs []string) {
 	if err := hasher.UpdateHashes(sqliteDB); err != nil {
 		log.Fatalf("Failed to update hashes: %v", err)
 	}
-	
+
 	log.Println("Assigning group_ids based on mmh3_hash...")
 	if err := hasher.AssignGroupIDs(sqliteDB); err != nil {
 		log.Fatalf("Failed to assign group IDs: %v", err)
 	}
-	
+
 	log.Println("Scan command finished successfully.")
 }
 
@@ -127,10 +127,10 @@ func processFile(path string, insertChan chan<- Insert) {
 
 func insertData(sqliteDB *sql.DB, insertChan <-chan Insert, wg *sync.WaitGroup) {
 	defer wg.Done()
-	
+
 	const batchSize = 100
 	var count int
-	
+
 	tx, err := sqliteDB.Begin()
 	if err != nil {
 		log.Printf("Failed to begin transaction for insertion: %v", err)
@@ -143,7 +143,7 @@ func insertData(sqliteDB *sql.DB, insertChan <-chan Insert, wg *sync.WaitGroup) 
 			log.Printf("write db line failed: %s: %v\n", i.Path, err)
 			continue
 		}
-		
+
 		count++
 		if count >= batchSize {
 			if err := tx.Commit(); err != nil {
@@ -157,7 +157,7 @@ func insertData(sqliteDB *sql.DB, insertChan <-chan Insert, wg *sync.WaitGroup) 
 			count = 0
 		}
 	}
-	
+
 	if err := tx.Commit(); err != nil {
 		log.Printf("Failed to commit final batch insertion: %v", err)
 	}
