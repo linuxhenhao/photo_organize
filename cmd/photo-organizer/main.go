@@ -21,7 +21,6 @@ import (
 	"github.com/linuxhenhao/photo_organize/internal/precompute"
 	"github.com/linuxhenhao/photo_organize/internal/scanner"
 	"github.com/linuxhenhao/photo_organize/internal/target"
-	"github.com/linuxhenhao/photo_organize/internal/web"
 )
 
 // stringArrayFlag implements flag.Value for parsing comma-separated strings
@@ -73,15 +72,6 @@ func main() {
 	precomputeCmd.IntVar(&precomputeWorkers, "workers", 0, "Worker count; default uses CPU core count")
 	precomputeCmd.BoolVar(&precomputeForce, "force", false, "Recompute features even if cache entry exists")
 
-	serveCmd := flag.NewFlagSet("serve", flag.ExitOnError)
-	serveCmd.StringVar(&destDir, "dest", "", "Target directory containing deduplicated items and cache.db")
-	var serveHost string
-	var servePort int
-	serveCmd.StringVar(&serveHost, "host", "127.0.0.1", "IP address to bind the web server to")
-	serveCmd.IntVar(&servePort, "port", 8080, "Port for the web server")
-	var cleanGroupsLogPath string
-	serveCmd.StringVar(&cleanGroupsLogPath, "cleangroups-log", "", "Optional cleangroups log file for review UI; absolute paths must be provided here")
-
 	convertCmd := flag.NewFlagSet("convertdb", flag.ExitOnError)
 	var cacheDBPath string
 	var photosDBPath string
@@ -93,7 +83,7 @@ func main() {
 
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: photo-organizer <command> [options]")
-		fmt.Println("Commands: scan, import, initcache, cleangroups, precompute, serve, convertdb")
+		fmt.Println("Commands: scan, import, initcache, cleangroups, precompute, convertdb")
 		fmt.Println("\nScan command options:")
 		scanCmd.PrintDefaults()
 		fmt.Println("\nImport command options:")
@@ -104,8 +94,6 @@ func main() {
 		cleanGroupsCmd.PrintDefaults()
 		fmt.Println("\nPrecompute command options:")
 		precomputeCmd.PrintDefaults()
-		fmt.Println("\nServe command options:")
-		serveCmd.PrintDefaults()
 		fmt.Println("\nConvertDB command options:")
 		convertCmd.PrintDefaults()
 		os.Exit(1)
@@ -189,29 +177,6 @@ func main() {
 			Force:   precomputeForce,
 		}); err != nil {
 			log.Fatalf("Precompute failed: %v", err)
-		}
-	case "serve":
-		serveCmd.Parse(os.Args[2:])
-		if destDir == "" {
-			log.Fatal("Serve command requires a target directory specified with -dest.")
-		}
-		dbPath := filepath.Join(destDir, "cache.db")
-		sqliteDB, err := sql.Open("sqlite", dbPath+"?_busy_timeout=5000")
-		if err != nil {
-			log.Fatalf("Failed to open cache.db: %v", err)
-		}
-		defer sqliteDB.Close()
-
-		cm, err := target.NewCacheManager(destDir, 10)
-		if err != nil {
-			log.Fatalf("Failed to initialize CacheManager for web server: %v", err)
-		}
-		defer cm.Close()
-
-		server := web.NewWebServer(cm, destDir)
-		server.SetCleanGroupsLogPath(cleanGroupsLogPath)
-		if err := server.Start(serveHost, servePort, sqliteDB); err != nil {
-			log.Fatalf("Web Server failed: %v", err)
 		}
 	case "convertdb":
 		convertCmd.Parse(os.Args[2:])

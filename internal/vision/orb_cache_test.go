@@ -1,3 +1,5 @@
+//go:build gocv
+
 package vision
 
 import (

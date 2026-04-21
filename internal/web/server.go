@@ -39,7 +39,6 @@ type WebServer struct {
 	cm                  *target.CacheManager
 	db                  *sql.DB
 	destDir             string
-	cleanGroupsLogPath  string
 	previewForPath      func(string) ([]byte, string, error)
 	thumbnailPathFor    func(string) string
 	thumbnailForPath    func(string) string
@@ -93,10 +92,6 @@ func NewWebServer(cm *target.CacheManager, destDir string) *WebServer {
 	}
 	ws.thumbnailPathFor = ws.cachedThumbnailPathFor
 	return ws
-}
-
-func (ws *WebServer) SetCleanGroupsLogPath(path string) {
-	ws.cleanGroupsLogPath = strings.TrimSpace(path)
 }
 
 func listenAddr(host string, port int) string {
@@ -816,7 +811,6 @@ func (ws *WebServer) Start(host string, port int, db *sql.DB) error {
 	// API Endpoints
 	mux.HandleFunc("/api/duplicates", ws.handleGetDuplicates)
 	mux.HandleFunc("/api/group-archive", ws.handleGroupArchiveDownload)
-	mux.HandleFunc("/api/cleangroups-log", ws.handleGetCleanGroupsLog)
 	mux.HandleFunc("/api/resolve", ws.handleResolveGroup)
 	mux.HandleFunc("/image", ws.handleImageServe)
 

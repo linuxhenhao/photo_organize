@@ -1,3 +1,5 @@
+//go:build gocv
+
 package vision
 
 import (
@@ -15,7 +17,7 @@ import (
 // - repeated count times:
 //   - float64 x, y, size, angle, response
 //   - int32 octave, class_id
-func SerializeORBKeypoints(keypoints []gocv.KeyPoint) ([]byte, error) {
+func SerializeORBKeypoints(keypoints []KeyPoint) ([]byte, error) {
 	if len(keypoints) > int(^uint32(0)) {
 		return nil, fmt.Errorf("too many keypoints: %d", len(keypoints))
 	}
@@ -50,16 +52,16 @@ func SerializeORBKeypoints(keypoints []gocv.KeyPoint) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func DeserializeORBKeypoints(encoded []byte) ([]gocv.KeyPoint, error) {
+func DeserializeORBKeypoints(encoded []byte) ([]KeyPoint, error) {
 	reader := bytes.NewReader(encoded)
 	var count uint32
 	if err := binary.Read(reader, binary.LittleEndian, &count); err != nil {
 		return nil, err
 	}
 
-	keypoints := make([]gocv.KeyPoint, 0, int(count))
+	keypoints := make([]KeyPoint, 0, int(count))
 	for i := uint32(0); i < count; i++ {
-		var kp gocv.KeyPoint
+		var kp KeyPoint
 		if err := binary.Read(reader, binary.LittleEndian, &kp.X); err != nil {
 			return nil, err
 		}

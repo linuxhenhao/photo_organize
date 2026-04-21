@@ -1,3 +1,5 @@
+//go:build gocv
+
 package vision
 
 import (
@@ -32,6 +34,8 @@ const (
 	ransacRefinementIters  = 10
 )
 
+type KeyPoint = gocv.KeyPoint
+
 type DerivativeVerification struct {
 	Confirmed   bool
 	GoodMatches int
@@ -50,7 +54,7 @@ type ORBSerializedFeatures struct {
 }
 
 type ORBFeatureSet struct {
-	Keypoints   []gocv.KeyPoint
+	Keypoints   []KeyPoint
 	Descriptors gocv.Mat
 	ImageWidth  int
 	ImageHeight int
