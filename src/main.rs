@@ -65,8 +65,12 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let filter = EnvFilter::from_default_env()
+        .add_directive("warn".parse()?)
+        .add_directive("photo_org=info".parse()?);
+
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
+        .with_env_filter(filter)
         .with_target(false)
         .compact()
         .init();
