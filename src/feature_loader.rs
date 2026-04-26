@@ -1,7 +1,7 @@
 use crate::db::FEATURE_VERSION;
 use crate::features::{
     VisualFeatures, compute_visual_features_for_mime_from_bytes, deserialize_akaze_descriptors,
-    serialize_akaze_descriptors, phash_to_u64,
+    phash_to_u64, serialize_akaze_descriptors, supports_visual_features,
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -37,6 +37,16 @@ impl FeatureLoader {
         conn: &Connection,
         request: FeatureRequest<'_>,
     ) -> Result<VisualFeatures> {
+        if !supports_visual_features(request.path, request.mime_type) {
+            let fallback = fallback_features(request);
+            let key = FeatureCacheKey {
+                exact_hash: request.exact_hash.to_string(),
+                size_bytes: request.size_bytes,
+            };
+            self.memo.insert(key, fallback.clone());
+            return Ok(fallback);
+        }
+
         let key = FeatureCacheKey {
             exact_hash: request.exact_hash.to_string(),
             size_bytes: request.size_bytes,
@@ -80,7 +90,11 @@ fn compute_feature(request: FeatureRequest<'_>) -> Result<VisualFeatures> {
         return Ok(computed);
     }
 
-    Ok(VisualFeatures {
+    Ok(fallback_features(request))
+}
+
+fn fallback_features(request: FeatureRequest<'_>) -> VisualFeatures {
+    VisualFeatures {
         exact_hash: request.exact_hash.to_string(),
         phash: request.phash_hint.to_string(),
         phash_bits: request.phash_bits,
@@ -90,7 +104,7 @@ fn compute_feature(request: FeatureRequest<'_>) -> Result<VisualFeatures> {
         size_bytes_hint: request.size_bytes,
         akaze_keypoints: None,
         akaze_descriptors: None,
-    })
+    }
 }
 
 fn load_cached_feature(
@@ -232,5 +246,34 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM feature_cache", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn loader_skips_non_visual_files_without_reading() {
+        let tmp = tempdir().unwrap();
+        let catalog = open_catalog_db(tmp.path().join("catalog.db")).unwrap();
+        let mut loader = FeatureLoader::default();
+        let features = loader
+            .load(
+                &catalog,
+                FeatureRequest {
+                    path: &tmp.path().join("missing.mp4"),
+                    mime_type: "video/mp4",
+                    exact_hash: "hash",
+                    size_bytes: 123,
+                    phash_hint: "",
+                    phash_bits: 0,
+                    width: 0,
+                    height: 0,
+                },
+            )
+            .unwrap();
+        assert!(features.phash.is_empty());
+        assert!(features.akaze_descriptors.is_none());
+
+        let count: i64 = catalog
+            .query_row("SELECT COUNT(*) FROM feature_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

@@ -70,6 +70,10 @@ pub fn compute_visual_features_for_mime_from_bytes(
     path: &Path,
     mime_type: &str,
 ) -> Result<Option<VisualFeatures>> {
+    if !supports_visual_features(path, mime_type) {
+        return Ok(None);
+    }
+
     if is_raw_like_mime(path, mime_type) {
         match compute_raw_preview_features_from_bytes(bytes, path) {
             Ok(features) => return Ok(Some(features)),
@@ -173,6 +177,10 @@ pub fn compute_base_features_from_bytes(
     path: &Path,
     mime_type: &str,
 ) -> Result<Option<VisualFeatures>> {
+    if !supports_visual_features(path, mime_type) {
+        return Ok(None);
+    }
+
     if is_raw_like_mime(path, mime_type) {
         if let Ok(mut raw) = RawImage::open(bytes) {
             if let Ok(thumbs) = raw.extract_thumbs() {
@@ -470,6 +478,17 @@ fn resize_for_feature(image: &DynamicImage, max_dimension: u32) -> DynamicImage 
     image.thumbnail(max_dimension, max_dimension)
 }
 
+pub(crate) fn supports_visual_features(path: &Path, mime_type: &str) -> bool {
+    if is_raw_like_mime(path, mime_type) {
+        return true;
+    }
+
+    mime_type
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("image/")
+}
+
 fn is_raw_like_mime(path: &Path, mime_type: &str) -> bool {
     let mime = mime_type.trim().to_ascii_lowercase();
     if mime.starts_with("image/x-raw") || mime.starts_with("image/x-") {
@@ -546,6 +565,24 @@ mod tests {
         assert!(!cr2_features.phash.is_empty());
         assert!(cr2_features.width > 0);
         assert!(cr2_features.height > 0);
+    }
+
+    #[test]
+    fn compute_visual_features_skips_video_mime() {
+        let video = std::path::Path::new("clip.mp4");
+        let features =
+            compute_visual_features_for_mime_from_bytes(b"not a real video", video, "video/mp4")
+                .unwrap();
+        assert!(features.is_none());
+    }
+
+    #[test]
+    fn compute_base_features_skips_video_mime() {
+        let video = std::path::Path::new("clip.mov");
+        let features =
+            compute_base_features_from_bytes(b"not a real video", video, "video/quicktime")
+                .unwrap();
+        assert!(features.is_none());
     }
 
     #[test]

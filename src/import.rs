@@ -1,6 +1,6 @@
 use crate::db::{max_group_id, open_catalog_db, open_scan_db};
 use crate::feature_loader::{FeatureLoader, FeatureRequest};
-use crate::features::{VisualFeatures, akaze_confirm};
+use crate::features::{VisualFeatures, akaze_confirm, phash_to_u64, supports_visual_features};
 use crate::phash_index::PhashIndex;
 use crate::scan::{DiscoveredFile, collect_file_paths, discover_file, run as scan_run};
 use crate::util::{ProgressReporter, date_for_target, safe_file_name, system_time_to_rfc3339};
@@ -356,6 +356,10 @@ fn prewarm_pass_initcache(catalog_db: &Path, phash_threshold: u32) -> Result<()>
     let mut to_prewarm = Vec::new();
     
     for item in pending_items {
+        if !supports_visual_features(&item.file.path, &item.file.mime_type) || item.file.phash.is_empty() {
+            continue;
+        }
+
         let matches = phash_index.search(&item.file.phash, item.file.phash_bits, phash_threshold);
         // Only pre-warm if there's at least one OTHER file that is similar
         let has_potential_duplicates = matches.iter().any(|&match_id| match_id != item.id);
@@ -557,6 +561,11 @@ fn import_from_scan_db(
     prewarm_progress.log_start();
 
     canonical_rows.par_iter().for_each(|row| {
+        if !supports_visual_features(Path::new(&row.source_path), &row.mime_type) || row.phash.is_empty() {
+            prewarm_progress.item_done();
+            return;
+        }
+
         if let Ok(mut conn) = open_catalog_db(catalog_db) {
             let mut loader = FeatureLoader::default();
             let _ = loader.load(&mut conn, FeatureRequest {
@@ -714,23 +723,42 @@ fn process_catalog_input(
     akaze_min_matches: usize,
     group_status: &str,
 ) -> Result<TargetRow> {
+    let visual_supported = supports_visual_features(&input.target_path, &input.mime_type);
     let input_feature_started = Instant::now();
-    let visual = feature_loader.load(
-        conn,
-        FeatureRequest {
-            path: &input.target_path,
-            mime_type: &input.mime_type,
-            exact_hash: &input.exact_hash,
-            size_bytes: input.size_bytes,
-            phash_hint: &input.phash,
+    let visual = if visual_supported {
+        feature_loader.load(
+            conn,
+            FeatureRequest {
+                path: &input.target_path,
+                mime_type: &input.mime_type,
+                exact_hash: &input.exact_hash,
+                size_bytes: input.size_bytes,
+                phash_hint: &input.phash,
+                phash_bits: input.phash_bits,
+                width: input.width,
+                height: input.height,
+            },
+        )?
+    } else {
+        VisualFeatures {
+            exact_hash: input.exact_hash.clone(),
+            phash: input.phash.clone(),
             phash_bits: input.phash_bits,
+            phash_value: phash_to_u64(&input.phash).unwrap_or(0),
             width: input.width,
             height: input.height,
-        },
-    )?;
-    let input_feature_elapsed = input_feature_started.elapsed();
+            size_bytes_hint: input.size_bytes,
+            akaze_keypoints: None,
+            akaze_descriptors: None,
+        }
+    };
+    let input_feature_elapsed = if visual_supported {
+        input_feature_started.elapsed()
+    } else {
+        Duration::default()
+    };
     let candidate_load_started = Instant::now();
-    let candidate_ids = if visual.phash.is_empty() {
+    let candidate_ids = if !visual_supported || visual.phash.is_empty() {
         Vec::new()
     } else {
         phash_index.search(&visual.phash, visual.phash_bits, phash_threshold)

@@ -1,5 +1,7 @@
 use crate::db::{now_string, open_scan_db};
-use crate::features::{VisualFeatures, compute_base_features_from_bytes, exact_hash};
+use crate::features::{
+    VisualFeatures, compute_base_features_from_bytes, exact_hash, supports_visual_features,
+};
 use crate::util::{
     ProgressReporter, best_effort_mime, fallback_file_time, filename_date, is_excluded_dir,
     parse_exif_datetime, to_bytes_lossless,
@@ -97,17 +99,32 @@ pub(crate) fn discover_file(path: &Path) -> Result<DiscoveredFile> {
     let created_at =
         metadata_time(path, &meta, &bytes).unwrap_or_else(|| fallback_file_time(&meta));
     let exact_hash = exact_hash(&bytes);
-    let visual = compute_base_features_from_bytes(&bytes, path, &mime_type)?.unwrap_or(VisualFeatures {
-        exact_hash: String::new(),
-        phash: String::new(),
-        phash_bits: 0,
-        phash_value: 0,
-        width: 0,
-        height: 0,
-        size_bytes_hint: 0,
-        akaze_keypoints: None,
-        akaze_descriptors: None,
-    });
+    let visual = if supports_visual_features(path, &mime_type) {
+        compute_base_features_from_bytes(&bytes, path, &mime_type)?
+            .unwrap_or(VisualFeatures {
+                exact_hash: String::new(),
+                phash: String::new(),
+                phash_bits: 0,
+                phash_value: 0,
+                width: 0,
+                height: 0,
+                size_bytes_hint: 0,
+                akaze_keypoints: None,
+                akaze_descriptors: None,
+            })
+    } else {
+        VisualFeatures {
+            exact_hash: String::new(),
+            phash: String::new(),
+            phash_bits: 0,
+            phash_value: 0,
+            width: 0,
+            height: 0,
+            size_bytes_hint: 0,
+            akaze_keypoints: None,
+            akaze_descriptors: None,
+        }
+    };
     let meta_json = json!({
         "fingerprint": {
             "size_bytes": meta.len(),
@@ -223,6 +240,7 @@ fn is_excluded_relative(root: &Path, path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::db::open_scan_db;
+    use crate::features::exact_hash;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -286,19 +304,24 @@ mod tests {
         let src = tmp.path().join("src");
         fs::create_dir_all(&src).unwrap();
         let video = src.join("clip.mp4");
-        fs::write(&video, b"not a real video").unwrap();
+        copy_fixture("clip_2023_05_06.mp4", &video);
+        let bytes = fs::read(&video).unwrap();
+        let expected_hash = exact_hash(&bytes);
+        let expected_size = i64::try_from(bytes.len()).unwrap();
 
         let scan_db = tmp.path().join("scan.db");
         run(&scan_db, &[src]).unwrap();
 
         let conn = open_scan_db(&scan_db).unwrap();
-        let (phash, phash_bits): (String, i64) = conn
+        let (size_bytes, exact_hash, phash, phash_bits): (i64, String, String, i64) = conn
             .query_row(
-                "SELECT phash, phash_bits FROM source_items WHERE source_path = ?1",
+                "SELECT size_bytes, exact_hash, phash, phash_bits FROM source_items WHERE source_path = ?1",
                 [video.to_string_lossy().to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
+        assert_eq!(size_bytes, expected_size);
+        assert_eq!(exact_hash, expected_hash);
         assert!(phash.is_empty());
         assert_eq!(phash_bits, 0);
     }
