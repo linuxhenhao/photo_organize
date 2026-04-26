@@ -315,7 +315,7 @@ fn write_ingest_batch(conn: &mut Connection, batch: &[DiscoveredFile]) -> Result
 }
 
 fn prewarm_pass_initcache(catalog_db: &Path, phash_threshold: u32) -> Result<()> {
-    let mut conn = open_catalog_db(catalog_db)?;
+    let conn = open_catalog_db(catalog_db)?;
     
     // 1. Identify items needing pre-warm
     // Find 'pending' items that have potential pHash matches (other than themselves)
@@ -408,7 +408,7 @@ fn prewarm_pass_initcache(catalog_db: &Path, phash_threshold: u32) -> Result<()>
     });
 
     to_prewarm.par_iter().for_each(|item| {
-        let mut loader = FeatureLoader::default();
+        let loader = FeatureLoader::default();
         // This will force computation if not cached
         if let Ok(feat) = loader.compute_only(item) {
             let _ = tx_chan.send(feat);
@@ -898,22 +898,6 @@ fn catalog_input_from_scan_row(row: &ScanRow, target_path: PathBuf) -> CatalogIn
         height: row.height,
         meta_json: row.meta_json.clone(),
         origin_source_id: Some(row.id),
-    }
-}
-
-fn catalog_input_from_discovered_file(file: &DiscoveredFile) -> CatalogInput {
-    CatalogInput {
-        target_path: file.path.clone(),
-        size_bytes: file.size_bytes,
-        mime_type: file.mime_type.clone(),
-        created_at: file.created_at.clone(),
-        exact_hash: file.exact_hash.clone(),
-        phash: file.phash.clone(),
-        phash_bits: file.phash_bits,
-        width: file.width,
-        height: file.height,
-        meta_json: file.meta_json.clone(),
-        origin_source_id: None,
     }
 }
 

@@ -29,11 +29,6 @@ pub fn exact_hash(bytes: &[u8]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-pub fn compute_visual_features(path: &Path) -> Result<VisualFeatures> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    compute_visual_features_from_bytes(&bytes, path)
-}
-
 pub fn compute_visual_features_from_bytes(bytes: &[u8], path: &Path) -> Result<VisualFeatures> {
     let image = decode_image(bytes, path)?;
     Ok(compute_visual_features_from_image(&image))
@@ -55,14 +50,6 @@ fn convert_direct_image(image: ::image::DynamicImage) -> img_hash::image::Dynami
     let buffer = img_hash::image::RgbaImage::from_raw(width, height, rgba.into_raw())
         .expect("rgba buffer dimensions should match");
     img_hash::image::DynamicImage::ImageRgba8(buffer)
-}
-
-pub fn compute_visual_features_for_mime(
-    path: &Path,
-    mime_type: &str,
-) -> Result<Option<VisualFeatures>> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    compute_visual_features_for_mime_from_bytes(&bytes, path, mime_type)
 }
 
 pub fn compute_visual_features_for_mime_from_bytes(
@@ -162,14 +149,6 @@ pub fn compute_base_features_from_image(image: &DynamicImage) -> VisualFeatures 
         akaze_keypoints: None,
         akaze_descriptors: None,
     }
-}
-
-pub fn compute_base_features_for_mime(
-    path: &Path,
-    mime_type: &str,
-) -> Result<Option<VisualFeatures>> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    compute_base_features_from_bytes(&bytes, path, mime_type)
 }
 
 pub fn compute_base_features_from_bytes(
@@ -337,11 +316,6 @@ fn read_u32(blob: &[u8], offset: &mut usize) -> Result<u32> {
     ]);
     *offset += 4;
     Ok(value)
-}
-
-fn compute_raw_preview_features(path: &Path) -> Result<VisualFeatures> {
-    let bytes = std::fs::read(path).with_context(|| format!("read raw {}", path.display()))?;
-    compute_raw_preview_features_from_bytes(&bytes, path)
 }
 
 fn compute_raw_preview_features_from_bytes(bytes: &[u8], path: &Path) -> Result<VisualFeatures> {
@@ -538,6 +512,7 @@ fn is_raw_extension(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn fixture_path(name: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -548,7 +523,12 @@ mod tests {
     #[test]
     fn compute_visual_features_for_arw_raw_preview() {
         let arw = fixture_path("source/DSC00903.ARW");
-        let arw_features = compute_visual_features_for_mime(&arw, "image/x-sony-arw")
+        let arw_bytes = fs::read(&arw).unwrap();
+        let arw_features = compute_visual_features_for_mime_from_bytes(
+            &arw_bytes,
+            &arw,
+            "image/x-sony-arw",
+        )
             .unwrap()
             .expect("ARW preview should decode");
         assert!(!arw_features.phash.is_empty());
@@ -559,7 +539,12 @@ mod tests {
     #[test]
     fn compute_visual_features_for_cr2_raw_preview() {
         let cr2 = fixture_path("source/IMG_5798.CR2");
-        let cr2_features = compute_visual_features_for_mime(&cr2, "image/x-canon-cr2")
+        let cr2_bytes = fs::read(&cr2).unwrap();
+        let cr2_features = compute_visual_features_for_mime_from_bytes(
+            &cr2_bytes,
+            &cr2,
+            "image/x-canon-cr2",
+        )
             .unwrap()
             .expect("CR2 preview should decode");
         assert!(!cr2_features.phash.is_empty());
