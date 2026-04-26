@@ -1,9 +1,9 @@
 use crate::db::FEATURE_VERSION;
 use crate::features::{
-    VisualFeatures, compute_visual_features_for_mime, deserialize_akaze_descriptors,
+    VisualFeatures, compute_visual_features_for_mime_from_bytes, deserialize_akaze_descriptors,
     serialize_akaze_descriptors,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 use std::path::Path;
@@ -58,7 +58,8 @@ impl FeatureLoader {
 }
 
 fn compute_feature(request: FeatureRequest<'_>) -> Result<VisualFeatures> {
-    if let Some(mut computed) = compute_visual_features_for_mime(request.path, request.mime_type)? {
+    let bytes = std::fs::read(request.path).with_context(|| format!("read {}", request.path.display()))?;
+    if let Some(mut computed) = compute_visual_features_for_mime_from_bytes(&bytes, request.path, request.mime_type)? {
         computed.exact_hash = request.exact_hash.to_string();
         return Ok(computed);
     }

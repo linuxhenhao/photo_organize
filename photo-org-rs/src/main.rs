@@ -36,9 +36,9 @@ enum Commands {
         src: Vec<PathBuf>,
         #[arg(long)]
         dest: PathBuf,
-        #[arg(long, default_value_t = 14)]
+        #[arg(long, default_value_t = 10)]
         phash_threshold: u32,
-        #[arg(long, default_value_t = 6)]
+        #[arg(long, default_value_t = 10)]
         akaze_min_matches: usize,
     },
     Initcache {
@@ -46,9 +46,9 @@ enum Commands {
         db: PathBuf,
         #[arg(long)]
         dest: PathBuf,
-        #[arg(long, default_value_t = 14)]
+        #[arg(long, default_value_t = 10)]
         phash_threshold: u32,
-        #[arg(long, default_value_t = 6)]
+        #[arg(long, default_value_t = 10)]
         akaze_min_matches: usize,
     },
     Serve {

@@ -291,9 +291,34 @@ fn import_from_scan_db(
 
     let progress = ProgressReporter::new("import canonicals", grouped.len());
     progress.log_start();
+
+    // --- Start Pre-warming Phase for Import ---
+    let canonical_rows: Vec<ScanRow> = grouped.values().map(|candidates| choose_canonical(candidates)).collect();
+    tracing::info!(count = canonical_rows.len(), "starting parallel feature pre-warming for import");
+    let prewarm_progress = ProgressReporter::new("pre-warm features", canonical_rows.len());
+    prewarm_progress.log_start();
+
+    canonical_rows.par_iter().for_each(|row| {
+        if let Ok(mut conn) = open_catalog_db(catalog_db) {
+            let mut loader = FeatureLoader::default();
+            let _ = loader.load(&mut conn, FeatureRequest {
+                path: Path::new(&row.source_path),
+                mime_type: &row.mime_type,
+                exact_hash: &row.exact_hash,
+                size_bytes: row.size_bytes,
+                phash_hint: &row.phash,
+                phash_bits: row.phash_bits,
+                width: row.width,
+                height: row.height,
+            });
+        }
+        prewarm_progress.item_done();
+    });
+    tracing::info!("feature pre-warming complete");
+    // --- End Pre-warming Phase ---
+
     let mut imported = 0usize;
-    for (_exact_hash, candidates) in grouped {
-        let canonical = choose_canonical(&candidates);
+    for canonical in canonical_rows {
         if target_exists_with_hash(&catalog_conn, &canonical.exact_hash)? {
             tracing::info!(source = %canonical.source_path, hash = %canonical.exact_hash, "skipping already imported exact duplicate");
             progress.item_done();
@@ -331,6 +356,32 @@ fn adopt_discovered_files(
         .iter()
         .filter(|file| file.scan_status == "present")
         .count();
+
+    // --- Start Pre-warming Phase ---
+    tracing::info!(count = total, "starting parallel feature pre-warming");
+    let prewarm_progress = ProgressReporter::new("pre-warm features", total);
+    prewarm_progress.log_start();
+    
+    discovered.par_iter().filter(|file| file.scan_status == "present").for_each(|file| {
+        // Each thread opens its own connection for pre-warming to avoid mutex contention
+        if let Ok(mut conn) = open_catalog_db(catalog_db) {
+            let mut loader = FeatureLoader::default();
+            let _ = loader.load(&mut conn, FeatureRequest {
+                path: &file.path,
+                mime_type: &file.mime_type,
+                exact_hash: &file.exact_hash,
+                size_bytes: file.size_bytes,
+                phash_hint: &file.phash,
+                phash_bits: file.phash_bits,
+                width: file.width,
+                height: file.height,
+            });
+        }
+        prewarm_progress.item_done();
+    });
+    tracing::info!("feature pre-warming complete");
+    // --- End Pre-warming Phase ---
+
     let progress = ProgressReporter::new("initcache adopt", total);
     progress.log_start();
     let mut adopted = 0usize;
@@ -795,23 +846,43 @@ fn load_group_members(conn: &Connection, group_id: i64) -> Result<Vec<TargetRow>
 }
 
 fn choose_primary_member(rows: &[TargetRow]) -> Result<i64> {
-    rows.iter()
-        .max_by(|a, b| {
-            canonical_target_rank(a)
-                .cmp(&canonical_target_rank(b))
-                .then_with(|| a.target_path.cmp(&b.target_path))
-        })
-        .map(|row| row.id)
-        .context("group should contain at least one row")
-}
+    if rows.is_empty() {
+        anyhow::bail!("group should contain at least one row");
+    }
 
-fn canonical_target_rank(row: &TargetRow) -> (bool, i64, i64, i64) {
-    (
-        row.mime_type.starts_with("image/"),
-        row.width * row.height,
-        row.size_bytes,
-        -(row.target_path.len() as i64),
-    )
+    let mut members = rows.to_vec();
+    members.sort_by(|a, b| {
+        let is_img_a = a.mime_type.starts_with("image/");
+        let is_img_b = b.mime_type.starts_with("image/");
+
+        // 1. Image > Non-image
+        if is_img_a != is_img_b {
+            return if is_img_a { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+        }
+
+        // 2. Resolution with 2% tolerance
+        let res_a = a.width * a.height;
+        let res_b = b.width * b.height;
+        let max_res = res_a.max(res_b).max(1);
+        let diff = (res_a - res_b).abs() as f64 / max_res as f64;
+
+        if diff >= 0.02 {
+            return if res_a > res_b { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+        }
+
+        // 3. File size
+        if a.size_bytes != b.size_bytes {
+            return if a.size_bytes > b.size_bytes { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+        }
+
+        // 4. Stable tie-break (shorter path length and then path itself)
+        if a.target_path.len() != b.target_path.len() {
+            return a.target_path.len().cmp(&b.target_path.len());
+        }
+        a.target_path.cmp(&b.target_path)
+    });
+
+    Ok(members[0].id)
 }
 
 #[cfg(test)]

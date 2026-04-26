@@ -8,6 +8,7 @@ use std::path::Path;
 
 const PHASH_MAX_DIMENSION: u32 = 256;
 const AKAZE_MAX_DIMENSION: u32 = 640;
+const MAX_KEYPOINTS_FOR_MATCH: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct VisualFeatures {
@@ -28,7 +29,11 @@ pub fn exact_hash(bytes: &[u8]) -> String {
 
 pub fn compute_visual_features(path: &Path) -> Result<VisualFeatures> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let image = decode_image(&bytes, path)?;
+    compute_visual_features_from_bytes(&bytes, path)
+}
+
+pub fn compute_visual_features_from_bytes(bytes: &[u8], path: &Path) -> Result<VisualFeatures> {
+    let image = decode_image(bytes, path)?;
     Ok(compute_visual_features_from_image(&image))
 }
 
@@ -54,8 +59,17 @@ pub fn compute_visual_features_for_mime(
     path: &Path,
     mime_type: &str,
 ) -> Result<Option<VisualFeatures>> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    compute_visual_features_for_mime_from_bytes(&bytes, path, mime_type)
+}
+
+pub fn compute_visual_features_for_mime_from_bytes(
+    bytes: &[u8],
+    path: &Path,
+    mime_type: &str,
+) -> Result<Option<VisualFeatures>> {
     if is_raw_like_mime(path, mime_type) {
-        match compute_raw_preview_features(path) {
+        match compute_raw_preview_features_from_bytes(bytes, path) {
             Ok(features) => return Ok(Some(features)),
             Err(err) => {
                 tracing::warn!(
@@ -68,7 +82,7 @@ pub fn compute_visual_features_for_mime(
         }
     }
 
-    match compute_visual_features(path) {
+    match compute_visual_features_from_bytes(bytes, path) {
         Ok(features) => Ok(Some(features)),
         Err(err) => {
             tracing::warn!(
@@ -114,7 +128,66 @@ pub fn compute_visual_features_from_image(image: &DynamicImage) -> VisualFeature
     }
 }
 
+pub fn compute_base_features_from_image(image: &DynamicImage) -> VisualFeatures {
+    let width = i64::from(image.width());
+    let height = i64::from(image.height());
+    let phash_image = resize_for_feature(image, PHASH_MAX_DIMENSION);
+    let hasher = HasherConfig::new()
+        .hash_size(8, 8)
+        .hash_alg(HashAlg::Mean)
+        .preproc_dct()
+        .to_hasher();
+    let hash = hasher.hash_image(&phash_image);
+    let phash = hash.to_base64();
+    let phash_bits = i64::try_from(hash.as_bytes().len() * 8).unwrap_or(64);
+
+    VisualFeatures {
+        exact_hash: String::new(),
+        phash,
+        phash_bits,
+        width,
+        height,
+        akaze_keypoints: None,
+        akaze_descriptors: None,
+    }
+}
+
+pub fn compute_base_features_for_mime(
+    path: &Path,
+    mime_type: &str,
+) -> Result<Option<VisualFeatures>> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    compute_base_features_from_bytes(&bytes, path, mime_type)
+}
+
+pub fn compute_base_features_from_bytes(
+    bytes: &[u8],
+    path: &Path,
+    mime_type: &str,
+) -> Result<Option<VisualFeatures>> {
+    if is_raw_like_mime(path, mime_type) {
+        if let Ok(mut raw) = RawImage::open(bytes) {
+            if let Ok(thumbs) = raw.extract_thumbs() {
+                if let Some(preview) = select_best_thumbnail(&thumbs, PHASH_MAX_DIMENSION) {
+                    if let Ok(image) = decode_thumbnail_image(preview) {
+                        return Ok(Some(compute_base_features_from_image(&image)));
+                    }
+                }
+            }
+        }
+    }
+
+    match decode_image(bytes, path) {
+        Ok(image) => Ok(Some(compute_base_features_from_image(&image))),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "base feature extraction failed");
+            Ok(None)
+        }
+    }
+}
+
 pub fn akaze_confirm(a: &VisualFeatures, b: &VisualFeatures, min_matches: usize) -> bool {
+    // 1. Exact pHash match is always trusted
     if !a.phash.is_empty() && a.phash == b.phash {
         return true;
     }
@@ -125,23 +198,46 @@ pub fn akaze_confirm(a: &VisualFeatures, b: &VisualFeatures, min_matches: usize)
     let Some(b_descs) = &b.akaze_descriptors else {
         return false;
     };
-    if a_descs.is_empty() || b_descs.is_empty() {
+
+    // 2. Minimum keypoint count protection
+    if a_descs.len() < 25 || b_descs.len() < 25 {
         return false;
     }
 
-    let mut matches = 0usize;
-    for left in a_descs {
-        if b_descs
-            .iter()
-            .any(|right| hamming_distance(left, right) <= 128)
-        {
-            matches += 1;
-            if matches >= min_matches {
-                return true;
+    // Performance protection: limit number of descriptors to compare
+    let a_subset = &a_descs[..a_descs.len().min(MAX_KEYPOINTS_FOR_MATCH)];
+    let b_subset = &b_descs[..b_descs.len().min(MAX_KEYPOINTS_FOR_MATCH)];
+
+    let mut good_matches = 0usize;
+    let ratio_threshold = 0.75f32;
+
+    // 3. Lowe's Ratio Test
+    for desc_a in a_subset {
+        let mut min_dist1 = u32::MAX;
+        let mut min_dist2 = u32::MAX;
+
+        for desc_b in b_subset {
+            let dist = hamming_distance(desc_a, desc_b);
+            if dist < min_dist1 {
+                min_dist2 = min_dist1;
+                min_dist1 = dist;
+            } else if dist < min_dist2 {
+                min_dist2 = dist;
             }
         }
+
+        // Ratio Test: Best match must be significantly better than the second best
+        if (min_dist1 as f32) < (min_dist2 as f32) * ratio_threshold && min_dist1 < 96 {
+            good_matches += 1;
+        }
     }
-    false
+
+    // 4. Final judgment: absolute count + relative ratio
+    let min_points = a_subset.len().min(b_subset.len());
+    let match_ratio = good_matches as f32 / min_points as f32;
+
+    // We require at least min_matches AND at least 15% of the points to match
+    good_matches >= min_matches && match_ratio >= 0.15
 }
 
 fn hamming_distance(left: &[u8], right: &[u8]) -> u32 {
@@ -223,7 +319,11 @@ fn read_u32(blob: &[u8], offset: &mut usize) -> Result<u32> {
 
 fn compute_raw_preview_features(path: &Path) -> Result<VisualFeatures> {
     let bytes = std::fs::read(path).with_context(|| format!("read raw {}", path.display()))?;
-    let mut raw = RawImage::open(&bytes).with_context(|| format!("open raw {}", path.display()))?;
+    compute_raw_preview_features_from_bytes(&bytes, path)
+}
+
+fn compute_raw_preview_features_from_bytes(bytes: &[u8], path: &Path) -> Result<VisualFeatures> {
+    let mut raw = RawImage::open(bytes).with_context(|| format!("open raw {}", path.display()))?;
     let thumbs = raw
         .extract_thumbs()
         .with_context(|| format!("extract raw previews {}", path.display()))?;

@@ -1,5 +1,5 @@
 use crate::db::{now_string, open_scan_db};
-use crate::features::{VisualFeatures, compute_visual_features_for_mime, exact_hash};
+use crate::features::{VisualFeatures, compute_base_features_from_bytes, exact_hash};
 use crate::util::{
     ProgressReporter, best_effort_mime, fallback_file_time, filename_date, is_excluded_dir,
     parse_exif_datetime, to_bytes_lossless,
@@ -9,8 +9,7 @@ use rayon::prelude::*;
 use rusqlite::{Connection, Transaction, params};
 use serde_json::json;
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::BufReader;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -98,7 +97,7 @@ pub(crate) fn discover_file(path: &Path) -> Result<DiscoveredFile> {
     let created_at =
         metadata_time(path, &meta, &bytes).unwrap_or_else(|| fallback_file_time(&meta));
     let exact_hash = exact_hash(&bytes);
-    let visual = compute_visual_features_for_mime(path, &mime_type)?.unwrap_or(VisualFeatures {
+    let visual = compute_base_features_from_bytes(&bytes, path, &mime_type)?.unwrap_or(VisualFeatures {
         exact_hash: String::new(),
         phash: String::new(),
         phash_bits: 0,
@@ -132,22 +131,20 @@ pub(crate) fn discover_file(path: &Path) -> Result<DiscoveredFile> {
 }
 
 fn metadata_time(path: &Path, meta: &std::fs::Metadata, bytes: &[u8]) -> Option<String> {
-    if let Ok(file) = File::open(path) {
-        let mut reader = BufReader::new(file);
-        if let Ok(exif) = exif::Reader::new().read_from_container(&mut reader) {
-            for tag in [
-                exif::Tag::DateTimeOriginal,
-                exif::Tag::DateTimeDigitized,
-                exif::Tag::DateTime,
-            ] {
-                if let Some(field) = exif.get_field(tag, exif::In::PRIMARY) {
-                    if let exif::Value::Ascii(values) = &field.value {
-                        if let Some(value) =
-                            values.first().and_then(|v| std::str::from_utf8(v).ok())
-                        {
-                            if let Some(ts) = parse_exif_datetime(value) {
-                                return Some(ts);
-                            }
+    let mut cursor = Cursor::new(bytes);
+    if let Ok(exif) = exif::Reader::new().read_from_container(&mut cursor) {
+        for tag in [
+            exif::Tag::DateTimeOriginal,
+            exif::Tag::DateTimeDigitized,
+            exif::Tag::DateTime,
+        ] {
+            if let Some(field) = exif.get_field(tag, exif::In::PRIMARY) {
+                if let exif::Value::Ascii(values) = &field.value {
+                    if let Some(value) =
+                        values.first().and_then(|v| std::str::from_utf8(v).ok())
+                    {
+                        if let Some(ts) = parse_exif_datetime(value) {
+                            return Some(ts);
                         }
                     }
                 }
@@ -160,10 +157,6 @@ fn metadata_time(path: &Path, meta: &std::fs::Metadata, bytes: &[u8]) -> Option<
             meta.modified()
                 .ok()
                 .map(crate::util::system_time_to_rfc3339)
-        })
-        .or_else(|| {
-            let _ = bytes;
-            None
         })
 }
 
