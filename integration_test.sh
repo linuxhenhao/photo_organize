@@ -33,7 +33,7 @@ cd "$SCRIPT_DIR"
 cargo build --bin photo-org
 
 echo "=== Stage 1: SCAN ==="
-"$BIN" scan --scan-db "$SCAN_DB" --src "$SRC_ROOT/source" --src "$SRC_ROOT/source1"
+"$BIN" scan --scan-db "$SCAN_DB" --src "$SRC_ROOT/source" --src "$SRC_ROOT/source1" --src "$SRC_ROOT/problematic_images"
 
 # Verify Scan results
 ROWS=$(sqlite3 "$SCAN_DB" "SELECT COUNT(*) FROM source_items;")

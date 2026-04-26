@@ -6,7 +6,7 @@ use std::process::Command;
 use tempfile::tempdir;
 use walkdir::WalkDir;
 
-fn test_data_root() -> PathBuf {
+fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data")
 }
 

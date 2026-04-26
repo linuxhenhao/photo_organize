@@ -101,6 +101,7 @@ pub(crate) fn discover_file(path: &Path) -> Result<DiscoveredFile> {
         exact_hash: String::new(),
         phash: String::new(),
         phash_bits: 0,
+        phash_value: 0,
         width: 0,
         height: 0,
         size_bytes_hint: 0,

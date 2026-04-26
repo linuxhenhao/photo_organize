@@ -7,3 +7,4 @@ coverage.out
 token.txt
 *.tar
 target/
+test_data/problematic_images/

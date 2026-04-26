@@ -1,7 +1,7 @@
 use crate::db::FEATURE_VERSION;
 use crate::features::{
     VisualFeatures, compute_visual_features_for_mime_from_bytes, deserialize_akaze_descriptors,
-    serialize_akaze_descriptors,
+    serialize_akaze_descriptors, phash_to_u64,
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -84,6 +84,7 @@ fn compute_feature(request: FeatureRequest<'_>) -> Result<VisualFeatures> {
         exact_hash: request.exact_hash.to_string(),
         phash: request.phash_hint.to_string(),
         phash_bits: request.phash_bits,
+        phash_value: phash_to_u64(request.phash_hint).unwrap_or(0),
         width: request.width,
         height: request.height,
         size_bytes_hint: request.size_bytes,
@@ -124,6 +125,7 @@ fn load_cached_feature(
         exact_hash: request.exact_hash.to_string(),
         phash: request.phash_hint.to_string(),
         phash_bits: request.phash_bits,
+        phash_value: phash_to_u64(request.phash_hint).unwrap_or(0),
         width: request.width,
         height: request.height,
         size_bytes_hint: request.size_bytes,

@@ -46,6 +46,7 @@ struct TargetRow {
     group_id: Option<i64>,
     keep_state: String,
     is_group_primary: bool,
+    #[allow(dead_code)]
     group_status: String,
 }
 
@@ -770,7 +771,7 @@ fn process_catalog_input(
         candidate_feature_calls += 1;
         candidate_feature_elapsed += candidate_feature_started.elapsed();
         let candidate_confirm_started = Instant::now();
-        let matched = akaze_confirm(&visual, &candidate_features, akaze_min_matches);
+        let matched = akaze_confirm(&visual, &candidate_features, akaze_min_matches, phash_threshold);
         candidate_confirm_calls += 1;
         candidate_confirm_elapsed += candidate_confirm_started.elapsed();
         if matched {
@@ -1181,7 +1182,7 @@ mod tests {
 
         let a = src.join("2024-06-09_a.jpg");
         let b = src.join("2024-06-09_b.jpg");
-        copy_mock_fixture("img_2023_05_01.jpg", &a);
+        copy_source_fixture("DSC00903.thumb.jpg", &a);
         fs::copy(&a, &b).unwrap();
         append_trailing_byte(&b);
 

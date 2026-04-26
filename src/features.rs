@@ -15,6 +15,7 @@ pub struct VisualFeatures {
     pub exact_hash: String,
     pub phash: String,
     pub phash_bits: i64,
+    pub phash_value: u64,
     pub width: i64,
     pub height: i64,
     pub size_bytes_hint: i64,
@@ -104,12 +105,13 @@ pub fn compute_visual_features_from_image(image: &DynamicImage) -> VisualFeature
     let akaze_image = resize_for_feature(image, AKAZE_MAX_DIMENSION);
     let hasher = HasherConfig::new()
         .hash_size(8, 8)
-        .hash_alg(HashAlg::Mean)
+        .hash_alg(HashAlg::Gradient)
         .preproc_dct()
         .to_hasher();
     let hash = hasher.hash_image(&phash_image);
     let phash = hash.to_base64();
     let phash_bits = i64::try_from(hash.as_bytes().len() * 8).unwrap_or(64);
+    let phash_value = phash_to_u64(&phash).unwrap_or(0);
     let akaze = Akaze::sparse();
     let (keypoints, descriptors) = akaze.extract(&akaze_image);
     let akaze_keypoints = (!keypoints.is_empty()).then_some(keypoints.len());
@@ -122,6 +124,7 @@ pub fn compute_visual_features_from_image(image: &DynamicImage) -> VisualFeature
         exact_hash: String::new(),
         phash,
         phash_bits,
+        phash_value,
         width,
         height,
         size_bytes_hint: 0,
@@ -136,17 +139,19 @@ pub fn compute_base_features_from_image(image: &DynamicImage) -> VisualFeatures 
     let phash_image = resize_for_feature(image, PHASH_MAX_DIMENSION);
     let hasher = HasherConfig::new()
         .hash_size(8, 8)
-        .hash_alg(HashAlg::Mean)
+        .hash_alg(HashAlg::Gradient)
         .preproc_dct()
         .to_hasher();
     let hash = hasher.hash_image(&phash_image);
     let phash = hash.to_base64();
     let phash_bits = i64::try_from(hash.as_bytes().len() * 8).unwrap_or(64);
+    let phash_value = phash_to_u64(&phash).unwrap_or(0);
 
     VisualFeatures {
         exact_hash: String::new(),
         phash,
         phash_bits,
+        phash_value,
         width,
         height,
         size_bytes_hint: 0,
@@ -189,16 +194,22 @@ pub fn compute_base_features_from_bytes(
     }
 }
 
-pub fn akaze_confirm(a: &VisualFeatures, b: &VisualFeatures, min_matches: usize) -> bool {
-    // 1. Exact pHash match is always trusted
-    if !a.phash.is_empty() && a.phash == b.phash {
-        return true;
+pub fn akaze_confirm(a: &VisualFeatures, b: &VisualFeatures, min_matches: usize, phash_threshold: u32) -> bool {
+    let a_descs = a.akaze_descriptors.as_ref();
+    let b_descs = b.akaze_descriptors.as_ref();
+
+    // 1. Special case: if BOTH have zero keypoints (empty/solid color), trust phash match within threshold
+    if a_descs.is_none() && b_descs.is_none() && !a.phash.is_empty() && !b.phash.is_empty() {
+        let distance = (a.phash_value ^ b.phash_value).count_ones();
+        if distance <= phash_threshold {
+            return true;
+        }
     }
 
-    let Some(a_descs) = &a.akaze_descriptors else {
+    let Some(a_descs) = a_descs else {
         return false;
     };
-    let Some(b_descs) = &b.akaze_descriptors else {
+    let Some(b_descs) = b_descs else {
         return false;
     };
 

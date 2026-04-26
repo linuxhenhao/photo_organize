@@ -13,6 +13,30 @@ Current internal structure also includes:
 - `feature_loader`: loads second-stage AKAZE data through a cache-first path and persists it in `catalog.db`.
 - `phash_index`: keeps an in-memory BK-tree over persisted 64-bit pHash values so `import` and `initcache` only run AKAZE on threshold-matching candidates.
 
+## Command Workflows
+
+- **`scan`**: Discovery phase. Walks source directories, extracts metadata (EXIF, hashes, pHash) in parallel, and upserts facts into a `scan-db` (`source_items`).
+- **`import`**: Transformation phase. Runs `scan` to refresh `scan-db`, selects canonical representatives for exact-duplicate groups, pre-warms visual features in parallel, and then serially copies files to the target directory while performing pHash/AKAZE grouping.
+- **`initcache`**: Adoption phase. 
+    - **Stage 1 (Ingest)**: Parallel discovery of existing target files, reusing DB facts if file size/mtime match.
+    - **Stage 2 (Pre-warm)**: Parallel computation of missing visual features for potential duplicates.
+    - **Stage 3 (Grouping)**: Serial grouping and primary-member selection based on resolution and size.
+- **`serve`**: Management phase. Provides a web interface for resolving 'undecided' groups and managing the catalog state.
+
+## Parallel Design & Safety
+
+- **CPU-Bound Parallelism**: Uses `rayon` for recursive directory walking, file hashing, and expensive visual feature extraction (AKAZE).
+- **Database Concurrency**: SQLite is configured with `WAL` mode and `busy_timeout`. To ensure write safety, the application often employs a **worker/consumer pattern** where parallel workers send results through a channel to a single-threaded consumer that performs batch DB writes.
+- **Thread Safety**: Visual feature discovery is read-only and thread-safe. High-level grouping logic is typically executed serially to avoid complex locking on the `group_id` state.
+
+## Storage Structure
+
+- **`catalog.db`**: The central repository for the organized collection.
+    - `target_items`: Current state of all files in the target directory, including `group_id` and `keep_state`.
+    - `feature_cache`: Content-based cache (exact hash + size) for AKAZE keypoints and descriptors to avoid redundant re-decoding.
+    - `operations_log`: Audit log of changes (imports, group resolutions).
+- **`scan-db`**: A source-specific database (usually `import-scan.db`) used as a staging area during `scan` and `import` to track discovered source files and their metadata.
+
 ## Change Rules
 Keep the command set limited to `scan`, `import`, `initcache`, and `serve`.
 Prefer small, explicit modules over a large monolith, and keep path validation and database mutation visible in code.
