@@ -6,9 +6,10 @@ use std::process::Command;
 use tempfile::tempdir;
 use walkdir::WalkDir;
 
-fn fixture_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../test_data")
+fn test_data_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data")
 }
+
 
 fn copy_tree(src: &Path, dst: &Path) {
     for entry in WalkDir::new(src) {

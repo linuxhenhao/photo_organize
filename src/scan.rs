@@ -228,7 +228,7 @@ mod tests {
 
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../test_data/source_mock")
+            .join("test_data/source_mock")
             .join(name)
     }
 
