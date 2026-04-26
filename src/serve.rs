@@ -1,4 +1,5 @@
 use crate::db::{insert_operation, open_catalog_db};
+use crate::interrupt;
 use crate::util::{ensure_under_root, safe_file_name};
 use anyhow::Result;
 use axum::extract::{Path, Query, State};
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 use std::fs;
+use std::future::Future;
 use std::io::Cursor;
 use std::path::{Path as StdPath, PathBuf};
 use tokio::net::TcpListener;
@@ -19,11 +21,7 @@ use tokio::net::TcpListener;
 static UGOS_MODE: Lazy<bool> = Lazy::new(detect_ugos_system);
 
 fn detect_ugos_system() -> bool {
-    let sentinels = [
-        "/usr/ugreen",
-        "/ugreen",
-        "/etc/sysconfig/thumb_core.sh",
-    ];
+    let sentinels = ["/usr/ugreen", "/ugreen", "/etc/sysconfig/thumb_core.sh"];
     sentinels.iter().any(|p| StdPath::new(p).exists())
 }
 
@@ -100,7 +98,17 @@ pub async fn run(db: PathBuf, dest: PathBuf, host: String, port: u16) -> Result<
     let app = router(state);
     let listener = TcpListener::bind((host.as_str(), port)).await?;
     tracing::info!(addr = %listener.local_addr()?, "serve listening (UGOS mode: {})", *UGOS_MODE);
-    axum::serve(listener, app).await?;
+    serve_with_shutdown(listener, app, interrupt::wait()).await?;
+    Ok(())
+}
+
+async fn serve_with_shutdown<F>(listener: TcpListener, app: Router, shutdown: F) -> Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 
@@ -444,9 +452,10 @@ async fn list_groups(
     let conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
     let limit = params.limit.unwrap_or(20);
     let page = params.page.unwrap_or(1).max(1);
-    
-    let total_groups: i64 = conn.query_row(
-        r#"
+
+    let total_groups: i64 = conn
+        .query_row(
+            r#"
         SELECT COUNT(DISTINCT group_id)
         FROM target_items
         WHERE group_id IS NOT NULL
@@ -454,16 +463,18 @@ async fn list_groups(
             SELECT group_id FROM target_items WHERE keep_state = 'undecided'
         )
         "#,
-        [],
-        |row| row.get(0),
-    ).map_err(internal_error)?;
+            [],
+            |row| row.get(0),
+        )
+        .map_err(internal_error)?;
     let total_groups = total_groups as usize;
 
     let total_pages = (total_groups + limit - 1) / limit;
     let offset = (page - 1) * limit;
 
-    let mut stmt = conn.prepare(
-        r#"
+    let mut stmt = conn
+        .prepare(
+            r#"
         SELECT group_id
         FROM target_items
         WHERE group_id IS NOT NULL
@@ -472,10 +483,13 @@ async fn list_groups(
         ORDER BY group_id
         LIMIT ?1 OFFSET ?2
         "#,
-    ).map_err(internal_error)?;
+        )
+        .map_err(internal_error)?;
 
     let ids = stmt
-        .query_map(rusqlite::params![limit as i64, offset as i64], |row| row.get::<_, i64>(0))
+        .query_map(rusqlite::params![limit as i64, offset as i64], |row| {
+            row.get::<_, i64>(0)
+        })
         .map_err(internal_error)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(internal_error)?;
@@ -486,18 +500,21 @@ async fn list_groups(
         groups.push(GroupSummary {
             group_id: id,
             status: "pending".to_string(),
-            members: members.into_iter().map(|m| GroupMember {
-                id: m.id,
-                target_path: m.target_path,
-                mime_type: m.mime_type,
-                keep_state: m.keep_state,
-                is_group_primary: m.is_group_primary,
-                exact_hash: m.exact_hash,
-                phash: m.phash,
-                width: m.width,
-                height: m.height,
-                size_bytes: m.size_bytes,
-            }).collect(),
+            members: members
+                .into_iter()
+                .map(|m| GroupMember {
+                    id: m.id,
+                    target_path: m.target_path,
+                    mime_type: m.mime_type,
+                    keep_state: m.keep_state,
+                    is_group_primary: m.is_group_primary,
+                    exact_hash: m.exact_hash,
+                    phash: m.phash,
+                    width: m.width,
+                    height: m.height,
+                    size_bytes: m.size_bytes,
+                })
+                .collect(),
         });
     }
 
@@ -521,11 +538,12 @@ async fn resolve_bulk(
         let group = load_group_members(&tx, res.group_id).map_err(internal_error)?;
         let kept_set: HashSet<_> = res.kept.iter().collect();
         let rejected_set: HashSet<_> = res.rejected.iter().collect();
-        
+
         let mut moved_paths = Vec::new();
         for member in &group {
             if rejected_set.contains(&member.target_path) {
-                let moved_to = move_to_trash(&state.dest, &member.target_path, res.group_id).map_err(internal_error)?;
+                let moved_to = move_to_trash(&state.dest, &member.target_path, res.group_id)
+                    .map_err(internal_error)?;
                 moved_paths.push((member.id, member.target_path.clone(), moved_to));
             }
         }
@@ -538,18 +556,24 @@ async fn resolve_bulk(
             } else {
                 "undecided"
             };
-            let is_primary = res.primary.as_ref().map(|p| p == &member.target_path).unwrap_or(false);
+            let is_primary = res
+                .primary
+                .as_ref()
+                .map(|p| p == &member.target_path)
+                .unwrap_or(false);
             tx.execute(
                 "UPDATE target_items SET keep_state = ?1, is_group_primary = ?2 WHERE id = ?3",
                 rusqlite::params![keep_state, if is_primary { 1 } else { 0 }, member.id],
-            ).map_err(internal_error)?;
+            )
+            .map_err(internal_error)?;
         }
 
         for (id, _, moved_to) in &moved_paths {
             tx.execute(
                 "UPDATE target_items SET target_path = ?1 WHERE id = ?2",
                 rusqlite::params![moved_to.to_string_lossy(), id],
-            ).map_err(internal_error)?;
+            )
+            .map_err(internal_error)?;
         }
 
         insert_operation(
@@ -672,14 +696,19 @@ async fn image(
 ) -> Result<Response, (StatusCode, String)> {
     let path = PathBuf::from(&query.path);
     ensure_under_root(&state.dest, &path).map_err(internal_error)?;
-    
+
     // 1. Try UGOS thumbnail if enabled
     if *UGOS_MODE {
         if let Some(thumb_path) = resolve_ugos_thumb(&path) {
             if let Ok(bytes) = fs::read(&thumb_path) {
-                let mime = infer::get(&bytes).map(|k| k.mime_type()).unwrap_or("image/jpeg");
+                let mime = infer::get(&bytes)
+                    .map(|k| k.mime_type())
+                    .unwrap_or("image/jpeg");
                 let mut resp = Response::new(axum::body::Body::from(bytes));
-                resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_str(mime).map_err(internal_error)?);
+                resp.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_str(mime).map_err(internal_error)?,
+                );
                 return Ok(resp);
             }
         }
@@ -693,7 +722,12 @@ async fn image(
             let mime = infer::get(&bytes)
                 .map(|k| k.mime_type())
                 .unwrap_or("application/octet-stream");
-            if bytes.len() < 5 * 1024 * 1024 && matches!(mime, "image/jpeg" | "image/png" | "image/webp" | "image/gif") {
+            if bytes.len() < 5 * 1024 * 1024
+                && matches!(
+                    mime,
+                    "image/jpeg" | "image/png" | "image/webp" | "image/gif"
+                )
+            {
                 let mut resp = Response::new(axum::body::Body::from(bytes));
                 resp.headers_mut().insert(
                     axum::http::header::CONTENT_TYPE,
@@ -707,15 +741,19 @@ async fn image(
     // 3. Fallback to on-demand resize (blocking)
     let preview = tokio::task::spawn_blocking(move || {
         let bytes = fs::read(&path).map_err(anyhow::Error::from)?;
-        
+
         let img = if let Ok(img) = image::load_from_memory(&bytes) {
             img
         } else {
             // Try RAW preview
             use rsraw::{RawImage, ThumbFormat};
-            let mut raw = RawImage::open(&bytes).map_err(|e| anyhow::anyhow!("rsraw open error: {}", e))?;
-            let thumbs = raw.extract_thumbs().map_err(|e| anyhow::anyhow!("rsraw extract error: {}", e))?;
-            let thumb = thumbs.iter()
+            let mut raw =
+                RawImage::open(&bytes).map_err(|e| anyhow::anyhow!("rsraw open error: {}", e))?;
+            let thumbs = raw
+                .extract_thumbs()
+                .map_err(|e| anyhow::anyhow!("rsraw extract error: {}", e))?;
+            let thumb = thumbs
+                .iter()
                 .find(|t| matches!(t.format, ThumbFormat::Jpeg))
                 .ok_or_else(|| anyhow::anyhow!("no jpeg preview found in raw"))?;
             image::load_from_memory(&thumb.data).map_err(anyhow::Error::from)?
@@ -746,13 +784,19 @@ fn resolve_ugos_thumb(path: &StdPath) -> Option<PathBuf> {
     let thumb_id = xattr::get(path, "user.thumb.id").ok()??;
     let thumb_id_str = String::from_utf8(thumb_id).ok()?;
     let stem = thumb_id_str.split('-').next()?.trim();
-    if stem.is_empty() { return None; }
+    if stem.is_empty() {
+        return None;
+    }
 
     let candidates = [
-        "_640_40.webp", "_640_40.jpg",
-        "_320_40.webp", "_320_40.jpg",
-        "_mini.webp", "_mini.jpg",
-        "_1600_40.webp", "_1600_40.jpg",
+        "_640_40.webp",
+        "_640_40.jpg",
+        "_320_40.webp",
+        "_320_40.jpg",
+        "_mini.webp",
+        "_mini.jpg",
+        "_1600_40.webp",
+        "_1600_40.jpg",
     ];
 
     for suffix in candidates {
@@ -833,11 +877,14 @@ fn internal_error(err: impl std::fmt::Display) -> (StatusCode, String) {
 mod tests {
     use super::*;
     use crate::db::open_catalog_db;
+    use crate::interrupt;
     use image::{ImageBuffer, Rgb};
     use serde_json::json;
     use std::fs;
     use std::path::Path;
     use tempfile::tempdir;
+    use tokio::sync::oneshot;
+    use tokio::time::{Duration, timeout};
     use tower::ServiceExt;
 
     fn make_png(path: &Path, color: [u8; 3]) {
@@ -969,5 +1016,61 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn serve_stops_when_shutdown_future_resolves() {
+        interrupt::reset();
+
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        open_catalog_db(&db_path).unwrap();
+
+        let state = AppState { db_path, dest };
+        let app = router(state);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            serve_with_shutdown(listener, app, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+
+        let response = reqwest::get(format!("http://{addr}/")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        shutdown_tx.send(()).unwrap();
+
+        let result = timeout(Duration::from_secs(2), server).await;
+        assert!(result.is_ok(), "server did not stop after shutdown signal");
+        let join = result.unwrap().unwrap();
+        assert!(join.is_ok(), "server exited with error: {join:?}");
+    }
+
+    #[tokio::test]
+    async fn serve_stops_when_interrupt_is_requested() {
+        interrupt::reset();
+
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        open_catalog_db(&db_path).unwrap();
+
+        let server = tokio::spawn(run(db_path, dest, "127.0.0.1".to_string(), 0));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        interrupt::request_for_test();
+
+        let result = timeout(Duration::from_secs(2), server).await;
+        interrupt::reset();
+        assert!(result.is_ok(), "serve did not stop after interrupt");
+        let join = result.unwrap().unwrap();
+        assert!(join.is_ok(), "serve exited with error: {join:?}");
     }
 }

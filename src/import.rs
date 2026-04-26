@@ -1,6 +1,7 @@
 use crate::db::{max_group_id, open_catalog_db, open_scan_db};
 use crate::feature_loader::{FeatureLoader, FeatureRequest};
 use crate::features::{VisualFeatures, akaze_confirm, phash_to_u64, supports_visual_features};
+use crate::interrupt;
 use crate::phash_index::PhashIndex;
 use crate::scan::{DiscoveredFile, collect_file_paths, discover_file, run as scan_run};
 use crate::util::{ProgressReporter, date_for_target, safe_file_name, system_time_to_rfc3339};
@@ -202,7 +203,7 @@ pub fn initcache(
 ) -> Result<()> {
     reset_initcache_profile();
     let total_started = Instant::now();
-    
+
     // Stage 1: Parallel Ingest Pass
     let scan_started = Instant::now();
     ingest_pass_initcache(catalog_db, dest)?;
@@ -228,21 +229,21 @@ fn ingest_pass_initcache(catalog_db: &Path, dest: &Path) -> Result<()> {
         let catalog_conn = open_catalog_db(catalog_db)?;
         load_existing_target_facts(&catalog_conn)?
     };
-    
+
     let files = collect_file_paths(&[dest.to_path_buf()])?;
     let total = files.len();
     let progress = ProgressReporter::new("initcache ingest", total);
     progress.log_start();
 
     let (tx_chan, rx_chan) = mpsc::sync_channel::<DiscoveredFile>(100);
-    
+
     // Consumer thread for batch writing
     let db_path = catalog_db.to_path_buf();
     let consumer = std::thread::spawn(move || -> Result<usize> {
         let mut conn = open_catalog_db(&db_path)?;
         let mut buffer = Vec::with_capacity(100);
         let mut count = 0;
-        
+
         while let Ok(item) = rx_chan.recv() {
             buffer.push(item);
             if buffer.len() >= 100 {
@@ -260,6 +261,9 @@ fn ingest_pass_initcache(catalog_db: &Path, dest: &Path) -> Result<()> {
 
     // Producer (Rayon)
     files.par_iter().for_each(|path| {
+        if interrupt::requested() {
+            return;
+        }
         if let Ok(Some(item)) = discover_or_reuse_target_file(path, &existing) {
             let _ = tx_chan.send(item);
         } else {
@@ -270,6 +274,7 @@ fn ingest_pass_initcache(catalog_db: &Path, dest: &Path) -> Result<()> {
 
     drop(tx_chan); // Signal end
     let written = consumer.join().expect("consumer thread panicked")?;
+    interrupt::check()?;
     tracing::info!(written, "ingest pass complete");
     Ok(())
 }
@@ -316,37 +321,39 @@ fn write_ingest_batch(conn: &mut Connection, batch: &[DiscoveredFile]) -> Result
 
 fn prewarm_pass_initcache(catalog_db: &Path, phash_threshold: u32) -> Result<()> {
     let conn = open_catalog_db(catalog_db)?;
-    
+
     // 1. Identify items needing pre-warm
     // Find 'pending' items that have potential pHash matches (other than themselves)
     let mut stmt = conn.prepare(
         "SELECT id, target_path, mime_type, exact_hash, size_bytes, phash, phash_bits, width, height 
          FROM target_items WHERE group_status = 'pending'"
     )?;
-    
+
     struct PendingForPrewarm {
         id: i64,
         file: DiscoveredFile,
     }
 
-    let pending_items = stmt.query_map([], |row| {
-        let id = row.get(0)?;
-        let file = DiscoveredFile {
-            path: PathBuf::from(row.get::<_, String>(1)?),
-            mime_type: row.get(2)?,
-            exact_hash: row.get(3)?,
-            size_bytes: row.get(4)?,
-            phash: row.get(5)?,
-            phash_bits: row.get(6)?,
-            width: row.get(7)?,
-            height: row.get(8)?,
-            scan_status: "present".to_string(),
-            created_at: String::new(),
-            last_scanned_at: String::new(),
-            meta_json: String::new(),
-        };
-        Ok(PendingForPrewarm { id, file })
-    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let pending_items = stmt
+        .query_map([], |row| {
+            let id = row.get(0)?;
+            let file = DiscoveredFile {
+                path: PathBuf::from(row.get::<_, String>(1)?),
+                mime_type: row.get(2)?,
+                exact_hash: row.get(3)?,
+                size_bytes: row.get(4)?,
+                phash: row.get(5)?,
+                phash_bits: row.get(6)?,
+                width: row.get(7)?,
+                height: row.get(8)?,
+                scan_status: "present".to_string(),
+                created_at: String::new(),
+                last_scanned_at: String::new(),
+                meta_json: String::new(),
+            };
+            Ok(PendingForPrewarm { id, file })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     if pending_items.is_empty() {
         return Ok(());
@@ -354,16 +361,18 @@ fn prewarm_pass_initcache(catalog_db: &Path, phash_threshold: u32) -> Result<()>
 
     let phash_index = PhashIndex::from_catalog(&conn)?;
     let mut to_prewarm = Vec::new();
-    
+
     for item in pending_items {
-        if !supports_visual_features(&item.file.path, &item.file.mime_type) || item.file.phash.is_empty() {
+        if !supports_visual_features(&item.file.path, &item.file.mime_type)
+            || item.file.phash.is_empty()
+        {
             continue;
         }
 
         let matches = phash_index.search(&item.file.phash, item.file.phash_bits, phash_threshold);
         // Only pre-warm if there's at least one OTHER file that is similar
         let has_potential_duplicates = matches.iter().any(|&match_id| match_id != item.id);
-        
+
         if has_potential_duplicates {
             // Check if already in feature_cache
             let exists: bool = conn.query_row(
@@ -381,13 +390,16 @@ fn prewarm_pass_initcache(catalog_db: &Path, phash_threshold: u32) -> Result<()>
         return Ok(());
     }
 
-    tracing::info!(count = to_prewarm.len(), "starting targeted feature pre-warm");
+    tracing::info!(
+        count = to_prewarm.len(),
+        "starting targeted feature pre-warm"
+    );
     let progress = ProgressReporter::new("pre-warm", to_prewarm.len());
     progress.log_start();
 
     let (tx_chan, rx_chan) = mpsc::sync_channel::<VisualFeatures>(100);
     let db_path = catalog_db.to_path_buf();
-    
+
     let consumer = std::thread::spawn(move || -> Result<usize> {
         let mut conn = open_catalog_db(&db_path)?;
         let mut buffer = Vec::with_capacity(100);
@@ -408,6 +420,9 @@ fn prewarm_pass_initcache(catalog_db: &Path, phash_threshold: u32) -> Result<()>
     });
 
     to_prewarm.par_iter().for_each(|item| {
+        if interrupt::requested() {
+            return;
+        }
         let loader = FeatureLoader::default();
         // This will force computation if not cached
         if let Ok(feat) = loader.compute_only(item) {
@@ -418,6 +433,7 @@ fn prewarm_pass_initcache(catalog_db: &Path, phash_threshold: u32) -> Result<()>
 
     drop(tx_chan);
     let cached = consumer.join().expect("consumer thread panicked")?;
+    interrupt::check()?;
     tracing::info!(cached, "pre-warm pass complete");
     Ok(())
 }
@@ -438,9 +454,9 @@ fn grouping_pass_initcache(
 ) -> Result<()> {
     let mut conn = open_catalog_db(catalog_db)?;
     let pending = {
-        let mut stmt = conn.prepare(
-            &format!("SELECT {TARGET_ROW_SELECT_COLUMNS} FROM target_items WHERE group_status = 'pending'")
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {TARGET_ROW_SELECT_COLUMNS} FROM target_items WHERE group_status = 'pending'"
+        ))?;
         stmt.query_map([], map_target_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
@@ -456,6 +472,13 @@ fn grouping_pass_initcache(
 
     let mut batch = Vec::new();
     for row in pending {
+        if interrupt::requested() {
+            if !batch.is_empty() {
+                mark_completed_batch(&mut conn, &batch)?;
+            }
+            interrupt::check()?;
+        }
+
         adopt_single(
             &mut conn,
             &mut feature_loader,
@@ -465,7 +488,7 @@ fn grouping_pass_initcache(
             akaze_min_matches,
             "completed",
         )?;
-        
+
         batch.push(row.id);
         if batch.len() >= 100 {
             mark_completed_batch(&mut conn, &batch)?;
@@ -473,7 +496,7 @@ fn grouping_pass_initcache(
         }
         progress.item_done();
     }
-    
+
     if !batch.is_empty() {
         mark_completed_batch(&mut conn, &batch)?;
     }
@@ -484,7 +507,8 @@ fn grouping_pass_initcache(
 fn mark_completed_batch(conn: &mut Connection, ids: &[i64]) -> Result<()> {
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare("UPDATE target_items SET group_status = 'completed' WHERE id = ?1")?;
+        let mut stmt =
+            tx.prepare("UPDATE target_items SET group_status = 'completed' WHERE id = ?1")?;
         for id in ids {
             stmt.execute(params![id])?;
         }
@@ -555,37 +579,53 @@ fn import_from_scan_db(
     progress.log_start();
 
     // --- Start Pre-warming Phase for Import ---
-    let canonical_rows: Vec<ScanRow> = grouped.values().map(|candidates| choose_canonical(candidates)).collect();
-    tracing::info!(count = canonical_rows.len(), "starting parallel feature pre-warming for import");
+    let canonical_rows: Vec<ScanRow> = grouped
+        .values()
+        .map(|candidates| choose_canonical(candidates))
+        .collect();
+    tracing::info!(
+        count = canonical_rows.len(),
+        "starting parallel feature pre-warming for import"
+    );
     let prewarm_progress = ProgressReporter::new("pre-warm features", canonical_rows.len());
     prewarm_progress.log_start();
 
     canonical_rows.par_iter().for_each(|row| {
-        if !supports_visual_features(Path::new(&row.source_path), &row.mime_type) || row.phash.is_empty() {
+        if interrupt::requested() {
+            return;
+        }
+        if !supports_visual_features(Path::new(&row.source_path), &row.mime_type)
+            || row.phash.is_empty()
+        {
             prewarm_progress.item_done();
             return;
         }
 
         if let Ok(mut conn) = open_catalog_db(catalog_db) {
             let mut loader = FeatureLoader::default();
-            let _ = loader.load(&mut conn, FeatureRequest {
-                path: Path::new(&row.source_path),
-                mime_type: &row.mime_type,
-                exact_hash: &row.exact_hash,
-                size_bytes: row.size_bytes,
-                phash_hint: &row.phash,
-                phash_bits: row.phash_bits,
-                width: row.width,
-                height: row.height,
-            });
+            let _ = loader.load(
+                &mut conn,
+                FeatureRequest {
+                    path: Path::new(&row.source_path),
+                    mime_type: &row.mime_type,
+                    exact_hash: &row.exact_hash,
+                    size_bytes: row.size_bytes,
+                    phash_hint: &row.phash,
+                    phash_bits: row.phash_bits,
+                    width: row.width,
+                    height: row.height,
+                },
+            );
         }
         prewarm_progress.item_done();
     });
+    interrupt::check()?;
     tracing::info!("feature pre-warming complete");
     // --- End Pre-warming Phase ---
 
     let mut imported = 0usize;
     for canonical in canonical_rows {
+        interrupt::check()?;
         if target_exists_with_hash(&catalog_conn, &canonical.exact_hash)? {
             tracing::info!(source = %canonical.source_path, hash = %canonical.exact_hash, "skipping already imported exact duplicate");
             progress.item_done();
@@ -799,7 +839,12 @@ fn process_catalog_input(
         candidate_feature_calls += 1;
         candidate_feature_elapsed += candidate_feature_started.elapsed();
         let candidate_confirm_started = Instant::now();
-        let matched = akaze_confirm(&visual, &candidate_features, akaze_min_matches, phash_threshold);
+        let matched = akaze_confirm(
+            &visual,
+            &candidate_features,
+            akaze_min_matches,
+            phash_threshold,
+        );
         candidate_confirm_calls += 1;
         candidate_confirm_elapsed += candidate_confirm_started.elapsed();
         if matched {
@@ -1070,7 +1115,11 @@ fn choose_primary_member(rows: &[TargetRow]) -> Result<i64> {
 
         // 1. Image > Non-image
         if is_img_a != is_img_b {
-            return if is_img_a { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+            return if is_img_a {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
         }
 
         // 2. Resolution with 2% tolerance
@@ -1080,12 +1129,20 @@ fn choose_primary_member(rows: &[TargetRow]) -> Result<i64> {
         let diff = (res_a - res_b).abs() as f64 / max_res as f64;
 
         if diff >= 0.02 {
-            return if res_a > res_b { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+            return if res_a > res_b {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
         }
 
         // 3. File size
         if a.size_bytes != b.size_bytes {
-            return if a.size_bytes > b.size_bytes { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+            return if a.size_bytes > b.size_bytes {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
         }
 
         // 4. Stable tie-break (shorter path length and then path itself)

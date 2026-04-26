@@ -2,6 +2,7 @@ mod db;
 mod feature_loader;
 mod features;
 mod import;
+mod interrupt;
 mod phash_index;
 mod scan;
 mod serve;
@@ -36,7 +37,7 @@ enum Commands {
         src: Vec<PathBuf>,
         #[arg(long)]
         dest: PathBuf,
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 14)]
         phash_threshold: u32,
         #[arg(long, default_value_t = 10)]
         akaze_min_matches: usize,
@@ -46,7 +47,7 @@ enum Commands {
         db: PathBuf,
         #[arg(long)]
         dest: PathBuf,
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 14)]
         phash_threshold: u32,
         #[arg(long, default_value_t = 10)]
         akaze_min_matches: usize,
@@ -74,6 +75,9 @@ async fn main() -> Result<()> {
         .with_target(false)
         .compact()
         .init();
+
+    interrupt::install_handler()?;
+    interrupt::reset();
 
     let cli = Cli::parse();
     match cli.command {

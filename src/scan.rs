@@ -2,6 +2,7 @@ use crate::db::{now_string, open_scan_db};
 use crate::features::{
     VisualFeatures, compute_base_features_from_bytes, exact_hash, supports_visual_features,
 };
+use crate::interrupt;
 use crate::util::{
     ProgressReporter, best_effort_mime, fallback_file_time, filename_date, is_excluded_dir,
     parse_exif_datetime, to_bytes_lossless,
@@ -10,9 +11,9 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::{Connection, Transaction, params};
 use serde_json::json;
-use std::collections::HashSet;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
@@ -32,23 +33,85 @@ pub(crate) struct DiscoveredFile {
 }
 
 pub fn run(scan_db: &Path, roots: &[PathBuf]) -> Result<()> {
-    let mut conn = open_scan_db(scan_db)?;
-    scan_with_conn(&mut conn, roots)
+    scan_with_db_path(scan_db, roots)
 }
 
+#[allow(dead_code)]
 pub fn scan_with_conn(conn: &mut Connection, roots: &[PathBuf]) -> Result<()> {
     let items = collect_discovered_files(roots)?;
-    let visited: HashSet<String> = items
-        .iter()
-        .map(|item| item.path.to_string_lossy().to_string())
-        .collect();
-
-    conn.execute("UPDATE source_items SET scan_status = 'missing'", [])?;
+    interrupt::check()?;
+    let run_id = now_string();
     let tx = conn.transaction()?;
-    upsert_items(&tx, &items)?;
-    mark_seen(&tx, &visited)?;
+    upsert_items(&tx, &items, &run_id)?;
+    mark_missing_unseen(&tx, &run_id)?;
     tx.commit()?;
     tracing::info!(count = items.len(), "scan complete");
+    Ok(())
+}
+
+fn scan_with_db_path(scan_db: &Path, roots: &[PathBuf]) -> Result<()> {
+    let files = collect_file_paths(roots)?;
+    let total = files.len();
+    let run_id = now_string();
+    let progress = ProgressReporter::new("scan discover", total);
+    progress.log_start();
+
+    let (tx_chan, rx_chan) = mpsc::sync_channel::<DiscoveredFile>(100);
+    let db_path = scan_db.to_path_buf();
+    let run_id_for_writer = run_id.clone();
+    let consumer = std::thread::spawn(move || -> Result<usize> {
+        let mut conn = open_scan_db(&db_path)?;
+        let mut buffer = Vec::with_capacity(100);
+        let mut count = 0;
+
+        while let Ok(item) = rx_chan.recv() {
+            buffer.push(item);
+            if buffer.len() >= 100 {
+                write_scan_batch(&mut conn, &buffer, &run_id_for_writer)?;
+                count += buffer.len();
+                buffer.clear();
+            }
+        }
+
+        if !buffer.is_empty() {
+            write_scan_batch(&mut conn, &buffer, &run_id_for_writer)?;
+            count += buffer.len();
+        }
+
+        Ok(count)
+    });
+
+    files.par_iter().for_each(|path| {
+        if interrupt::requested() {
+            return;
+        }
+
+        let result = match discover_file(path) {
+            Ok(mut item) => {
+                item.last_scanned_at = run_id.clone();
+                Some(item)
+            }
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "scan failed");
+                None
+            }
+        };
+
+        if let Some(item) = result {
+            let _ = tx_chan.send(item);
+        }
+        progress.item_done();
+    });
+
+    drop(tx_chan);
+    let written = consumer.join().expect("consumer thread panicked")?;
+    interrupt::check()?;
+
+    let mut conn = open_scan_db(scan_db)?;
+    let tx = conn.transaction()?;
+    mark_missing_unseen(&tx, &run_id)?;
+    tx.commit()?;
+    tracing::info!(written, "scan complete");
     Ok(())
 }
 
@@ -60,6 +123,7 @@ pub(crate) fn collect_file_paths(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
             .into_iter()
             .filter_entry(|e| e.depth() == 0 || !is_excluded_relative(root, e.path()))
         {
+            interrupt::check()?;
             let entry = entry?;
             if !entry.file_type().is_file() || is_excluded_relative(root, entry.path()) {
                 continue;
@@ -70,6 +134,7 @@ pub(crate) fn collect_file_paths(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+#[allow(dead_code)]
 pub(crate) fn collect_discovered_files(roots: &[PathBuf]) -> Result<Vec<DiscoveredFile>> {
     let files = collect_file_paths(roots)?;
     let progress = ProgressReporter::new("scan discover", files.len());
@@ -77,6 +142,9 @@ pub(crate) fn collect_discovered_files(roots: &[PathBuf]) -> Result<Vec<Discover
     let items: Vec<DiscoveredFile> = files
         .par_iter()
         .filter_map(|path| {
+            if interrupt::requested() {
+                return None;
+            }
             let result = match discover_file(path) {
                 Ok(item) => Some(item),
                 Err(err) => {
@@ -88,6 +156,7 @@ pub(crate) fn collect_discovered_files(roots: &[PathBuf]) -> Result<Vec<Discover
             result
         })
         .collect();
+    interrupt::check()?;
     Ok(items)
 }
 
@@ -100,18 +169,17 @@ pub(crate) fn discover_file(path: &Path) -> Result<DiscoveredFile> {
         metadata_time(path, &meta, &bytes).unwrap_or_else(|| fallback_file_time(&meta));
     let exact_hash = exact_hash(&bytes);
     let visual = if supports_visual_features(path, &mime_type) {
-        compute_base_features_from_bytes(&bytes, path, &mime_type)?
-            .unwrap_or(VisualFeatures {
-                exact_hash: String::new(),
-                phash: String::new(),
-                phash_bits: 0,
-                phash_value: 0,
-                width: 0,
-                height: 0,
-                size_bytes_hint: 0,
-                akaze_keypoints: None,
-                akaze_descriptors: None,
-            })
+        compute_base_features_from_bytes(&bytes, path, &mime_type)?.unwrap_or(VisualFeatures {
+            exact_hash: String::new(),
+            phash: String::new(),
+            phash_bits: 0,
+            phash_value: 0,
+            width: 0,
+            height: 0,
+            size_bytes_hint: 0,
+            akaze_keypoints: None,
+            akaze_descriptors: None,
+        })
     } else {
         VisualFeatures {
             exact_hash: String::new(),
@@ -159,9 +227,7 @@ fn metadata_time(path: &Path, meta: &std::fs::Metadata, bytes: &[u8]) -> Option<
         ] {
             if let Some(field) = exif.get_field(tag, exif::In::PRIMARY) {
                 if let exif::Value::Ascii(values) = &field.value {
-                    if let Some(value) =
-                        values.first().and_then(|v| std::str::from_utf8(v).ok())
-                    {
+                    if let Some(value) = values.first().and_then(|v| std::str::from_utf8(v).ok()) {
                         if let Some(ts) = parse_exif_datetime(value) {
                             return Some(ts);
                         }
@@ -179,7 +245,7 @@ fn metadata_time(path: &Path, meta: &std::fs::Metadata, bytes: &[u8]) -> Option<
         })
 }
 
-fn upsert_items(tx: &Transaction<'_>, items: &[DiscoveredFile]) -> Result<()> {
+fn upsert_items(tx: &Transaction<'_>, items: &[DiscoveredFile], run_id: &str) -> Result<()> {
     let mut stmt = tx.prepare(
         r#"
         INSERT INTO source_items (
@@ -215,19 +281,25 @@ fn upsert_items(tx: &Transaction<'_>, items: &[DiscoveredFile]) -> Result<()> {
             item.width,
             item.height,
             item.scan_status,
-            item.last_scanned_at,
+            run_id,
             item.meta_json,
         ])?;
     }
     Ok(())
 }
 
-fn mark_seen(tx: &Transaction<'_>, visited: &HashSet<String>) -> Result<()> {
-    let mut stmt =
-        tx.prepare("UPDATE source_items SET scan_status = 'present' WHERE source_path = ?1")?;
-    for path in visited {
-        stmt.execute(params![path])?;
-    }
+fn mark_missing_unseen(tx: &Transaction<'_>, run_id: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE source_items SET scan_status = 'missing' WHERE last_scanned_at <> ?1",
+        params![run_id],
+    )?;
+    Ok(())
+}
+
+fn write_scan_batch(conn: &mut Connection, batch: &[DiscoveredFile], run_id: &str) -> Result<()> {
+    let tx = conn.transaction()?;
+    upsert_items(&tx, batch, run_id)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -241,6 +313,7 @@ mod tests {
     use super::*;
     use crate::db::open_scan_db;
     use crate::features::exact_hash;
+    use crate::interrupt;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -324,5 +397,35 @@ mod tests {
         assert_eq!(exact_hash, expected_hash);
         assert!(phash.is_empty());
         assert_eq!(phash_bits, 0);
+    }
+
+    #[test]
+    fn interrupted_scan_does_not_mark_unseen_rows_missing() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let a = src.join("2024-06-09_a.png");
+        let b = src.join("2024-06-10_b.png");
+        copy_fixture("img_2023_05_01.jpg", &a);
+        copy_fixture("img_2023_05_02.jpg", &b);
+
+        let scan_db = tmp.path().join("scan.db");
+        run(&scan_db, &[src.clone()]).unwrap();
+
+        fs::remove_file(&b).unwrap();
+        interrupt::request_for_test();
+        let result = run(&scan_db, &[src]);
+        interrupt::reset();
+        assert!(result.is_err());
+
+        let conn = open_scan_db(&scan_db).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT scan_status FROM source_items WHERE source_path = ?1",
+                [b.to_string_lossy().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "present");
     }
 }
