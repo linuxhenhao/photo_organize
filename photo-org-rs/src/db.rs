@@ -68,6 +68,7 @@ fn init_catalog_schema(conn: &Connection) -> Result<()> {
             group_id INTEGER,
             keep_state TEXT NOT NULL DEFAULT 'undecided',
             is_group_primary INTEGER NOT NULL DEFAULT 0,
+            group_status TEXT NOT NULL DEFAULT 'pending',
             origin_source_id INTEGER,
             meta_json TEXT NOT NULL DEFAULT '{}'
         );

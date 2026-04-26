@@ -11,6 +11,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
@@ -45,6 +46,7 @@ struct TargetRow {
     group_id: Option<i64>,
     keep_state: String,
     is_group_primary: bool,
+    group_status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -71,7 +73,7 @@ struct ExistingTargetFact {
 
 const TARGET_ROW_SELECT_COLUMNS: &str = r#"
     id, target_path, size_bytes, mime_type, exact_hash, phash, phash_bits, width, height,
-    group_id, keep_state, is_group_primary
+    group_id, keep_state, is_group_primary, group_status
 "#;
 
 const INITCACHE_PROFILE_ENV: &str = "PHOTO_ORG_PROFILE_INITCACHE";
@@ -199,52 +201,307 @@ pub fn initcache(
 ) -> Result<()> {
     reset_initcache_profile();
     let total_started = Instant::now();
-    let existing = {
-        let catalog_conn = open_catalog_db(catalog_db)?;
-        load_existing_target_facts(&catalog_conn)?
-    };
+    
+    // Stage 1: Parallel Ingest Pass
     let scan_started = Instant::now();
-    let discovered = collect_initcache_discovered_files(&[dest.to_path_buf()], &existing)?;
+    ingest_pass_initcache(catalog_db, dest)?;
     let scan_elapsed = scan_started.elapsed();
+
+    // Stage 2: Targeted Parallel Feature Pre-warm
+    let _prewarm_started = Instant::now();
+    prewarm_pass_initcache(catalog_db, phash_threshold)?;
+
+    // Stage 3: Serial Grouping Pass
     let adopt_started = Instant::now();
-    let result = adopt_discovered_files(catalog_db, discovered, phash_threshold, akaze_min_matches);
+    let result = grouping_pass_initcache(catalog_db, phash_threshold, akaze_min_matches);
     let adopt_elapsed = adopt_started.elapsed();
+
     if initcache_profiling_enabled() {
         log_initcache_profile(scan_elapsed, adopt_elapsed, total_started.elapsed());
     }
     result
 }
 
-fn collect_initcache_discovered_files(
-    roots: &[PathBuf],
-    existing: &HashMap<String, ExistingTargetFact>,
-) -> Result<Vec<DiscoveredFile>> {
-    let files = collect_file_paths(roots)?;
-    let skipped = Mutex::new(0usize);
-    let progress = ProgressReporter::new("initcache discover", files.len());
+fn ingest_pass_initcache(catalog_db: &Path, dest: &Path) -> Result<()> {
+    let existing = {
+        let catalog_conn = open_catalog_db(catalog_db)?;
+        load_existing_target_facts(&catalog_conn)?
+    };
+    
+    let files = collect_file_paths(&[dest.to_path_buf()])?;
+    let total = files.len();
+    let progress = ProgressReporter::new("initcache ingest", total);
     progress.log_start();
-    let items: Vec<DiscoveredFile> = files
-        .par_iter()
-        .filter_map(|path| {
-            let result = match discover_or_reuse_target_file(path, existing) {
-                Ok(Some(item)) => Some(item),
-                Ok(None) => {
-                    let mut guard = skipped.lock().expect("skip count lock poisoned");
-                    *guard += 1;
-                    None
-                }
-                Err(err) => {
-                    tracing::warn!(path = %path.display(), error = %err, "initcache scan failed");
-                    None
-                }
-            };
-            progress.item_done();
-            result
-        })
-        .collect();
-    let skipped = *skipped.lock().expect("skip count lock poisoned");
-    tracing::info!(count = items.len(), skipped, "initcache scan complete");
-    Ok(items)
+
+    let (tx_chan, rx_chan) = mpsc::sync_channel::<DiscoveredFile>(100);
+    
+    // Consumer thread for batch writing
+    let db_path = catalog_db.to_path_buf();
+    let consumer = std::thread::spawn(move || -> Result<usize> {
+        let mut conn = open_catalog_db(&db_path)?;
+        let mut buffer = Vec::with_capacity(100);
+        let mut count = 0;
+        
+        while let Ok(item) = rx_chan.recv() {
+            buffer.push(item);
+            if buffer.len() >= 100 {
+                write_ingest_batch(&mut conn, &buffer)?;
+                count += buffer.len();
+                buffer.clear();
+            }
+        }
+        if !buffer.is_empty() {
+            write_ingest_batch(&mut conn, &buffer)?;
+            count += buffer.len();
+        }
+        Ok(count)
+    });
+
+    // Producer (Rayon)
+    files.par_iter().for_each(|path| {
+        if let Ok(Some(item)) = discover_or_reuse_target_file(path, &existing) {
+            let _ = tx_chan.send(item);
+        } else {
+            // Even if skipped, we notify progress
+        }
+        progress.item_done();
+    });
+
+    drop(tx_chan); // Signal end
+    let written = consumer.join().expect("consumer thread panicked")?;
+    tracing::info!(written, "ingest pass complete");
+    Ok(())
+}
+
+fn write_ingest_batch(conn: &mut Connection, batch: &[DiscoveredFile]) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            r#"
+            INSERT INTO target_items (
+                target_path, size_bytes, mime_type, created_at, exact_hash, phash, phash_bits, width, height,
+                group_id, keep_state, is_group_primary, group_status, origin_source_id, meta_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 'undecided', 0, 'pending', NULL, ?10)
+            ON CONFLICT(target_path) DO UPDATE SET
+                size_bytes = excluded.size_bytes,
+                mime_type = excluded.mime_type,
+                created_at = excluded.created_at,
+                exact_hash = excluded.exact_hash,
+                phash = excluded.phash,
+                phash_bits = excluded.phash_bits,
+                width = excluded.width,
+                height = excluded.height,
+                meta_json = excluded.meta_json
+            "#,
+        )?;
+        for item in batch {
+            stmt.execute(params![
+                item.path.to_string_lossy(),
+                item.size_bytes,
+                item.mime_type,
+                item.created_at,
+                item.exact_hash,
+                item.phash,
+                item.phash_bits,
+                item.width,
+                item.height,
+                item.meta_json,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn prewarm_pass_initcache(catalog_db: &Path, phash_threshold: u32) -> Result<()> {
+    let mut conn = open_catalog_db(catalog_db)?;
+    
+    // 1. Identify items needing pre-warm
+    // Find 'pending' items that have potential pHash matches (other than themselves)
+    let mut stmt = conn.prepare(
+        "SELECT id, target_path, mime_type, exact_hash, size_bytes, phash, phash_bits, width, height 
+         FROM target_items WHERE group_status = 'pending'"
+    )?;
+    
+    struct PendingForPrewarm {
+        id: i64,
+        file: DiscoveredFile,
+    }
+
+    let pending_items = stmt.query_map([], |row| {
+        let id = row.get(0)?;
+        let file = DiscoveredFile {
+            path: PathBuf::from(row.get::<_, String>(1)?),
+            mime_type: row.get(2)?,
+            exact_hash: row.get(3)?,
+            size_bytes: row.get(4)?,
+            phash: row.get(5)?,
+            phash_bits: row.get(6)?,
+            width: row.get(7)?,
+            height: row.get(8)?,
+            scan_status: "present".to_string(),
+            created_at: String::new(),
+            last_scanned_at: String::new(),
+            meta_json: String::new(),
+        };
+        Ok(PendingForPrewarm { id, file })
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if pending_items.is_empty() {
+        return Ok(());
+    }
+
+    let phash_index = PhashIndex::from_catalog(&conn)?;
+    let mut to_prewarm = Vec::new();
+    
+    for item in pending_items {
+        let matches = phash_index.search(&item.file.phash, item.file.phash_bits, phash_threshold);
+        // Only pre-warm if there's at least one OTHER file that is similar
+        let has_potential_duplicates = matches.iter().any(|&match_id| match_id != item.id);
+        
+        if has_potential_duplicates {
+            // Check if already in feature_cache
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM feature_cache WHERE exact_hash = ?1 AND size_bytes = ?2)",
+                params![item.file.exact_hash, item.file.size_bytes],
+                |row| row.get(0)
+            )?;
+            if !exists {
+                to_prewarm.push(item.file);
+            }
+        }
+    }
+
+    if to_prewarm.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(count = to_prewarm.len(), "starting targeted feature pre-warm");
+    let progress = ProgressReporter::new("pre-warm", to_prewarm.len());
+    progress.log_start();
+
+    let (tx_chan, rx_chan) = mpsc::sync_channel::<VisualFeatures>(100);
+    let db_path = catalog_db.to_path_buf();
+    
+    let consumer = std::thread::spawn(move || -> Result<usize> {
+        let mut conn = open_catalog_db(&db_path)?;
+        let mut buffer = Vec::with_capacity(100);
+        let mut count = 0;
+        while let Ok(feat) = rx_chan.recv() {
+            buffer.push(feat);
+            if buffer.len() >= 100 {
+                write_feature_batch(&mut conn, &buffer)?;
+                count += buffer.len();
+                buffer.clear();
+            }
+        }
+        if !buffer.is_empty() {
+            write_feature_batch(&mut conn, &buffer)?;
+            count += buffer.len();
+        }
+        Ok(count)
+    });
+
+    to_prewarm.par_iter().for_each(|item| {
+        let mut loader = FeatureLoader::default();
+        // This will force computation if not cached
+        if let Ok(feat) = loader.compute_only(item) {
+            let _ = tx_chan.send(feat);
+        }
+        progress.item_done();
+    });
+
+    drop(tx_chan);
+    let cached = consumer.join().expect("consumer thread panicked")?;
+    tracing::info!(cached, "pre-warm pass complete");
+    Ok(())
+}
+
+fn write_feature_batch(conn: &mut Connection, batch: &[VisualFeatures]) -> Result<()> {
+    let tx = conn.transaction()?;
+    for feat in batch {
+        crate::feature_loader::save_feature_cache(&tx, feat.size_bytes_hint, feat)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn grouping_pass_initcache(
+    catalog_db: &Path,
+    phash_threshold: u32,
+    akaze_min_matches: usize,
+) -> Result<()> {
+    let mut conn = open_catalog_db(catalog_db)?;
+    let pending = {
+        let mut stmt = conn.prepare(
+            &format!("SELECT {TARGET_ROW_SELECT_COLUMNS} FROM target_items WHERE group_status = 'pending'")
+        )?;
+        stmt.query_map([], map_target_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let mut feature_loader = FeatureLoader::default();
+    let mut phash_index = PhashIndex::from_catalog(&conn)?;
+    let progress = ProgressReporter::new("initcache group", pending.len());
+    progress.log_start();
+
+    let mut batch = Vec::new();
+    for row in pending {
+        adopt_single(
+            &mut conn,
+            &mut feature_loader,
+            &mut phash_index,
+            catalog_input_from_target_row(&row),
+            phash_threshold,
+            akaze_min_matches,
+            "completed",
+        )?;
+        
+        batch.push(row.id);
+        if batch.len() >= 100 {
+            mark_completed_batch(&mut conn, &batch)?;
+            batch.clear();
+        }
+        progress.item_done();
+    }
+    
+    if !batch.is_empty() {
+        mark_completed_batch(&mut conn, &batch)?;
+    }
+
+    Ok(())
+}
+
+fn mark_completed_batch(conn: &mut Connection, ids: &[i64]) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare("UPDATE target_items SET group_status = 'completed' WHERE id = ?1")?;
+        for id in ids {
+            stmt.execute(params![id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn catalog_input_from_target_row(row: &TargetRow) -> CatalogInput {
+    CatalogInput {
+        target_path: PathBuf::from(&row.target_path),
+        size_bytes: row.size_bytes,
+        mime_type: row.mime_type.clone(),
+        created_at: String::new(), // Not needed for grouping
+        exact_hash: row.exact_hash.clone(),
+        phash: row.phash.clone(),
+        phash_bits: row.phash_bits,
+        width: row.width,
+        height: row.height,
+        meta_json: String::new(),
+        origin_source_id: None,
+    }
 }
 
 fn discover_or_reuse_target_file(
@@ -342,70 +599,6 @@ fn import_from_scan_db(
     Ok(())
 }
 
-fn adopt_discovered_files(
-    catalog_db: &Path,
-    discovered: Vec<DiscoveredFile>,
-    phash_threshold: u32,
-    akaze_min_matches: usize,
-) -> Result<()> {
-    let mut catalog_conn = open_catalog_db(catalog_db)?;
-    let mut feature_loader = FeatureLoader::default();
-    let mut phash_index = PhashIndex::from_catalog(&catalog_conn)?;
-
-    let total = discovered
-        .iter()
-        .filter(|file| file.scan_status == "present")
-        .count();
-
-    // --- Start Pre-warming Phase ---
-    tracing::info!(count = total, "starting parallel feature pre-warming");
-    let prewarm_progress = ProgressReporter::new("pre-warm features", total);
-    prewarm_progress.log_start();
-    
-    discovered.par_iter().filter(|file| file.scan_status == "present").for_each(|file| {
-        // Each thread opens its own connection for pre-warming to avoid mutex contention
-        if let Ok(mut conn) = open_catalog_db(catalog_db) {
-            let mut loader = FeatureLoader::default();
-            let _ = loader.load(&mut conn, FeatureRequest {
-                path: &file.path,
-                mime_type: &file.mime_type,
-                exact_hash: &file.exact_hash,
-                size_bytes: file.size_bytes,
-                phash_hint: &file.phash,
-                phash_bits: file.phash_bits,
-                width: file.width,
-                height: file.height,
-            });
-        }
-        prewarm_progress.item_done();
-    });
-    tracing::info!("feature pre-warming complete");
-    // --- End Pre-warming Phase ---
-
-    let progress = ProgressReporter::new("initcache adopt", total);
-    progress.log_start();
-    let mut adopted = 0usize;
-    for file in discovered
-        .into_iter()
-        .filter(|file| file.scan_status == "present")
-    {
-        let visual = adopt_single(
-            &mut catalog_conn,
-            &mut feature_loader,
-            &mut phash_index,
-            catalog_input_from_discovered_file(&file),
-            phash_threshold,
-            akaze_min_matches,
-        )?;
-        adopted += 1;
-        tracing::info!(target = %visual.target_path, group_id = ?visual.group_id, "adopted target file");
-        progress.item_done();
-    }
-
-    tracing::info!(db = %catalog_db.display(), adopted, "initcache complete");
-    Ok(())
-}
-
 fn load_scan_rows(conn: &Connection) -> Result<Vec<ScanRow>> {
     let mut stmt = conn.prepare(
         r#"
@@ -487,6 +680,7 @@ fn import_single(
         input,
         phash_threshold,
         akaze_min_matches,
+        "completed",
     )
 }
 
@@ -497,6 +691,7 @@ fn adopt_single(
     input: CatalogInput,
     phash_threshold: u32,
     akaze_min_matches: usize,
+    group_status: &str,
 ) -> Result<TargetRow> {
     process_catalog_input(
         conn,
@@ -505,6 +700,7 @@ fn adopt_single(
         input,
         phash_threshold,
         akaze_min_matches,
+        group_status,
     )
 }
 
@@ -515,6 +711,7 @@ fn process_catalog_input(
     input: CatalogInput,
     phash_threshold: u32,
     akaze_min_matches: usize,
+    group_status: &str,
 ) -> Result<TargetRow> {
     let input_feature_started = Instant::now();
     let visual = feature_loader.load(
@@ -598,7 +795,7 @@ fn process_catalog_input(
 
     let db_tx_started = Instant::now();
     let tx = conn.transaction()?;
-    upsert_catalog_item(&tx, &input, &visual)?;
+    upsert_catalog_item(&tx, &input, &visual, group_status)?;
     let inserted = load_target_by_path(&tx, input.target_path.as_path())?;
     let target_row = if matches.is_empty() {
         tx.execute(
@@ -733,13 +930,14 @@ fn upsert_catalog_item(
     tx: &Connection,
     input: &CatalogInput,
     visual: &VisualFeatures,
+    group_status: &str,
 ) -> Result<()> {
     tx.execute(
         r#"
         INSERT INTO target_items (
             target_path, size_bytes, mime_type, created_at, exact_hash, phash, phash_bits, width, height,
-            group_id, keep_state, is_group_primary, origin_source_id, meta_json
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 'undecided', 0, ?10, ?11)
+            group_id, keep_state, is_group_primary, group_status, origin_source_id, meta_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 'undecided', 0, ?10, ?11, ?12)
         ON CONFLICT(target_path) DO UPDATE SET
             size_bytes = excluded.size_bytes,
             mime_type = excluded.mime_type,
@@ -762,6 +960,7 @@ fn upsert_catalog_item(
             visual.phash_bits,
             visual.width,
             visual.height,
+            group_status,
             input.origin_source_id,
             input.meta_json,
         ],
@@ -814,6 +1013,7 @@ fn map_target_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TargetRow> {
         group_id: row.get(9)?,
         keep_state: row.get(10)?,
         is_group_primary: row.get::<_, i64>(11)? != 0,
+        group_status: row.get(12)?,
     })
 }
 

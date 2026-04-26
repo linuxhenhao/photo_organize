@@ -50,10 +50,26 @@ impl FeatureLoader {
             return Ok(cached);
         }
 
-        let computed = compute_feature(request)?;
+        let mut computed = compute_feature(request)?;
+        computed.size_bytes_hint = request.size_bytes;
         save_feature_cache(conn, request.size_bytes, &computed)?;
         self.memo.insert(key, computed.clone());
         Ok(computed)
+    }
+
+    pub fn compute_only(&self, item: &crate::scan::DiscoveredFile) -> Result<VisualFeatures> {
+        let mut feat = compute_feature(FeatureRequest {
+            path: &item.path,
+            mime_type: &item.mime_type,
+            exact_hash: &item.exact_hash,
+            size_bytes: item.size_bytes,
+            phash_hint: &item.phash,
+            phash_bits: item.phash_bits,
+            width: item.width,
+            height: item.height,
+        })?;
+        feat.size_bytes_hint = item.size_bytes;
+        Ok(feat)
     }
 }
 
@@ -70,6 +86,7 @@ fn compute_feature(request: FeatureRequest<'_>) -> Result<VisualFeatures> {
         phash_bits: request.phash_bits,
         width: request.width,
         height: request.height,
+        size_bytes_hint: request.size_bytes,
         akaze_keypoints: None,
         akaze_descriptors: None,
     })
@@ -109,12 +126,13 @@ fn load_cached_feature(
         phash_bits: request.phash_bits,
         width: request.width,
         height: request.height,
+        size_bytes_hint: request.size_bytes,
         akaze_keypoints: keypoints.and_then(|value| usize::try_from(value).ok()),
         akaze_descriptors: descriptors,
     }))
 }
 
-fn save_feature_cache(conn: &Connection, size_bytes: i64, visual: &VisualFeatures) -> Result<()> {
+pub fn save_feature_cache(conn: &Connection, size_bytes: i64, visual: &VisualFeatures) -> Result<()> {
     let descriptors = visual
         .akaze_descriptors
         .as_ref()

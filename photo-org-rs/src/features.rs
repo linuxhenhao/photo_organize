@@ -17,6 +17,7 @@ pub struct VisualFeatures {
     pub phash_bits: i64,
     pub width: i64,
     pub height: i64,
+    pub size_bytes_hint: i64,
     pub akaze_keypoints: Option<usize>,
     pub akaze_descriptors: Option<Vec<Vec<u8>>>,
 }
@@ -123,6 +124,7 @@ pub fn compute_visual_features_from_image(image: &DynamicImage) -> VisualFeature
         phash_bits,
         width,
         height,
+        size_bytes_hint: 0,
         akaze_keypoints,
         akaze_descriptors,
     }
@@ -147,6 +149,7 @@ pub fn compute_base_features_from_image(image: &DynamicImage) -> VisualFeatures 
         phash_bits,
         width,
         height,
+        size_bytes_hint: 0,
         akaze_keypoints: None,
         akaze_descriptors: None,
     }

@@ -103,6 +103,7 @@ pub(crate) fn discover_file(path: &Path) -> Result<DiscoveredFile> {
         phash_bits: 0,
         width: 0,
         height: 0,
+        size_bytes_hint: 0,
         akaze_keypoints: None,
         akaze_descriptors: None,
     });
