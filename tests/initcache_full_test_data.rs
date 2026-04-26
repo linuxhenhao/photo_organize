@@ -10,7 +10,6 @@ fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data")
 }
 
-
 fn copy_tree(src: &Path, dst: &Path) {
     for entry in WalkDir::new(src) {
         let entry = entry.expect("walk fixture tree");

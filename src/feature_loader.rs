@@ -84,8 +84,11 @@ impl FeatureLoader {
 }
 
 fn compute_feature(request: FeatureRequest<'_>) -> Result<VisualFeatures> {
-    let bytes = std::fs::read(request.path).with_context(|| format!("read {}", request.path.display()))?;
-    if let Some(mut computed) = compute_visual_features_for_mime_from_bytes(&bytes, request.path, request.mime_type)? {
+    let bytes =
+        std::fs::read(request.path).with_context(|| format!("read {}", request.path.display()))?;
+    if let Some(mut computed) =
+        compute_visual_features_for_mime_from_bytes(&bytes, request.path, request.mime_type)?
+    {
         computed.exact_hash = request.exact_hash.to_string();
         return Ok(computed);
     }
@@ -148,7 +151,11 @@ fn load_cached_feature(
     }))
 }
 
-pub fn save_feature_cache(conn: &Connection, size_bytes: i64, visual: &VisualFeatures) -> Result<()> {
+pub fn save_feature_cache(
+    conn: &Connection,
+    size_bytes: i64,
+    visual: &VisualFeatures,
+) -> Result<()> {
     let descriptors = visual
         .akaze_descriptors
         .as_ref()

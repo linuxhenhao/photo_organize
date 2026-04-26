@@ -68,22 +68,31 @@ fn regression_grouping_issue_efficient() {
         .output()
         .expect("run photo-org initcache");
 
-    assert!(output.status.success(), "initcache failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "initcache failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let conn = Connection::open(&db).expect("open catalog db");
 
     let mut stmt = conn
         .prepare("SELECT group_id, target_path FROM target_items")
         .expect("prepare stmt");
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?))
-    })
-    .expect("query map");
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("query map");
 
     let mut assignments: HashMap<String, Option<i64>> = HashMap::new();
     for row in rows {
         let (group_id, path) = row.unwrap();
-        let filename = Path::new(&path).file_name().unwrap().to_string_lossy().to_string();
+        let filename = Path::new(&path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         assignments.insert(filename, group_id);
     }
 
@@ -99,8 +108,8 @@ fn regression_grouping_issue_efficient() {
         }
 
         if case.expect_grouped {
-            let first_group = assignments[case.files[0]]
-                .expect("expected grouped file to have group_id");
+            let first_group =
+                assignments[case.files[0]].expect("expected grouped file to have group_id");
             for file in &case.files[1..] {
                 assert_eq!(
                     assignments[*file],
@@ -127,8 +136,7 @@ fn regression_grouping_issue_efficient() {
     }
 
     assert_ne!(
-        positive_group_ids["1707"],
-        positive_group_ids["2197"],
+        positive_group_ids["1707"], positive_group_ids["2197"],
         "1707 and 2197 should not collapse into the same group"
     );
 }

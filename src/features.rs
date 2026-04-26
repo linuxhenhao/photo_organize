@@ -181,7 +181,12 @@ pub fn compute_base_features_from_bytes(
     }
 }
 
-pub fn akaze_confirm(a: &VisualFeatures, b: &VisualFeatures, min_matches: usize, phash_threshold: u32) -> bool {
+pub fn akaze_confirm(
+    a: &VisualFeatures,
+    b: &VisualFeatures,
+    min_matches: usize,
+    phash_threshold: u32,
+) -> bool {
     let a_descs = a.akaze_descriptors.as_ref();
     let b_descs = b.akaze_descriptors.as_ref();
 
@@ -457,10 +462,7 @@ pub(crate) fn supports_visual_features(path: &Path, mime_type: &str) -> bool {
         return true;
     }
 
-    mime_type
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("image/")
+    mime_type.trim().to_ascii_lowercase().starts_with("image/")
 }
 
 fn is_raw_like_mime(path: &Path, mime_type: &str) -> bool {
@@ -524,13 +526,10 @@ mod tests {
     fn compute_visual_features_for_arw_raw_preview() {
         let arw = fixture_path("source/DSC00903.ARW");
         let arw_bytes = fs::read(&arw).unwrap();
-        let arw_features = compute_visual_features_for_mime_from_bytes(
-            &arw_bytes,
-            &arw,
-            "image/x-sony-arw",
-        )
-            .unwrap()
-            .expect("ARW preview should decode");
+        let arw_features =
+            compute_visual_features_for_mime_from_bytes(&arw_bytes, &arw, "image/x-sony-arw")
+                .unwrap()
+                .expect("ARW preview should decode");
         assert!(!arw_features.phash.is_empty());
         assert!(arw_features.width > 0);
         assert!(arw_features.height > 0);
@@ -540,13 +539,10 @@ mod tests {
     fn compute_visual_features_for_cr2_raw_preview() {
         let cr2 = fixture_path("source/IMG_5798.CR2");
         let cr2_bytes = fs::read(&cr2).unwrap();
-        let cr2_features = compute_visual_features_for_mime_from_bytes(
-            &cr2_bytes,
-            &cr2,
-            "image/x-canon-cr2",
-        )
-            .unwrap()
-            .expect("CR2 preview should decode");
+        let cr2_features =
+            compute_visual_features_for_mime_from_bytes(&cr2_bytes, &cr2, "image/x-canon-cr2")
+                .unwrap()
+                .expect("CR2 preview should decode");
         assert!(!cr2_features.phash.is_empty());
         assert!(cr2_features.width > 0);
         assert!(cr2_features.height > 0);
