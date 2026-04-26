@@ -1,0 +1,56 @@
+# Module Guidelines
+
+## Scope
+`photo-org-rs` is the Rust rewrite workspace for the photo organizer spec.
+
+It owns the new `photo-org` binary, the SQLite schema for `catalog.db` and scan databases, source scanning, target import, target adoption via `initcache`, and the local duplicate-resolution web server.
+It also handles RAW preview extraction in pure Rust when possible so camera RAW files can participate in scan/import grouping without shelling out to `exiftool`.
+`initcache` should scan target-file facts directly into `catalog.db.target_items`; target adoption must not depend on a persistent target-side `source_items` scan database such as `initcache-scan.db`.
+Repeated `initcache` runs should reuse prior `target_items` facts when file `size_bytes` and stored `modified_at` are unchanged, and only fall back to re-reading file content and recomputing hashes when that fingerprint changes.
+Long-running `scan`, `import`, and `initcache` paths should emit periodic progress logs with total, processed, and remaining counts so operators can tell that work is advancing.
+
+Current internal structure also includes:
+- `feature_loader`: loads second-stage AKAZE data through a cache-first path and persists it in `catalog.db`.
+- `phash_index`: keeps an in-memory BK-tree over persisted 64-bit pHash values so `import` and `initcache` only run AKAZE on threshold-matching candidates.
+
+## Change Rules
+Keep the command set limited to `scan`, `import`, `initcache`, and `serve`.
+Prefer small, explicit modules over a large monolith, and keep path validation and database mutation visible in code.
+
+The rewrite should stay local-first and avoid reintroducing the removed Go maintenance commands.
+
+When touching duplicate matching:
+- Keep pHash coarse filtering cheap and in-memory.
+- Treat `exact_hash`, `pHash`, `phash_bits`, and image dimensions as base item attributes stored on `source_items` or `target_items`, not as second-stage feature-cache payload.
+- Do not make callers care whether second-stage AKAZE data came from memory, SQLite, or a fresh decode; `feature_loader` owns that decision.
+- Cache keys for persisted AKAZE data must be content-based, not path-based. Use file content hash plus size so renamed or re-adopted files can reuse the expensive second-stage work safely.
+
+## RAW Performance
+RAW preview extraction itself is cheap in this crate; the expensive work is decoding oversized embedded previews and running visual features on them.
+
+Measured on committed fixtures in `../test_data`:
+- `rsraw` open + `extract_thumbs()` for the ARW and CR2 fixtures together took about `0.16s`.
+- ARW large embedded JPEG `7008x4672`: decode about `6.29s`, resize to `960` about `2.48s`.
+- ARW medium embedded JPEG `1616x1080`: decode about `0.37s`, resize to `960` about `0.23s`.
+- CR2 large embedded JPEG `5184x3456`: decode about `5.09s`, resize to `960` about `1.42s`.
+- Extra downsize from `960` to `256` was only about `0.05s`, so the main cost is choosing and decoding the wrong preview, not maintaining separate pHash and AKAZE sizes.
+
+When handling RAW files:
+- Prefer the smallest embedded preview whose max dimension is at least the AKAZE target size.
+- If no preview reaches the AKAZE target, use the largest available preview.
+- Do not decode the largest full preview by default when a medium preview is available.
+- Do not upscale tiny previews.
+- Keep pHash and AKAZE target sizes separate when possible.
+
+Current sizing guidance for this crate:
+- `pHash`: target about `256px` max dimension.
+- `AKAZE`: target about `640px` max dimension for better speed on current fixtures.
+- If a single shared size is required, prefer something around `640px`; `256px` is too small for reliable AKAZE.
+
+## Testing
+Add focused Rust tests next to the implementation or under `tests/` when behavior changes.
+Run `cargo test` for every code change in this crate.
+
+For Bookworm-targeted release builds inside Docker, use `./container_build.sh`. It expects a build image such as `photo-organize-bookworm-gocv:latest` and mounts the host Cargo registry and git caches into the container so repeated builds do not re-download Rust dependencies.
+
+The expensive full-tree `initcache` regression lives in `tests/initcache_full_test_data.rs` and is intentionally `#[ignore]`; run it explicitly when changing import/initcache candidate selection, feature caching, or target adoption behavior.

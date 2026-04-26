@@ -1,4 +1,5 @@
 ARG OPENCV_VERSION=4.10.0
+ARG RUST_TOOLCHAIN=stable
 
 FROM debian:bookworm AS opencv-builder
 
@@ -62,10 +63,16 @@ RUN cmake -S "/tmp/opencv-${OPENCV_VERSION}" -B /tmp/opencv-build -G Ninja \
 FROM golang:1.24-bookworm
 
 ARG OPENCV_VERSION
+ARG RUST_TOOLCHAIN
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     ca-certificates \
+    clang \
+    cmake \
+    curl \
     exiftool \
+    git \
     libatlas-base-dev \
     libavcodec59 \
     libavformat59 \
@@ -82,9 +89,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libtbb12 \
     libtiff6 \
     libwebp7 \
+    libclang-dev \
+    make \
     pkg-config \
     zlib1g \
     && rm -rf /var/lib/apt/lists/*
+
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN}"
 
 COPY --from=opencv-builder /usr/local /usr/local
 
@@ -93,8 +104,10 @@ WORKDIR /workspace
 ENV CGO_ENABLED=1
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig
 ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64
-ENV PATH=/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PATH=/root/.cargo/bin:/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV OPENCV_VERSION=${OPENCV_VERSION}
+ENV RUSTUP_HOME=/root/.rustup
+ENV CARGO_HOME=/root/.cargo
 
 RUN mkdir -p /usr/local/lib/pkgconfig && \
     libs="$(find /usr/local/lib -maxdepth 1 -name 'libopencv_*.so' -printf '%f\n' | sed -e 's/^lib//' -e 's/\.so$//' | sort | sed 's/^/-l/' | tr '\n' ' ')" && \

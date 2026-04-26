@@ -6,3 +6,4 @@ output/
 coverage.out
 token.txt
 *.tar
+target/
