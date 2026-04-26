@@ -75,6 +75,6 @@ Current sizing guidance for this crate:
 Add focused Rust tests next to the implementation or under `tests/` when behavior changes.
 Run `cargo test` for every code change in this crate.
 
-For Bookworm-targeted release builds inside Docker, use `./container_build.sh`. It expects a build image such as `photo-organize-bookworm-gocv:latest` and mounts the host Cargo registry and git caches into the container so repeated builds do not re-download Rust dependencies.
+For Bookworm-targeted release builds inside Docker, use `./container_build.sh`. It uses the `photo-org-build:bookworm` image (building it automatically if missing) and mounts the host Cargo registry and git caches into the container so repeated builds do not re-download Rust dependencies.
 
 The expensive full-tree `initcache` regression lives in `tests/initcache_full_test_data.rs` and is intentionally `#[ignore]`; run it explicitly when changing import/initcache candidate selection, feature caching, or target adoption behavior.

@@ -1,0 +1,7 @@
+target/
+.git/
+.cargo/
+test_data/
+problematic_images/
+*.db
+*.txt

@@ -2,9 +2,8 @@
 
 set -euo pipefail
 
-CRATE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_DIR=$(cd "$CRATE_DIR/.." && pwd)
-IMAGE="${DOCKER_RUST_BUILD_IMAGE:-photo-organize-bookworm-gocv:latest}"
+REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+IMAGE="${DOCKER_RUST_BUILD_IMAGE:-photo-org-build:bookworm}"
 CARGO_CACHE_ROOT="${CARGO_CACHE_ROOT:-$HOME/.cargo}"
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -12,21 +11,22 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 1
 fi
 
+# Build the image if it doesn't exist
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    echo "docker image not found: $IMAGE" >&2
-    echo "Set DOCKER_RUST_BUILD_IMAGE or build/tag the image first." >&2
-    exit 1
+    echo "Building build image: $IMAGE..."
+    docker build -t "$IMAGE" "$REPO_DIR"
 fi
 
 mkdir -p \
     "$CARGO_CACHE_ROOT/registry" \
     "$CARGO_CACHE_ROOT/git"
 
+echo "Running release build in container..."
 docker run --rm \
-    --workdir /workspace/photo-org-rs \
+    --user "$(id -u):$(id -g)" \
+    --workdir /workspace \
     -e "CARGO_HOME=/cargo-home" \
     -e "CARGO_NET_GIT_FETCH_WITH_CLI=true" \
-    -e "PATH=/root/.cargo/bin:/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     --volume "$REPO_DIR:/workspace" \
     --volume "$CARGO_CACHE_ROOT/registry:/cargo-home/registry" \
     --volume "$CARGO_CACHE_ROOT/git:/cargo-home/git" \
