@@ -1,5 +1,5 @@
 use crate::db::{max_group_id, open_catalog_db, open_scan_db};
-use crate::feature_loader::{FeatureLoader, FeatureRequest};
+use crate::feature_loader::{FeatureLoader, FeatureRequest, has_reusable_feature_cache};
 use crate::features::{
     AkazeStatus, VisualFeatures, akaze_confirm, phash_to_u64, supports_visual_features,
 };
@@ -377,12 +377,7 @@ fn prewarm_pass_initcache(catalog_db: &Path, phash_threshold: u32) -> Result<()>
 
         if has_potential_duplicates {
             // Check if already in feature_cache
-            let exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM feature_cache WHERE exact_hash = ?1 AND size_bytes = ?2)",
-                params![item.file.exact_hash, item.file.size_bytes],
-                |row| row.get(0)
-            )?;
-            if !exists {
+            if !has_reusable_feature_cache(&conn, &item.file.exact_hash, item.file.size_bytes)? {
                 to_prewarm.push(item.file);
             }
         }

@@ -18,6 +18,8 @@ pub enum AkazeStatus {
     Pending,
     Ready,
     NoKeypoints,
+    TooSmall,
+    DecodeError,
     Unavailable,
 }
 
@@ -27,6 +29,8 @@ impl AkazeStatus {
             Self::Pending => "pending",
             Self::Ready => "ready",
             Self::NoKeypoints => "no_keypoints",
+            Self::TooSmall => "too_small",
+            Self::DecodeError => "decode_error",
             Self::Unavailable => "unavailable",
         }
     }
@@ -36,9 +40,15 @@ impl AkazeStatus {
             "pending" => Some(Self::Pending),
             "ready" => Some(Self::Ready),
             "no_keypoints" => Some(Self::NoKeypoints),
+            "too_small" => Some(Self::TooSmall),
+            "decode_error" => Some(Self::DecodeError),
             "unavailable" => Some(Self::Unavailable),
             _ => None,
         }
+    }
+
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Pending | Self::DecodeError)
     }
 }
 
@@ -157,7 +167,7 @@ fn extract_akaze_features(
     image: &DynamicImage,
 ) -> (AkazeStatus, Option<usize>, Option<Vec<Vec<u8>>>) {
     if image.width().min(image.height()) < AKAZE_MIN_DIMENSION {
-        return (AkazeStatus::Unavailable, None, None);
+        return (AkazeStatus::TooSmall, None, None);
     }
 
     let akaze = Akaze::sparse();
@@ -169,14 +179,14 @@ fn extract_akaze_features(
             height = image.height(),
             "akaze extractor panicked; continuing without descriptors"
         );
-        return (AkazeStatus::Unavailable, None, None);
+        return (AkazeStatus::DecodeError, None, None);
     };
 
     let akaze_keypoints = (!keypoints.is_empty()).then_some(keypoints.len());
     let (akaze_status, akaze_descriptors) = if keypoints.is_empty() && descriptors.is_empty() {
         (AkazeStatus::NoKeypoints, None)
     } else if descriptors.is_empty() {
-        (AkazeStatus::Unavailable, None)
+        (AkazeStatus::DecodeError, None)
     } else {
         (
             AkazeStatus::Ready,
@@ -743,7 +753,7 @@ mod tests {
         let features = compute_visual_features_from_image(&image);
 
         assert!(!features.phash.is_empty());
-        assert_eq!(features.akaze_status, AkazeStatus::Unavailable);
+        assert_eq!(features.akaze_status, AkazeStatus::TooSmall);
         assert!(features.akaze_keypoints.is_none());
         assert!(features.akaze_descriptors.is_none());
     }
@@ -759,7 +769,7 @@ mod tests {
         let features = compute_visual_features_from_image(&image);
 
         assert!(!features.phash.is_empty());
-        assert_eq!(features.akaze_status, AkazeStatus::Unavailable);
+        assert_eq!(features.akaze_status, AkazeStatus::TooSmall);
         assert!(features.akaze_keypoints.is_none());
         assert!(features.akaze_descriptors.is_none());
     }

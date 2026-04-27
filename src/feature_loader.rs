@@ -85,8 +85,17 @@ impl FeatureLoader {
 }
 
 fn compute_feature(request: FeatureRequest<'_>) -> Result<VisualFeatures> {
-    let bytes =
-        std::fs::read(request.path).with_context(|| format!("read {}", request.path.display()))?;
+    let bytes = match std::fs::read(request.path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                path = %request.path.display(),
+                error = %err,
+                "feature computation failed while reading file"
+            );
+            return Ok(fallback_features(request, AkazeStatus::DecodeError));
+        }
+    };
     if let Some(mut computed) =
         compute_visual_features_for_mime_from_bytes(&bytes, request.path, request.mime_type)?
     {
@@ -94,7 +103,7 @@ fn compute_feature(request: FeatureRequest<'_>) -> Result<VisualFeatures> {
         return Ok(computed);
     }
 
-    Ok(fallback_features(request, AkazeStatus::Unavailable))
+    Ok(fallback_features(request, AkazeStatus::DecodeError))
 }
 
 fn fallback_features(request: FeatureRequest<'_>, akaze_status: AkazeStatus) -> VisualFeatures {
@@ -139,7 +148,7 @@ fn load_cached_feature(
     };
     let status = AkazeStatus::from_db_str(&status_text)
         .with_context(|| format!("unknown akaze status {status_text}"))?;
-    if status == AkazeStatus::Pending {
+    if status.is_retryable() {
         return Ok(None);
     }
     let descriptors = descriptors_blob
@@ -158,6 +167,30 @@ fn load_cached_feature(
         akaze_keypoints: keypoints.and_then(|value| usize::try_from(value).ok()),
         akaze_descriptors: descriptors,
     }))
+}
+
+pub fn has_reusable_feature_cache(
+    conn: &Connection,
+    exact_hash: &str,
+    size_bytes: i64,
+) -> Result<bool> {
+    let status = conn
+        .query_row(
+            r#"
+            SELECT akaze_status
+            FROM feature_cache
+            WHERE exact_hash = ?1 AND size_bytes = ?2 AND feature_version = ?3
+            "#,
+            params![exact_hash, size_bytes, FEATURE_VERSION],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(status_text) = status else {
+        return Ok(false);
+    };
+    let status = AkazeStatus::from_db_str(&status_text)
+        .with_context(|| format!("unknown akaze status {status_text}"))?;
+    Ok(!status.is_retryable())
 }
 
 pub fn save_feature_cache(
@@ -298,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn loader_persists_unavailable_akaze_status() {
+    fn loader_persists_too_small_akaze_status() {
         let tmp = tempdir().unwrap();
         let image_path = tmp.path().join("tiny.png");
         ::image::RgbaImage::from_pixel(20, 20, ::image::Rgba([255, 255, 255, 255]))
@@ -325,7 +358,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(features.akaze_status, AkazeStatus::Unavailable);
+        assert_eq!(features.akaze_status, AkazeStatus::TooSmall);
         assert!(features.akaze_descriptors.is_none());
 
         let stored_status: String = catalog
@@ -335,6 +368,89 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(stored_status, "unavailable");
+        assert_eq!(stored_status, "too_small");
+    }
+
+    #[test]
+    fn loader_retries_decode_error_cache_rows() {
+        let tmp = tempdir().unwrap();
+        let image_path = tmp.path().join("retry.jpg");
+        fs::copy(mock_fixture_path("img_2023_05_01.jpg"), &image_path).unwrap();
+        let bytes = fs::read(&image_path).unwrap();
+        let exact_hash = exact_hash(&bytes);
+        let size_bytes = i64::try_from(bytes.len()).unwrap();
+
+        let catalog = open_catalog_db(tmp.path().join("catalog.db")).unwrap();
+        catalog
+            .execute(
+                "INSERT INTO feature_cache (exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, feature_version, updated_at)
+                 VALUES (?1, ?2, 'decode_error', NULL, NULL, ?3, datetime('now'))",
+                params![exact_hash, size_bytes, FEATURE_VERSION],
+            )
+            .unwrap();
+
+        assert!(!has_reusable_feature_cache(&catalog, &exact_hash, size_bytes).unwrap());
+
+        let mut loader = FeatureLoader::default();
+        let features = loader
+            .load(
+                &catalog,
+                FeatureRequest {
+                    path: &image_path,
+                    mime_type: "image/jpeg",
+                    exact_hash: &exact_hash,
+                    size_bytes,
+                    phash_hint: "",
+                    phash_bits: 0,
+                    width: 0,
+                    height: 0,
+                },
+            )
+            .unwrap();
+        assert_ne!(features.akaze_status, AkazeStatus::DecodeError);
+
+        let stored_status: String = catalog
+            .query_row(
+                "SELECT akaze_status FROM feature_cache WHERE exact_hash = ?1 AND size_bytes = ?2",
+                params![exact_hash, size_bytes],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(stored_status, "decode_error");
+    }
+
+    #[test]
+    fn loader_persists_read_failures_as_retryable_decode_error() {
+        let tmp = tempdir().unwrap();
+        let missing_path = tmp.path().join("missing.jpg");
+        let catalog = open_catalog_db(tmp.path().join("catalog.db")).unwrap();
+        let mut loader = FeatureLoader::default();
+
+        let features = loader
+            .load(
+                &catalog,
+                FeatureRequest {
+                    path: &missing_path,
+                    mime_type: "image/jpeg",
+                    exact_hash: "missing-hash",
+                    size_bytes: 321,
+                    phash_hint: "",
+                    phash_bits: 0,
+                    width: 0,
+                    height: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(features.akaze_status, AkazeStatus::DecodeError);
+        assert!(!has_reusable_feature_cache(&catalog, "missing-hash", 321).unwrap());
+
+        let stored_status: String = catalog
+            .query_row(
+                "SELECT akaze_status FROM feature_cache WHERE exact_hash = 'missing-hash' AND size_bytes = 321",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_status, "decode_error");
     }
 }

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
-pub const FEATURE_VERSION: i64 = 4;
+pub const FEATURE_VERSION: i64 = 5;
 
 pub fn open_scan_db(path: impl AsRef<Path>) -> Result<Connection> {
     let conn = Connection::open(path.as_ref())
@@ -116,17 +116,38 @@ fn normalize_feature_cache_rows(conn: &Connection) -> Result<()> {
             feature_version = ?1
         WHERE
             akaze_descriptors IS NOT NULL
-            AND (akaze_status IS NULL OR akaze_status = '' OR akaze_status = 'pending' OR feature_version < ?1)
+            AND (akaze_status IS NULL OR akaze_status = '' OR akaze_status != 'ready' OR feature_version < ?1)
         "#,
         params![FEATURE_VERSION],
     )?;
 
     conn.execute(
         r#"
-        DELETE FROM feature_cache
+        UPDATE feature_cache
+        SET
+            akaze_status = 'decode_error',
+            feature_version = ?1
         WHERE
             akaze_descriptors IS NULL
-            AND (akaze_status IS NULL OR akaze_status = '' OR akaze_status = 'pending' OR feature_version < ?1)
+            AND (
+                akaze_status IS NULL
+                OR akaze_status = ''
+                OR akaze_status = 'pending'
+                OR akaze_status = 'unavailable'
+                OR akaze_status = 'decode_error'
+            )
+        "#,
+        params![FEATURE_VERSION],
+    )?;
+
+    conn.execute(
+        r#"
+        UPDATE feature_cache
+        SET feature_version = ?1
+        WHERE
+            akaze_descriptors IS NULL
+            AND akaze_status IN ('no_keypoints', 'too_small')
+            AND feature_version < ?1
         "#,
         params![FEATURE_VERSION],
     )?;
@@ -200,14 +221,72 @@ mod tests {
         assert_eq!(ready_row.0, "ready");
         assert_eq!(ready_row.1, FEATURE_VERSION);
 
-        let stale_count: i64 = migrated
+        let stale_row: (String, i64) = migrated
             .query_row(
-                "SELECT COUNT(*) FROM feature_cache WHERE exact_hash = 'stale-hash'",
+                "SELECT akaze_status, feature_version FROM feature_cache WHERE exact_hash = 'stale-hash'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(stale_count, 0);
+        assert_eq!(stale_row.0, "decode_error");
+        assert_eq!(stale_row.1, FEATURE_VERSION);
+    }
+
+    #[test]
+    fn open_catalog_db_reclassifies_retryable_unavailable_rows() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE feature_cache (
+                exact_hash TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                akaze_status TEXT NOT NULL DEFAULT 'pending',
+                akaze_keypoints INTEGER,
+                akaze_descriptors BLOB,
+                feature_version INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (exact_hash, size_bytes)
+            );
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO feature_cache (exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, feature_version, updated_at)
+             VALUES (?1, ?2, 'unavailable', NULL, NULL, 4, datetime('now'))",
+            params!["retry-hash", 10_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO feature_cache (exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, feature_version, updated_at)
+             VALUES (?1, ?2, 'no_keypoints', NULL, NULL, 4, datetime('now'))",
+            params!["nokp-hash", 11_i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        let migrated = open_catalog_db(&db_path).unwrap();
+
+        let retry_row: (String, i64) = migrated
+            .query_row(
+                "SELECT akaze_status, feature_version FROM feature_cache WHERE exact_hash = 'retry-hash'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retry_row.0, "decode_error");
+        assert_eq!(retry_row.1, FEATURE_VERSION);
+
+        let nokp_row: (String, i64) = migrated
+            .query_row(
+                "SELECT akaze_status, feature_version FROM feature_cache WHERE exact_hash = 'nokp-hash'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(nokp_row.0, "no_keypoints");
+        assert_eq!(nokp_row.1, FEATURE_VERSION);
     }
 }
 
