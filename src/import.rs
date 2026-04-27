@@ -1004,7 +1004,10 @@ fn upsert_catalog_item(
             width = excluded.width,
             height = excluded.height,
             origin_source_id = excluded.origin_source_id,
-            meta_json = excluded.meta_json
+            meta_json = CASE
+                WHEN excluded.meta_json != '' THEN excluded.meta_json
+                ELSE target_items.meta_json
+            END
         "#,
         params![
             input.target_path.to_string_lossy(),
@@ -1349,6 +1352,32 @@ mod tests {
                 d.to_string_lossy().to_string(),
                 i.to_string_lossy().to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn initcache_preserves_fingerprint_meta_json() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let image = dest.join("img.jpg");
+        copy_mock_fixture("img_2023_05_01.jpg", &image);
+
+        let catalog_db = tmp.path().join("catalog.db");
+        initcache(&catalog_db, &dest, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let meta_json: String = catalog
+            .query_row(
+                "SELECT meta_json FROM target_items WHERE target_path = ?1",
+                params![image.to_string_lossy().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(
+            extract_modified_at(&meta_json).is_some(),
+            "expected initcache regrouping to preserve fingerprint.modified_at, got {meta_json}"
         );
     }
 
