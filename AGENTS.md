@@ -49,6 +49,16 @@ When touching duplicate matching:
 - Do not make callers care whether second-stage AKAZE data came from memory, SQLite, or a fresh decode; `feature_loader` owns that decision.
 - Cache keys for persisted AKAZE data must be content-based, not path-based. Use file content hash plus size so renamed or re-adopted files can reuse the expensive second-stage work safely.
 
+## Dup Improvements
+When investigating or fixing duplicate-grouping mistakes, first capture a stable local snapshot of the remote group before changing matcher logic.
+
+- Keep repo-maintained Codex skills under `skills/`; `skills/photo-org-group-snapshot/` is the canonical copy of the remote group snapshot workflow.
+- Prefer using the Codex skill `$photo-org-group-snapshot` to fetch a `group_id` from `nas-photo`.
+- That skill bundles the `fetch_group_snapshot.py` workflow and pulls `target_items`, matching `feature_cache` rows, `operations_log` context, and the related image files into one local directory.
+- Keep investigation write-ups and downloaded assets together under a dedicated `docs/<group-or-topic>-investigation/` directory when the issue is important enough to preserve.
+- For analysis, explicitly compare which pairs are valid within a subgroup and which borderline pHash-only edges act as bridges across unrelated subgroups.
+- Treat transitive group collapse as a first-class failure mode: a small number of weak `no_keypoints` matches can merge otherwise coherent groups.
+
 ## RAW Performance
 RAW preview extraction itself is cheap in this crate; the expensive work is decoding oversized embedded previews and running visual features on them.
 

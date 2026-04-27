@@ -248,7 +248,8 @@ fn metadata_time(path: &Path, meta: &std::fs::Metadata, file: &mut File) -> Opti
 }
 
 fn read_prefix(file: &mut File, limit: usize) -> Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(0)).context("rewind file for prefix read")?;
+    file.seek(SeekFrom::Start(0))
+        .context("rewind file for prefix read")?;
     let mut buf = vec![0u8; limit];
     let count = file.read(&mut buf).context("read prefix bytes")?;
     buf.truncate(count);
@@ -261,7 +262,9 @@ fn exact_hash_file(file: &mut File) -> Result<String> {
     let mut hasher = Blake3Hasher::new();
     let mut buffer = [0u8; HASH_BUFFER_BYTES];
     loop {
-        let count = file.read(&mut buffer).context("stream file for exact hash")?;
+        let count = file
+            .read(&mut buffer)
+            .context("stream file for exact hash")?;
         if count == 0 {
             break;
         }
