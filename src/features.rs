@@ -1,9 +1,9 @@
 use akaze::Akaze;
 use anyhow::{Context, Result};
 use blake3::Hasher as Blake3Hasher;
+use image::ImageReader;
 use img_hash::image::{DynamicImage, GenericImageView};
 use img_hash::{HashAlg, HasherConfig};
-use image::ImageReader;
 use rsraw::{RawImage, ThumbFormat, ThumbnailImage};
 use std::io::{BufRead, Seek};
 use std::path::Path;
@@ -170,9 +170,18 @@ fn extract_akaze_features(
         return (AkazeStatus::TooSmall, None, None);
     }
 
-    let akaze = Akaze::sparse();
-    let extracted =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| akaze.extract(image)));
+    let sparse = extract_akaze_features_with(image, Akaze::sparse());
+    if sparse.0 == AkazeStatus::NoKeypoints {
+        return extract_akaze_features_with(image, Akaze::default());
+    }
+    sparse
+}
+
+fn extract_akaze_features_with(
+    image: &DynamicImage,
+    akaze: Akaze,
+) -> (AkazeStatus, Option<usize>, Option<Vec<Vec<u8>>>) {
+    let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| akaze.extract(image)));
     let Ok((keypoints, descriptors)) = extracted else {
         tracing::warn!(
             width = image.width(),
@@ -570,23 +579,24 @@ pub(crate) fn supports_visual_features(path: &Path, mime_type: &str) -> bool {
 
 pub(crate) fn is_raw_like_mime(mime_type: &str) -> bool {
     let mime = mime_type.trim().to_ascii_lowercase();
-    mime == "image/x-raw" || matches!(
-        mime.as_str(),
-        "image/x-sony-arw"
-            | "image/x-sony-sr2"
-            | "image/x-canon-cr2"
-            | "image/x-canon-cr3"
-            | "image/x-nikon-nef"
-            | "image/x-nikon-nrw"
-            | "image/x-adobe-dng"
-            | "image/x-fuji-raf"
-            | "image/x-olympus-orf"
-            | "image/x-panasonic-rw2"
-            | "image/x-pentax-pef"
-            | "image/x-sigma-x3f"
-            | "image/x-hasselblad-3fr"
-            | "image/x-raw"
-    )
+    mime == "image/x-raw"
+        || matches!(
+            mime.as_str(),
+            "image/x-sony-arw"
+                | "image/x-sony-sr2"
+                | "image/x-canon-cr2"
+                | "image/x-canon-cr3"
+                | "image/x-nikon-nef"
+                | "image/x-nikon-nrw"
+                | "image/x-adobe-dng"
+                | "image/x-fuji-raf"
+                | "image/x-olympus-orf"
+                | "image/x-panasonic-rw2"
+                | "image/x-pentax-pef"
+                | "image/x-sigma-x3f"
+                | "image/x-hasselblad-3fr"
+                | "image/x-raw"
+        )
 }
 
 fn bytes_are_raw(bytes: &[u8]) -> bool {
@@ -601,6 +611,15 @@ mod tests {
     fn fixture_path(name: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("test_data")
+            .join(name)
+    }
+
+    fn bad_case_fixture_path(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("docs")
+            .join("group_bad_cases")
+            .join("group-71-investigation")
+            .join("assets")
             .join(name)
     }
 
@@ -669,10 +688,13 @@ mod tests {
         let arw = fixture_path("source/DSC00903.ARW");
         let arw_bytes = fs::read(&arw).unwrap();
 
-        let features =
-            compute_visual_features_for_mime_from_bytes(&arw_bytes, Path::new("pretend.jpg"), "application/octet-stream")
-                .unwrap()
-                .expect("raw bytes should still be treated as raw");
+        let features = compute_visual_features_for_mime_from_bytes(
+            &arw_bytes,
+            Path::new("pretend.jpg"),
+            "application/octet-stream",
+        )
+        .unwrap()
+        .expect("raw bytes should still be treated as raw");
 
         assert!(!features.phash.is_empty());
         assert!(features.width > 0);
@@ -772,5 +794,21 @@ mod tests {
         assert_eq!(features.akaze_status, AkazeStatus::TooSmall);
         assert!(features.akaze_keypoints.is_none());
         assert!(features.akaze_descriptors.is_none());
+    }
+
+    #[test]
+    fn compute_visual_features_retries_no_keypoints_with_default_akaze() {
+        let path = bad_case_fixture_path("defaultimg_0183-3.jpg");
+        let bytes = fs::read(&path).unwrap();
+        let image = decode_image(&bytes, &path).unwrap();
+        let scaled = resize_for_feature(&image, AKAZE_MAX_DIMENSION);
+
+        let sparse = extract_akaze_features_with(&scaled, Akaze::sparse());
+        assert_eq!(sparse.0, AkazeStatus::NoKeypoints);
+
+        let features = compute_visual_features_from_image(&image);
+        assert_eq!(features.akaze_status, AkazeStatus::Ready);
+        assert!(features.akaze_keypoints.unwrap_or(0) > 0);
+        assert!(features.akaze_descriptors.is_some());
     }
 }

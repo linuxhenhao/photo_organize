@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
-pub const FEATURE_VERSION: i64 = 5;
+pub const FEATURE_VERSION: i64 = 6;
 
 pub fn open_scan_db(path: impl AsRef<Path>) -> Result<Connection> {
     let conn = Connection::open(path.as_ref())
@@ -116,7 +116,12 @@ fn normalize_feature_cache_rows(conn: &Connection) -> Result<()> {
             feature_version = ?1
         WHERE
             akaze_descriptors IS NOT NULL
-            AND (akaze_status IS NULL OR akaze_status = '' OR akaze_status != 'ready' OR feature_version < ?1)
+            AND (
+                akaze_status IS NULL
+                OR akaze_status = ''
+                OR akaze_status != 'ready'
+                OR feature_version < ?1
+            )
         "#,
         params![FEATURE_VERSION],
     )?;
@@ -134,7 +139,7 @@ fn normalize_feature_cache_rows(conn: &Connection) -> Result<()> {
                 OR akaze_status = ''
                 OR akaze_status = 'pending'
                 OR akaze_status = 'unavailable'
-                OR akaze_status = 'decode_error'
+                OR (akaze_status = 'decode_error' AND feature_version < ?1)
             )
         "#,
         params![FEATURE_VERSION],
@@ -146,7 +151,18 @@ fn normalize_feature_cache_rows(conn: &Connection) -> Result<()> {
         SET feature_version = ?1
         WHERE
             akaze_descriptors IS NULL
-            AND akaze_status IN ('no_keypoints', 'too_small')
+            AND akaze_status = 'too_small'
+            AND feature_version < ?1
+        "#,
+        params![FEATURE_VERSION],
+    )?;
+
+    conn.execute(
+        r#"
+        DELETE FROM feature_cache
+        WHERE
+            akaze_descriptors IS NULL
+            AND akaze_status = 'no_keypoints'
             AND feature_version < ?1
         "#,
         params![FEATURE_VERSION],
@@ -264,6 +280,12 @@ mod tests {
             params!["nokp-hash", 11_i64],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO feature_cache (exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, feature_version, updated_at)
+             VALUES (?1, ?2, 'too_small', NULL, NULL, 4, datetime('now'))",
+            params!["small-hash", 12_i64],
+        )
+        .unwrap();
         drop(conn);
 
         let migrated = open_catalog_db(&db_path).unwrap();
@@ -278,15 +300,24 @@ mod tests {
         assert_eq!(retry_row.0, "decode_error");
         assert_eq!(retry_row.1, FEATURE_VERSION);
 
-        let nokp_row: (String, i64) = migrated
+        let nokp_count: i64 = migrated
             .query_row(
-                "SELECT akaze_status, feature_version FROM feature_cache WHERE exact_hash = 'nokp-hash'",
+                "SELECT COUNT(*) FROM feature_cache WHERE exact_hash = 'nokp-hash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nokp_count, 0);
+
+        let too_small_row: (String, i64) = migrated
+            .query_row(
+                "SELECT akaze_status, feature_version FROM feature_cache WHERE exact_hash = 'small-hash'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(nokp_row.0, "no_keypoints");
-        assert_eq!(nokp_row.1, FEATURE_VERSION);
+        assert_eq!(too_small_row.0, "too_small");
+        assert_eq!(too_small_row.1, FEATURE_VERSION);
     }
 }
 

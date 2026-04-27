@@ -420,6 +420,55 @@ mod tests {
     }
 
     #[test]
+    fn loader_recomputes_stale_feature_version_rows() {
+        let tmp = tempdir().unwrap();
+        let image_path = tmp.path().join("stale.jpg");
+        fs::copy(mock_fixture_path("img_2023_05_01.jpg"), &image_path).unwrap();
+        let bytes = fs::read(&image_path).unwrap();
+        let exact_hash = exact_hash(&bytes);
+        let size_bytes = i64::try_from(bytes.len()).unwrap();
+
+        let catalog = open_catalog_db(tmp.path().join("catalog.db")).unwrap();
+        catalog
+            .execute(
+                "INSERT INTO feature_cache (exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, feature_version, updated_at)
+                 VALUES (?1, ?2, 'no_keypoints', NULL, NULL, ?3, datetime('now'))",
+                params![exact_hash, size_bytes, FEATURE_VERSION - 1],
+            )
+            .unwrap();
+
+        assert!(!has_reusable_feature_cache(&catalog, &exact_hash, size_bytes).unwrap());
+
+        let mut loader = FeatureLoader::default();
+        let features = loader
+            .load(
+                &catalog,
+                FeatureRequest {
+                    path: &image_path,
+                    mime_type: "image/jpeg",
+                    exact_hash: &exact_hash,
+                    size_bytes,
+                    phash_hint: "",
+                    phash_bits: 0,
+                    width: 0,
+                    height: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(features.size_bytes_hint, size_bytes);
+
+        let stored_row: (String, i64) = catalog
+            .query_row(
+                "SELECT akaze_status, feature_version FROM feature_cache WHERE exact_hash = ?1 AND size_bytes = ?2",
+                params![exact_hash, size_bytes],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_row.1, FEATURE_VERSION);
+        assert!(has_reusable_feature_cache(&catalog, &exact_hash, size_bytes).unwrap());
+    }
+
+    #[test]
     fn loader_persists_read_failures_as_retryable_decode_error() {
         let tmp = tempdir().unwrap();
         let missing_path = tmp.path().join("missing.jpg");
