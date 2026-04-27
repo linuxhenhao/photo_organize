@@ -1,6 +1,8 @@
 use crate::db::{max_group_id, open_catalog_db, open_scan_db};
 use crate::feature_loader::{FeatureLoader, FeatureRequest};
-use crate::features::{VisualFeatures, akaze_confirm, phash_to_u64, supports_visual_features};
+use crate::features::{
+    AkazeStatus, VisualFeatures, akaze_confirm, phash_to_u64, supports_visual_features,
+};
 use crate::interrupt;
 use crate::phash_index::PhashIndex;
 use crate::scan::{DiscoveredFile, collect_file_paths, discover_file, run as scan_run};
@@ -788,6 +790,7 @@ fn process_catalog_input(
             width: input.width,
             height: input.height,
             size_bytes_hint: input.size_bytes,
+            akaze_status: AkazeStatus::Unavailable,
             akaze_keypoints: None,
             akaze_descriptors: None,
         }

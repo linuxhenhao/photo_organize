@@ -3,12 +3,44 @@ use anyhow::{Context, Result};
 use blake3::Hasher as Blake3Hasher;
 use img_hash::image::{DynamicImage, GenericImageView};
 use img_hash::{HashAlg, HasherConfig};
+use image::ImageReader;
 use rsraw::{RawImage, ThumbFormat, ThumbnailImage};
+use std::io::{BufRead, Seek};
 use std::path::Path;
 
 const PHASH_MAX_DIMENSION: u32 = 256;
 const AKAZE_MAX_DIMENSION: u32 = 640;
+const AKAZE_MIN_DIMENSION: u32 = 40;
 const MAX_KEYPOINTS_FOR_MATCH: usize = 500;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AkazeStatus {
+    Pending,
+    Ready,
+    NoKeypoints,
+    Unavailable,
+}
+
+impl AkazeStatus {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::NoKeypoints => "no_keypoints",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "ready" => Some(Self::Ready),
+            "no_keypoints" => Some(Self::NoKeypoints),
+            "unavailable" => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct VisualFeatures {
@@ -19,10 +51,12 @@ pub struct VisualFeatures {
     pub width: i64,
     pub height: i64,
     pub size_bytes_hint: i64,
+    pub akaze_status: AkazeStatus,
     pub akaze_keypoints: Option<usize>,
     pub akaze_descriptors: Option<Vec<Vec<u8>>>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn exact_hash(bytes: &[u8]) -> String {
     let mut hasher = Blake3Hasher::new();
     hasher.update(bytes);
@@ -57,11 +91,12 @@ pub fn compute_visual_features_for_mime_from_bytes(
     path: &Path,
     mime_type: &str,
 ) -> Result<Option<VisualFeatures>> {
-    if !supports_visual_features(path, mime_type) {
+    let raw_by_content = bytes_are_raw(bytes);
+    if !raw_by_content && !supports_visual_features(path, mime_type) {
         return Ok(None);
     }
 
-    if is_raw_like_mime(path, mime_type) {
+    if raw_by_content || is_raw_like_mime(mime_type) {
         match compute_raw_preview_features_from_bytes(bytes, path) {
             Ok(features) => return Ok(Some(features)),
             Err(err) => {
@@ -103,14 +138,7 @@ pub fn compute_visual_features_from_image(image: &DynamicImage) -> VisualFeature
     let phash = hash.to_base64();
     let phash_bits = i64::try_from(hash.as_bytes().len() * 8).unwrap_or(64);
     let phash_value = phash_to_u64(&phash).unwrap_or(0);
-    let akaze = Akaze::sparse();
-    let (keypoints, descriptors) = akaze.extract(&akaze_image);
-    let akaze_keypoints = (!keypoints.is_empty()).then_some(keypoints.len());
-    let akaze_descriptors = if descriptors.is_empty() {
-        None
-    } else {
-        Some(descriptors.iter().map(|d| d.bytes().to_vec()).collect())
-    };
+    let (akaze_status, akaze_keypoints, akaze_descriptors) = extract_akaze_features(&akaze_image);
     VisualFeatures {
         exact_hash: String::new(),
         phash,
@@ -119,9 +147,43 @@ pub fn compute_visual_features_from_image(image: &DynamicImage) -> VisualFeature
         width,
         height,
         size_bytes_hint: 0,
+        akaze_status,
         akaze_keypoints,
         akaze_descriptors,
     }
+}
+
+fn extract_akaze_features(
+    image: &DynamicImage,
+) -> (AkazeStatus, Option<usize>, Option<Vec<Vec<u8>>>) {
+    if image.width().min(image.height()) < AKAZE_MIN_DIMENSION {
+        return (AkazeStatus::Unavailable, None, None);
+    }
+
+    let akaze = Akaze::sparse();
+    let extracted =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| akaze.extract(image)));
+    let Ok((keypoints, descriptors)) = extracted else {
+        tracing::warn!(
+            width = image.width(),
+            height = image.height(),
+            "akaze extractor panicked; continuing without descriptors"
+        );
+        return (AkazeStatus::Unavailable, None, None);
+    };
+
+    let akaze_keypoints = (!keypoints.is_empty()).then_some(keypoints.len());
+    let (akaze_status, akaze_descriptors) = if keypoints.is_empty() && descriptors.is_empty() {
+        (AkazeStatus::NoKeypoints, None)
+    } else if descriptors.is_empty() {
+        (AkazeStatus::Unavailable, None)
+    } else {
+        (
+            AkazeStatus::Ready,
+            Some(descriptors.iter().map(|d| d.bytes().to_vec()).collect()),
+        )
+    };
+    (akaze_status, akaze_keypoints, akaze_descriptors)
 }
 
 pub fn compute_base_features_from_image(image: &DynamicImage) -> VisualFeatures {
@@ -146,6 +208,7 @@ pub fn compute_base_features_from_image(image: &DynamicImage) -> VisualFeatures 
         width,
         height,
         size_bytes_hint: 0,
+        akaze_status: AkazeStatus::Pending,
         akaze_keypoints: None,
         akaze_descriptors: None,
     }
@@ -156,11 +219,12 @@ pub fn compute_base_features_from_bytes(
     path: &Path,
     mime_type: &str,
 ) -> Result<Option<VisualFeatures>> {
-    if !supports_visual_features(path, mime_type) {
+    let raw_by_content = bytes_are_raw(bytes);
+    if !raw_by_content && !supports_visual_features(path, mime_type) {
         return Ok(None);
     }
 
-    if is_raw_like_mime(path, mime_type) {
+    if raw_by_content || is_raw_like_mime(mime_type) {
         if let Ok(mut raw) = RawImage::open(bytes) {
             if let Ok(thumbs) = raw.extract_thumbs() {
                 if let Some(preview) = select_best_thumbnail(&thumbs, PHASH_MAX_DIMENSION) {
@@ -181,23 +245,39 @@ pub fn compute_base_features_from_bytes(
     }
 }
 
+pub fn compute_base_features_from_reader<R>(reader: R, path: &Path) -> Result<VisualFeatures>
+where
+    R: BufRead + Seek,
+{
+    let image = decode_image_from_reader(reader, path)?;
+    Ok(compute_base_features_from_image(&image))
+}
+
 pub fn akaze_confirm(
     a: &VisualFeatures,
     b: &VisualFeatures,
     min_matches: usize,
     phash_threshold: u32,
 ) -> bool {
-    let a_descs = a.akaze_descriptors.as_ref();
-    let b_descs = b.akaze_descriptors.as_ref();
-
-    // 1. Special case: if BOTH have zero keypoints (empty/solid color), trust phash match within threshold
-    if a_descs.is_none() && b_descs.is_none() && !a.phash.is_empty() && !b.phash.is_empty() {
+    // 1. Special case: if BOTH were computed and produced no keypoints (empty/solid color),
+    // trust pHash match within threshold.
+    if a.akaze_status == AkazeStatus::NoKeypoints
+        && b.akaze_status == AkazeStatus::NoKeypoints
+        && !a.phash.is_empty()
+        && !b.phash.is_empty()
+    {
         let distance = (a.phash_value ^ b.phash_value).count_ones();
         if distance <= phash_threshold {
             return true;
         }
     }
 
+    if a.akaze_status != AkazeStatus::Ready || b.akaze_status != AkazeStatus::Ready {
+        return false;
+    }
+
+    let a_descs = a.akaze_descriptors.as_ref();
+    let b_descs = b.akaze_descriptors.as_ref();
     let Some(a_descs) = a_descs else {
         return false;
     };
@@ -335,6 +415,18 @@ fn compute_raw_preview_features_from_bytes(bytes: &[u8], path: &Path) -> Result<
     Ok(compute_visual_features_from_image(&image))
 }
 
+fn decode_image_from_reader<R>(reader: R, path: &Path) -> Result<DynamicImage>
+where
+    R: BufRead + Seek,
+{
+    let image = ImageReader::new(reader)
+        .with_guessed_format()
+        .with_context(|| format!("guess image format {}", path.display()))?
+        .decode()
+        .with_context(|| format!("decode image {}", path.display()))?;
+    Ok(convert_direct_image(image))
+}
+
 fn select_best_thumbnail(thumbs: &[ThumbnailImage], min_dimension: u32) -> Option<&ThumbnailImage> {
     let supported: Vec<_> = thumbs
         .iter()
@@ -458,57 +550,37 @@ fn resize_for_feature(image: &DynamicImage, max_dimension: u32) -> DynamicImage 
 }
 
 pub(crate) fn supports_visual_features(path: &Path, mime_type: &str) -> bool {
-    if is_raw_like_mime(path, mime_type) {
+    if is_raw_like_mime(mime_type) {
         return true;
     }
 
+    let _ = path;
     mime_type.trim().to_ascii_lowercase().starts_with("image/")
 }
 
-fn is_raw_like_mime(path: &Path, mime_type: &str) -> bool {
+pub(crate) fn is_raw_like_mime(mime_type: &str) -> bool {
     let mime = mime_type.trim().to_ascii_lowercase();
-    if mime.starts_with("image/x-raw") || mime.starts_with("image/x-") {
-        return true;
-    }
-
-    if mime == "image/tiff" {
-        return is_raw_extension(path);
-    }
-
-    is_raw_extension(path)
+    mime == "image/x-raw" || matches!(
+        mime.as_str(),
+        "image/x-sony-arw"
+            | "image/x-sony-sr2"
+            | "image/x-canon-cr2"
+            | "image/x-canon-cr3"
+            | "image/x-nikon-nef"
+            | "image/x-nikon-nrw"
+            | "image/x-adobe-dng"
+            | "image/x-fuji-raf"
+            | "image/x-olympus-orf"
+            | "image/x-panasonic-rw2"
+            | "image/x-pentax-pef"
+            | "image/x-sigma-x3f"
+            | "image/x-hasselblad-3fr"
+            | "image/x-raw"
+    )
 }
 
-fn is_raw_extension(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    matches!(
-        ext.to_ascii_lowercase().as_str(),
-        "3fr"
-            | "ari"
-            | "arw"
-            | "cr2"
-            | "cr3"
-            | "crw"
-            | "dcr"
-            | "dng"
-            | "erf"
-            | "iiq"
-            | "kdc"
-            | "mef"
-            | "mos"
-            | "mrw"
-            | "nef"
-            | "nrw"
-            | "orf"
-            | "pef"
-            | "raf"
-            | "raw"
-            | "rw2"
-            | "sr2"
-            | "srw"
-            | "x3f"
-    )
+fn bytes_are_raw(bytes: &[u8]) -> bool {
+    RawImage::open(bytes).is_ok()
 }
 
 #[cfg(test)]
@@ -567,6 +639,45 @@ mod tests {
     }
 
     #[test]
+    fn compute_visual_features_does_not_treat_jpeg_bytes_as_raw_from_extension() {
+        let jpeg = fixture_path("source_mock/img_2023_05_01.jpg");
+        let jpeg_bytes = fs::read(&jpeg).unwrap();
+        let fake_raw_name = std::path::Path::new("pretend.arw");
+
+        let features =
+            compute_visual_features_for_mime_from_bytes(&jpeg_bytes, fake_raw_name, "image/jpeg")
+                .unwrap()
+                .expect("jpeg should decode normally");
+
+        assert!(!features.phash.is_empty());
+        assert!(features.width > 0);
+        assert!(features.height > 0);
+    }
+
+    #[test]
+    fn compute_visual_features_detects_raw_bytes_even_with_non_raw_mime() {
+        let arw = fixture_path("source/DSC00903.ARW");
+        let arw_bytes = fs::read(&arw).unwrap();
+
+        let features =
+            compute_visual_features_for_mime_from_bytes(&arw_bytes, Path::new("pretend.jpg"), "application/octet-stream")
+                .unwrap()
+                .expect("raw bytes should still be treated as raw");
+
+        assert!(!features.phash.is_empty());
+        assert!(features.width > 0);
+        assert!(features.height > 0);
+    }
+
+    #[test]
+    fn supports_visual_features_does_not_trust_raw_extension() {
+        let fake_raw_name = std::path::Path::new("pretend.cr2");
+
+        assert!(!is_raw_like_mime("image/jpeg"));
+        assert!(supports_visual_features(fake_raw_name, "image/jpeg"));
+    }
+
+    #[test]
     fn select_best_thumbnail_prefers_smallest_adequate_preview() {
         let thumbs = vec![
             ThumbnailImage {
@@ -619,5 +730,37 @@ mod tests {
         let selected = select_best_thumbnail(&thumbs, 960).unwrap();
         assert_eq!(selected.width, 660);
         assert_eq!(selected.height, 441);
+    }
+
+    #[test]
+    fn compute_visual_features_skips_akaze_for_tiny_images() {
+        let image = DynamicImage::ImageRgba8(img_hash::image::RgbaImage::from_pixel(
+            20,
+            20,
+            img_hash::image::Rgba([255, 255, 255, 255]),
+        ));
+
+        let features = compute_visual_features_from_image(&image);
+
+        assert!(!features.phash.is_empty());
+        assert_eq!(features.akaze_status, AkazeStatus::Unavailable);
+        assert!(features.akaze_keypoints.is_none());
+        assert!(features.akaze_descriptors.is_none());
+    }
+
+    #[test]
+    fn compute_visual_features_skips_akaze_for_thin_images_after_resize() {
+        let image = DynamicImage::ImageRgba8(img_hash::image::RgbaImage::from_pixel(
+            2_000,
+            20,
+            img_hash::image::Rgba([255, 255, 255, 255]),
+        ));
+
+        let features = compute_visual_features_from_image(&image);
+
+        assert!(!features.phash.is_empty());
+        assert_eq!(features.akaze_status, AkazeStatus::Unavailable);
+        assert!(features.akaze_keypoints.is_none());
+        assert!(features.akaze_descriptors.is_none());
     }
 }

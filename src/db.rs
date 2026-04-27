@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
-pub const FEATURE_VERSION: i64 = 3;
+pub const FEATURE_VERSION: i64 = 4;
 
 pub fn open_scan_db(path: impl AsRef<Path>) -> Result<Connection> {
     let conn = Connection::open(path.as_ref())
@@ -81,6 +81,7 @@ fn init_catalog_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS feature_cache (
             exact_hash TEXT NOT NULL,
             size_bytes INTEGER NOT NULL,
+            akaze_status TEXT NOT NULL DEFAULT 'pending',
             akaze_keypoints INTEGER,
             akaze_descriptors BLOB,
             feature_version INTEGER NOT NULL,
@@ -91,7 +92,123 @@ fn init_catalog_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_target_items_phash ON target_items(phash);
         "#,
     )?;
+    migrate_feature_cache_schema(conn)?;
     Ok(())
+}
+
+fn migrate_feature_cache_schema(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "feature_cache", "akaze_status")? {
+        conn.execute(
+            "ALTER TABLE feature_cache ADD COLUMN akaze_status TEXT NOT NULL DEFAULT 'pending'",
+            [],
+        )?;
+    }
+    normalize_feature_cache_rows(conn)?;
+    Ok(())
+}
+
+fn normalize_feature_cache_rows(conn: &Connection) -> Result<()> {
+    conn.execute(
+        r#"
+        UPDATE feature_cache
+        SET
+            akaze_status = 'ready',
+            feature_version = ?1
+        WHERE
+            akaze_descriptors IS NOT NULL
+            AND (akaze_status IS NULL OR akaze_status = '' OR akaze_status = 'pending' OR feature_version < ?1)
+        "#,
+        params![FEATURE_VERSION],
+    )?;
+
+    conn.execute(
+        r#"
+        DELETE FROM feature_cache
+        WHERE
+            akaze_descriptors IS NULL
+            AND (akaze_status IS NULL OR akaze_status = '' OR akaze_status = 'pending' OR feature_version < ?1)
+        "#,
+        params![FEATURE_VERSION],
+    )?;
+    Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::features::serialize_akaze_descriptors;
+    use tempfile::tempdir;
+
+    #[test]
+    fn open_catalog_db_migrates_legacy_feature_cache_rows() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE feature_cache (
+                exact_hash TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                akaze_keypoints INTEGER,
+                akaze_descriptors BLOB,
+                feature_version INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (exact_hash, size_bytes)
+            );
+            "#,
+        )
+        .unwrap();
+        let ready_blob = serialize_akaze_descriptors(&[vec![1, 2, 3, 4]]).unwrap();
+        conn.execute(
+            "INSERT INTO feature_cache (exact_hash, size_bytes, akaze_keypoints, akaze_descriptors, feature_version, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+            params!["ready-hash", 10_i64, 1_i64, ready_blob, 3_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO feature_cache (exact_hash, size_bytes, akaze_keypoints, akaze_descriptors, feature_version, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+            params!["stale-hash", 20_i64, Option::<i64>::None, Option::<Vec<u8>>::None, 3_i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        let migrated = open_catalog_db(&db_path).unwrap();
+
+        let has_status = table_has_column(&migrated, "feature_cache", "akaze_status").unwrap();
+        assert!(has_status);
+
+        let ready_row: (String, i64) = migrated
+            .query_row(
+                "SELECT akaze_status, feature_version FROM feature_cache WHERE exact_hash = 'ready-hash'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ready_row.0, "ready");
+        assert_eq!(ready_row.1, FEATURE_VERSION);
+
+        let stale_count: i64 = migrated
+            .query_row(
+                "SELECT COUNT(*) FROM feature_cache WHERE exact_hash = 'stale-hash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_count, 0);
+    }
 }
 
 pub fn now_string() -> String {

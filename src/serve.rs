@@ -1,6 +1,6 @@
 use crate::db::{insert_operation, open_catalog_db};
 use crate::interrupt;
-use crate::util::{ensure_under_root, safe_file_name};
+use crate::util::{best_effort_mime, ensure_under_root, safe_file_name};
 use anyhow::Result;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode};
@@ -701,13 +701,11 @@ async fn image(
     if *UGOS_MODE {
         if let Some(thumb_path) = resolve_ugos_thumb(&path) {
             if let Ok(bytes) = fs::read(&thumb_path) {
-                let mime = infer::get(&bytes)
-                    .map(|k| k.mime_type())
-                    .unwrap_or("image/jpeg");
+                let mime = best_effort_mime(&thumb_path, &bytes);
                 let mut resp = Response::new(axum::body::Body::from(bytes));
                 resp.headers_mut().insert(
                     axum::http::header::CONTENT_TYPE,
-                    HeaderValue::from_str(mime).map_err(internal_error)?,
+                    HeaderValue::from_str(&mime).map_err(internal_error)?,
                 );
                 return Ok(resp);
             }
@@ -719,19 +717,17 @@ async fn image(
     // 2. Fast path for small browser-safe images
     if requested_size >= 1600 {
         if let Ok(bytes) = fs::read(&path) {
-            let mime = infer::get(&bytes)
-                .map(|k| k.mime_type())
-                .unwrap_or("application/octet-stream");
+            let mime = best_effort_mime(&path, &bytes);
             if bytes.len() < 5 * 1024 * 1024
                 && matches!(
-                    mime,
+                    mime.as_str(),
                     "image/jpeg" | "image/png" | "image/webp" | "image/gif"
                 )
             {
                 let mut resp = Response::new(axum::body::Body::from(bytes));
                 resp.headers_mut().insert(
                     axum::http::header::CONTENT_TYPE,
-                    HeaderValue::from_str(mime).map_err(internal_error)?,
+                    HeaderValue::from_str(&mime).map_err(internal_error)?,
                 );
                 return Ok(resp);
             }

@@ -31,7 +31,7 @@ fn copy_tree(src: &Path, dst: &Path) {
 
 fn is_hidden_metadata_path(path: &Path) -> bool {
     path.components().any(|component| match component {
-        Component::Normal(part) => part == ".photo-org",
+        Component::Normal(part) => part.to_string_lossy().starts_with('.'),
         _ => false,
     })
 }
@@ -42,7 +42,10 @@ fn managed_files(root: &Path) -> BTreeSet<String> {
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_file())
         .map(|entry| entry.into_path())
-        .filter(|path| !is_hidden_metadata_path(path))
+        .filter(|path| {
+            let relative = path.strip_prefix(root).expect("relative managed file path");
+            !is_hidden_metadata_path(relative)
+        })
         .map(|path| path.to_string_lossy().to_string())
         .collect()
 }

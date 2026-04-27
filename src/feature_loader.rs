@@ -1,7 +1,8 @@
 use crate::db::FEATURE_VERSION;
 use crate::features::{
-    VisualFeatures, compute_visual_features_for_mime_from_bytes, deserialize_akaze_descriptors,
-    phash_to_u64, serialize_akaze_descriptors, supports_visual_features,
+    AkazeStatus, VisualFeatures, compute_visual_features_for_mime_from_bytes,
+    deserialize_akaze_descriptors, phash_to_u64, serialize_akaze_descriptors,
+    supports_visual_features,
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -38,7 +39,7 @@ impl FeatureLoader {
         request: FeatureRequest<'_>,
     ) -> Result<VisualFeatures> {
         if !supports_visual_features(request.path, request.mime_type) {
-            let fallback = fallback_features(request);
+            let fallback = fallback_features(request, AkazeStatus::Unavailable);
             let key = FeatureCacheKey {
                 exact_hash: request.exact_hash.to_string(),
                 size_bytes: request.size_bytes,
@@ -93,10 +94,10 @@ fn compute_feature(request: FeatureRequest<'_>) -> Result<VisualFeatures> {
         return Ok(computed);
     }
 
-    Ok(fallback_features(request))
+    Ok(fallback_features(request, AkazeStatus::Unavailable))
 }
 
-fn fallback_features(request: FeatureRequest<'_>) -> VisualFeatures {
+fn fallback_features(request: FeatureRequest<'_>, akaze_status: AkazeStatus) -> VisualFeatures {
     VisualFeatures {
         exact_hash: request.exact_hash.to_string(),
         phash: request.phash_hint.to_string(),
@@ -105,6 +106,7 @@ fn fallback_features(request: FeatureRequest<'_>) -> VisualFeatures {
         width: request.width,
         height: request.height,
         size_bytes_hint: request.size_bytes,
+        akaze_status,
         akaze_keypoints: None,
         akaze_descriptors: None,
     }
@@ -118,22 +120,28 @@ fn load_cached_feature(
     let row = conn
         .query_row(
             r#"
-        SELECT akaze_keypoints, akaze_descriptors
+        SELECT akaze_status, akaze_keypoints, akaze_descriptors
         FROM feature_cache
         WHERE exact_hash = ?1 AND size_bytes = ?2 AND feature_version = ?3
         "#,
             params![key.exact_hash, key.size_bytes, FEATURE_VERSION],
             |row| {
                 Ok((
-                    row.get::<_, Option<i64>>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
                 ))
             },
         )
         .optional()?;
-    let Some((keypoints, descriptors_blob)) = row else {
+    let Some((status_text, keypoints, descriptors_blob)) = row else {
         return Ok(None);
     };
+    let status = AkazeStatus::from_db_str(&status_text)
+        .with_context(|| format!("unknown akaze status {status_text}"))?;
+    if status == AkazeStatus::Pending {
+        return Ok(None);
+    }
     let descriptors = descriptors_blob
         .as_deref()
         .map(deserialize_akaze_descriptors)
@@ -146,6 +154,7 @@ fn load_cached_feature(
         width: request.width,
         height: request.height,
         size_bytes_hint: request.size_bytes,
+        akaze_status: status,
         akaze_keypoints: keypoints.and_then(|value| usize::try_from(value).ok()),
         akaze_descriptors: descriptors,
     }))
@@ -167,9 +176,10 @@ pub fn save_feature_cache(
     conn.execute(
         r#"
         INSERT INTO feature_cache (
-            exact_hash, size_bytes, akaze_keypoints, akaze_descriptors, feature_version, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+            exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, feature_version, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
         ON CONFLICT(exact_hash, size_bytes) DO UPDATE SET
+            akaze_status = excluded.akaze_status,
             akaze_keypoints = excluded.akaze_keypoints,
             akaze_descriptors = excluded.akaze_descriptors,
             feature_version = excluded.feature_version,
@@ -178,6 +188,7 @@ pub fn save_feature_cache(
         params![
             &visual.exact_hash,
             size_bytes,
+            visual.akaze_status.as_db_str(),
             keypoints,
             descriptors,
             FEATURE_VERSION,
@@ -247,6 +258,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(second.phash, first.phash);
+        assert_eq!(second.akaze_status, first.akaze_status);
         assert_eq!(second.akaze_descriptors, first.akaze_descriptors);
 
         let count: i64 = catalog
@@ -276,11 +288,53 @@ mod tests {
             )
             .unwrap();
         assert!(features.phash.is_empty());
+        assert_eq!(features.akaze_status, AkazeStatus::Unavailable);
         assert!(features.akaze_descriptors.is_none());
 
         let count: i64 = catalog
             .query_row("SELECT COUNT(*) FROM feature_cache", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn loader_persists_unavailable_akaze_status() {
+        let tmp = tempdir().unwrap();
+        let image_path = tmp.path().join("tiny.png");
+        ::image::RgbaImage::from_pixel(20, 20, ::image::Rgba([255, 255, 255, 255]))
+            .save(&image_path)
+            .unwrap();
+        let bytes = fs::read(&image_path).unwrap();
+        let exact_hash = exact_hash(&bytes);
+        let size_bytes = i64::try_from(bytes.len()).unwrap();
+
+        let catalog = open_catalog_db(tmp.path().join("catalog.db")).unwrap();
+        let mut loader = FeatureLoader::default();
+        let features = loader
+            .load(
+                &catalog,
+                FeatureRequest {
+                    path: &image_path,
+                    mime_type: "image/png",
+                    exact_hash: &exact_hash,
+                    size_bytes,
+                    phash_hint: "",
+                    phash_bits: 0,
+                    width: 0,
+                    height: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(features.akaze_status, AkazeStatus::Unavailable);
+        assert!(features.akaze_descriptors.is_none());
+
+        let stored_status: String = catalog
+            .query_row(
+                "SELECT akaze_status FROM feature_cache WHERE exact_hash = ?1 AND size_bytes = ?2",
+                params![exact_hash, size_bytes],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_status, "unavailable");
     }
 }

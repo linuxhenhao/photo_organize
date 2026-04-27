@@ -1,20 +1,26 @@
 use crate::db::{now_string, open_scan_db};
 use crate::features::{
-    VisualFeatures, compute_base_features_from_bytes, exact_hash, supports_visual_features,
+    AkazeStatus, VisualFeatures, compute_base_features_from_bytes,
+    compute_base_features_from_reader, is_raw_like_mime, supports_visual_features,
 };
 use crate::interrupt;
 use crate::util::{
     ProgressReporter, best_effort_mime, fallback_file_time, filename_date, is_excluded_dir,
-    parse_exif_datetime, to_bytes_lossless,
+    parse_exif_datetime,
 };
 use anyhow::{Context, Result};
+use blake3::Hasher as Blake3Hasher;
 use rayon::prelude::*;
 use rusqlite::{Connection, Transaction, params};
 use serde_json::json;
-use std::io::Cursor;
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use walkdir::WalkDir;
+
+const MIME_PREFIX_BYTES: usize = 3072;
+const HASH_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DiscoveredFile {
@@ -162,36 +168,31 @@ pub(crate) fn collect_discovered_files(roots: &[PathBuf]) -> Result<Vec<Discover
 
 pub(crate) fn discover_file(path: &Path) -> Result<DiscoveredFile> {
     let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    let bytes = to_bytes_lossless(path)?;
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let now = now_string();
-    let mime_type = best_effort_mime(path, &bytes);
+    let sniff_bytes = read_prefix(&mut file, MIME_PREFIX_BYTES)?;
+    let mime_type = best_effort_mime(path, &sniff_bytes);
     let created_at =
-        metadata_time(path, &meta, &bytes).unwrap_or_else(|| fallback_file_time(&meta));
-    let exact_hash = exact_hash(&bytes);
+        metadata_time(path, &meta, &mut file).unwrap_or_else(|| fallback_file_time(&meta));
+    let exact_hash = exact_hash_file(&mut file)?;
     let visual = if supports_visual_features(path, &mime_type) {
-        compute_base_features_from_bytes(&bytes, path, &mime_type)?.unwrap_or(VisualFeatures {
-            exact_hash: String::new(),
-            phash: String::new(),
-            phash_bits: 0,
-            phash_value: 0,
-            width: 0,
-            height: 0,
-            size_bytes_hint: 0,
-            akaze_keypoints: None,
-            akaze_descriptors: None,
-        })
-    } else {
-        VisualFeatures {
-            exact_hash: String::new(),
-            phash: String::new(),
-            phash_bits: 0,
-            phash_value: 0,
-            width: 0,
-            height: 0,
-            size_bytes_hint: 0,
-            akaze_keypoints: None,
-            akaze_descriptors: None,
+        if is_raw_like_mime(&mime_type) {
+            let bytes = read_all_bytes(&mut file, path)?;
+            compute_base_features_from_bytes(&bytes, path, &mime_type)?
+                .unwrap_or_else(empty_visual_features)
+        } else {
+            file.seek(SeekFrom::Start(0))
+                .with_context(|| format!("rewind {}", path.display()))?;
+            match compute_base_features_from_reader(BufReader::new(&mut file), path) {
+                Ok(features) => features,
+                Err(err) => {
+                    tracing::warn!(path = %path.display(), error = %err, "base feature extraction failed");
+                    empty_visual_features()
+                }
+            }
         }
+    } else {
+        empty_visual_features()
     };
     let meta_json = json!({
         "fingerprint": {
@@ -217,9 +218,10 @@ pub(crate) fn discover_file(path: &Path) -> Result<DiscoveredFile> {
     })
 }
 
-fn metadata_time(path: &Path, meta: &std::fs::Metadata, bytes: &[u8]) -> Option<String> {
-    let mut cursor = Cursor::new(bytes);
-    if let Ok(exif) = exif::Reader::new().read_from_container(&mut cursor) {
+fn metadata_time(path: &Path, meta: &std::fs::Metadata, file: &mut File) -> Option<String> {
+    let _ = file.seek(SeekFrom::Start(0));
+    let mut reader = BufReader::new(file);
+    if let Ok(exif) = exif::Reader::new().read_from_container(&mut reader) {
         for tag in [
             exif::Tag::DateTimeOriginal,
             exif::Tag::DateTimeDigitized,
@@ -243,6 +245,53 @@ fn metadata_time(path: &Path, meta: &std::fs::Metadata, bytes: &[u8]) -> Option<
                 .ok()
                 .map(crate::util::system_time_to_rfc3339)
         })
+}
+
+fn read_prefix(file: &mut File, limit: usize) -> Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(0)).context("rewind file for prefix read")?;
+    let mut buf = vec![0u8; limit];
+    let count = file.read(&mut buf).context("read prefix bytes")?;
+    buf.truncate(count);
+    Ok(buf)
+}
+
+fn exact_hash_file(file: &mut File) -> Result<String> {
+    file.seek(SeekFrom::Start(0))
+        .context("rewind file for exact hash")?;
+    let mut hasher = Blake3Hasher::new();
+    let mut buffer = [0u8; HASH_BUFFER_BYTES];
+    loop {
+        let count = file.read(&mut buffer).context("stream file for exact hash")?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn read_all_bytes(file: &mut File, path: &Path) -> Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("rewind {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    Ok(bytes)
+}
+
+fn empty_visual_features() -> VisualFeatures {
+    VisualFeatures {
+        exact_hash: String::new(),
+        phash: String::new(),
+        phash_bits: 0,
+        phash_value: 0,
+        width: 0,
+        height: 0,
+        size_bytes_hint: 0,
+        akaze_status: AkazeStatus::Pending,
+        akaze_keypoints: None,
+        akaze_descriptors: None,
+    }
 }
 
 fn upsert_items(tx: &Transaction<'_>, items: &[DiscoveredFile], run_id: &str) -> Result<()> {
@@ -315,6 +364,7 @@ mod tests {
     use crate::features::exact_hash;
     use crate::interrupt;
     use std::fs;
+    use std::fs::File;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -397,6 +447,20 @@ mod tests {
         assert_eq!(exact_hash, expected_hash);
         assert!(phash.is_empty());
         assert_eq!(phash_bits, 0);
+    }
+
+    #[test]
+    fn exact_hash_file_matches_buffer_hash() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("clip.mp4");
+        copy_fixture("clip_2023_05_06.mp4", &path);
+        let bytes = fs::read(&path).unwrap();
+        let expected = exact_hash(&bytes);
+
+        let mut file = File::open(&path).unwrap();
+        let actual = exact_hash_file(&mut file).unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

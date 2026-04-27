@@ -76,34 +76,8 @@ pub fn date_for_target(created_at: &str) -> (String, String, String) {
     )
 }
 
-pub fn to_bytes_lossless(path: &Path) -> Result<Vec<u8>> {
-    Ok(fs::read(path).with_context(|| format!("read {}", path.display()))?)
-}
-
-pub fn best_effort_mime(path: &Path, bytes: &[u8]) -> String {
-    if let Some(kind) = infer::get(bytes) {
-        return kind.mime_type().to_string();
-    }
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        "tif" | "tiff" => "image/tiff",
-        "heic" | "heif" => "image/heic",
-        "mp4" => "video/mp4",
-        "mov" => "video/quicktime",
-        "mkv" => "video/x-matroska",
-        _ => "application/octet-stream",
-    }
-    .to_string()
+pub fn best_effort_mime(_path: &Path, bytes: &[u8]) -> String {
+    mimetype_detector::detect(bytes).mime().to_string()
 }
 
 pub fn safe_file_name(path: &Path) -> String {
@@ -190,5 +164,34 @@ fn progress_step(total: usize) -> usize {
         0..=20 => 1,
         21..=200 => 10,
         _ => (total / 20).max(25),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data")
+            .join(name)
+    }
+
+    #[test]
+    fn best_effort_mime_uses_content_for_jpeg_with_raw_extension() {
+        let bytes = fs::read(fixture_path("source_mock/img_2023_05_01.jpg")).unwrap();
+
+        let mime = best_effort_mime(Path::new("misleading.arw"), &bytes);
+
+        assert_eq!(mime, "image/jpeg");
+    }
+
+    #[test]
+    fn best_effort_mime_detects_raw_bytes_with_wrong_extension() {
+        let bytes = fs::read(fixture_path("source/DSC00903.ARW")).unwrap();
+
+        let mime = best_effort_mime(Path::new("misleading.jpg"), &bytes);
+
+        assert_eq!(mime, "image/x-sony-sr2");
     }
 }
