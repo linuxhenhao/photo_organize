@@ -7,3 +7,5 @@ coverage.out
 token.txt
 *.tar
 target/
+__pycache__/
+*.pyc
