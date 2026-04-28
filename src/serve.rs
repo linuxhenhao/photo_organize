@@ -36,6 +36,8 @@ struct PagedGroups {
     groups: Vec<GroupSummary>,
     total_groups: usize,
     total_pages: usize,
+    page_index: usize,
+    page_size: usize,
     current_page: usize,
     limit: usize,
 }
@@ -63,9 +65,14 @@ struct GroupMember {
 
 #[derive(Debug, Deserialize)]
 struct GroupParams {
+    page_index: Option<usize>,
+    page_size: Option<usize>,
     page: Option<usize>,
     limit: Option<usize>,
 }
+
+const DEFAULT_PAGE_SIZE: usize = 20;
+const MAX_PAGE_SIZE: usize = 200;
 
 #[derive(Debug, Deserialize)]
 struct ResolveRequest {
@@ -148,11 +155,13 @@ async fn index() -> Html<&'static str> {
     h1 { margin: 0; font-size: 1.25rem; }
     main { padding: 2rem; max-width: 1600px; margin: 0 auto; }
     
-    .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; background: #1e293b; padding: 1rem 1.5rem; border-radius: 0.75rem; border: 1px solid var(--border); }
+    .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; background: #1e293b; padding: 1rem 1.5rem; border-radius: 0.75rem; border: 1px solid var(--border); gap: 1rem; flex-wrap: wrap; }
     .pagination { display: flex; gap: 0.5rem; align-items: center; }
+    .pagination-meta { display: flex; gap: 1rem; align-items: center; color: var(--text-muted); font-size: 0.875rem; flex-wrap: wrap; }
     .page-btn { padding: 0.5rem 1rem; background: #334155; border: 1px solid var(--border); border-radius: 0.5rem; color: #fff; cursor: pointer; }
     .page-btn:disabled { opacity: 0.3; cursor: not-allowed; }
     .page-btn.active { background: var(--primary); border-color: var(--primary); }
+    .page-size-input { width: 5rem; padding: 0.45rem 0.6rem; background: #0f172a; border: 1px solid var(--border); border-radius: 0.5rem; color: #fff; }
     
     .group { border: 1px solid var(--border); border-radius: 1rem; margin-bottom: 4rem; background: var(--card-bg); overflow: hidden; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }
     .group-header { padding: 1rem 1.5rem; background: #1e293b; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
@@ -239,17 +248,41 @@ async fn index() -> Html<&'static str> {
         groups: [],
         total_groups: 0,
         total_pages: 0,
+        page_index: 0,
+        page_size: 20,
         current_page: 1,
         limit: 20
     };
 
-    async function fetchGroups(page = 1) {
+    function getInitialPaging() {
+      const params = new URLSearchParams(window.location.search);
+      const pageIndexParam = params.get('page_index') ?? (params.has('page') ? String(Math.max(0, Number(params.get('page')) - 1)) : null);
+      const pageSizeParam = params.get('page_size') ?? params.get('limit');
+      const pageIndex = Number.parseInt(pageIndexParam ?? '0', 10);
+      const pageSize = Number.parseInt(pageSizeParam ?? String(pagedData.page_size), 10);
+      return {
+        page_index: Number.isFinite(pageIndex) && pageIndex >= 0 ? pageIndex : 0,
+        page_size: Number.isFinite(pageSize) && pageSize > 0 ? pageSize : pagedData.page_size,
+      };
+    }
+
+    function syncBrowserUrl() {
+      const url = new URL(window.location.href);
+      url.searchParams.set('page_index', String(pagedData.page_index));
+      url.searchParams.set('page_size', String(pagedData.page_size));
+      url.searchParams.delete('page');
+      url.searchParams.delete('limit');
+      window.history.replaceState(null, '', url);
+    }
+
+    async function fetchGroups(pageIndex = pagedData.page_index, pageSize = pagedData.page_size) {
       try {
-        groupsContainer.innerHTML = '<div style="text-align: center; padding: 10rem;"><div style="font-size: 1.5rem;">Loading Page ' + page + '...</div></div>';
+        groupsContainer.innerHTML = '<div style="text-align: center; padding: 10rem;"><div style="font-size: 1.5rem;">Loading Page ' + (pageIndex + 1) + '...</div></div>';
         window.scrollTo(0, 0);
 
-        const resp = await fetch(`/api/groups?page=${page}&limit=${pagedData.limit}`);
+        const resp = await fetch(`/api/groups?page_index=${pageIndex}&page_size=${pageSize}`);
         pagedData = await resp.json();
+        syncBrowserUrl();
         
         // Initialize UI state
         pagedData.groups.forEach(group => {
@@ -286,13 +319,26 @@ async fn index() -> Html<&'static str> {
       container.innerHTML = `
         <div class="toolbar">
           <div class="pagination">
-            <button class="page-btn" ${pagedData.current_page <= 1 ? 'disabled' : ''} onclick="fetchGroups(${pagedData.current_page - 1})">Prev</button>
+            <button class="page-btn" ${pagedData.page_index <= 0 ? 'disabled' : ''} onclick="fetchGroups(${pagedData.page_index - 1}, ${pagedData.page_size})">Prev</button>
             <span style="margin: 0 1rem">Page <strong>${pagedData.current_page}</strong> of ${pagedData.total_pages} (${pagedData.total_groups} groups)</span>
-            <button class="page-btn" ${pagedData.current_page >= pagedData.total_pages ? 'disabled' : ''} onclick="fetchGroups(${pagedData.current_page + 1})">Next</button>
+            <button class="page-btn" ${pagedData.page_index + 1 >= pagedData.total_pages ? 'disabled' : ''} onclick="fetchGroups(${pagedData.page_index + 1}, ${pagedData.page_size})">Next</button>
+          </div>
+          <div class="pagination-meta">
+            <span>page_index=<strong>${pagedData.page_index}</strong></span>
+            <label>page_size <input class="page-size-input" id="${container.id}-page-size" type="number" min="1" max="200" value="${pagedData.page_size}" onchange="changePageSize(this.value)"></label>
           </div>
           <button class="btn-bulk" onclick="confirmAllOnPage()">Confirm All on This Page</button>
         </div>
       `;
+    }
+
+    function changePageSize(value) {
+      const nextSize = Number.parseInt(value, 10);
+      if (!Number.isFinite(nextSize) || nextSize <= 0) {
+        renderUI();
+        return;
+      }
+      fetchGroups(0, nextSize);
     }
 
     function renderGroups() {
@@ -399,7 +445,7 @@ async fn index() -> Html<&'static str> {
         if (resp.ok) {
           pagedData.groups = pagedData.groups.filter(g => g.group_id !== groupId);
           if (pagedData.groups.length === 0) {
-            fetchGroups(pagedData.current_page);
+            fetchGroups(pagedData.page_index, pagedData.page_size);
           } else {
             renderUI();
           }
@@ -429,7 +475,7 @@ async fn index() -> Html<&'static str> {
         });
         
         if (resp.ok) {
-          fetchGroups(pagedData.current_page);
+          fetchGroups(pagedData.page_index, pagedData.page_size);
         } else {
           alert('Bulk resolve failed: ' + await resp.text());
         }
@@ -438,7 +484,8 @@ async fn index() -> Html<&'static str> {
       }
     }
 
-    fetchGroups();
+    const initialPaging = getInitialPaging();
+    fetchGroups(initialPaging.page_index, initialPaging.page_size);
   </script>
 </body>
 </html>"#,
@@ -450,8 +497,14 @@ async fn list_groups(
     Query(params): Query<GroupParams>,
 ) -> Result<Json<PagedGroups>, (StatusCode, String)> {
     let conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
-    let limit = params.limit.unwrap_or(20);
-    let page = params.page.unwrap_or(1).max(1);
+    let page_size = params
+        .page_size
+        .or(params.limit)
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let requested_page_index = params
+        .page_index
+        .unwrap_or_else(|| params.page.unwrap_or(1).saturating_sub(1));
 
     let total_groups: i64 = conn
         .query_row(
@@ -469,8 +522,13 @@ async fn list_groups(
         .map_err(internal_error)?;
     let total_groups = total_groups as usize;
 
-    let total_pages = (total_groups + limit - 1) / limit;
-    let offset = (page - 1) * limit;
+    let total_pages = total_groups.div_ceil(page_size);
+    let page_index = if total_pages == 0 {
+        0
+    } else {
+        requested_page_index.min(total_pages - 1)
+    };
+    let offset = page_index * page_size;
 
     let mut stmt = conn
         .prepare(
@@ -487,7 +545,7 @@ async fn list_groups(
         .map_err(internal_error)?;
 
     let ids = stmt
-        .query_map(rusqlite::params![limit as i64, offset as i64], |row| {
+        .query_map(rusqlite::params![page_size as i64, offset as i64], |row| {
             row.get::<_, i64>(0)
         })
         .map_err(internal_error)?
@@ -522,8 +580,10 @@ async fn list_groups(
         groups,
         total_groups,
         total_pages,
-        current_page: page,
-        limit,
+        page_index,
+        page_size,
+        current_page: page_index + 1,
+        limit: page_size,
     }))
 }
 
@@ -874,6 +934,7 @@ mod tests {
     use super::*;
     use crate::db::open_catalog_db;
     use crate::interrupt;
+    use axum::body::to_bytes;
     use image::{ImageBuffer, Rgb};
     use serde_json::json;
     use std::fs;
@@ -892,6 +953,81 @@ mod tests {
             },
         );
         image.save(path).unwrap();
+    }
+
+    fn insert_pending_group(conn: &rusqlite::Connection, group_id: i64, path_prefix: &str) {
+        conn.execute(
+            r#"
+            INSERT INTO target_items (
+                target_path, size_bytes, mime_type, created_at, exact_hash, phash, phash_bits,
+                width, height, group_id, keep_state, is_group_primary, origin_source_id, meta_json
+            ) VALUES
+                (?1, 1, 'image/png', '2024-06-09T00:00:00Z', ?2, 'p', 64, 32, 32, ?3, 'undecided', 1, NULL, '{}'),
+                (?4, 1, 'image/png', '2024-06-09T00:00:00Z', ?5, 'p', 64, 32, 32, ?3, 'undecided', 0, NULL, '{}')
+            "#,
+            rusqlite::params![
+                format!("{path_prefix}/g{group_id}-a.png"),
+                format!("hash-{group_id}-a"),
+                group_id,
+                format!("{path_prefix}/g{group_id}-b.png"),
+                format!("hash-{group_id}-b"),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_groups_supports_page_index_and_page_size() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        insert_pending_group(&conn, 1, "/tmp");
+        insert_pending_group(&conn, 2, "/tmp");
+        insert_pending_group(&conn, 3, "/tmp");
+
+        let app = router(AppState { db_path, dest });
+        let request = axum::http::Request::builder()
+            .uri("/api/groups?page_index=1&page_size=1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let paged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paged["page_index"], 1);
+        assert_eq!(paged["page_size"], 1);
+        assert_eq!(paged["current_page"], 2);
+        assert_eq!(paged["total_pages"], 3);
+        assert_eq!(paged["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(paged["groups"][0]["group_id"], 2);
+    }
+
+    #[tokio::test]
+    async fn index_html_mentions_page_index_and_page_size() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        open_catalog_db(&db_path).unwrap();
+
+        let app = router(AppState { db_path, dest });
+        let request = axum::http::Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("page_index"));
+        assert!(html.contains("page_size"));
+        assert!(html.contains("changePageSize"));
     }
 
     #[tokio::test]
