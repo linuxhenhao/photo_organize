@@ -1,8 +1,8 @@
 use crate::db::FEATURE_VERSION;
 use crate::features::{
     AkazeStatus, VisualFeatures, compute_visual_features_for_mime_from_bytes,
-    deserialize_akaze_descriptors, phash_to_u64, serialize_akaze_descriptors,
-    supports_visual_features,
+    deserialize_akaze_descriptors, deserialize_akaze_points, phash_to_u64,
+    serialize_akaze_descriptors, serialize_akaze_points, supports_visual_features,
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -117,6 +117,7 @@ fn fallback_features(request: FeatureRequest<'_>, akaze_status: AkazeStatus) -> 
         size_bytes_hint: request.size_bytes,
         akaze_status,
         akaze_keypoints: None,
+        akaze_points: None,
         akaze_descriptors: None,
     }
 }
@@ -130,6 +131,7 @@ fn load_cached_feature(
         .query_row(
             r#"
         SELECT akaze_status, akaze_keypoints, akaze_descriptors
+             , akaze_points
         FROM feature_cache
         WHERE exact_hash = ?1 AND size_bytes = ?2 AND feature_version = ?3
         "#,
@@ -139,11 +141,12 @@ fn load_cached_feature(
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<i64>>(1)?,
                     row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
                 ))
             },
         )
         .optional()?;
-    let Some((status_text, keypoints, descriptors_blob)) = row else {
+    let Some((status_text, keypoints, descriptors_blob, points_blob)) = row else {
         return Ok(None);
     };
     let status = AkazeStatus::from_db_str(&status_text)
@@ -155,6 +158,13 @@ fn load_cached_feature(
         .as_deref()
         .map(deserialize_akaze_descriptors)
         .transpose()?;
+    let points = points_blob
+        .as_deref()
+        .map(deserialize_akaze_points)
+        .transpose()?;
+    if status == AkazeStatus::Ready && (descriptors.is_none() || points.is_none()) {
+        return Ok(None);
+    }
     Ok(Some(VisualFeatures {
         exact_hash: request.exact_hash.to_string(),
         phash: request.phash_hint.to_string(),
@@ -165,6 +175,7 @@ fn load_cached_feature(
         size_bytes_hint: request.size_bytes,
         akaze_status: status,
         akaze_keypoints: keypoints.and_then(|value| usize::try_from(value).ok()),
+        akaze_points: points,
         akaze_descriptors: descriptors,
     }))
 }
@@ -203,18 +214,24 @@ pub fn save_feature_cache(
         .as_ref()
         .map(|value| serialize_akaze_descriptors(value))
         .transpose()?;
+    let points = visual
+        .akaze_points
+        .as_ref()
+        .map(|value| serialize_akaze_points(value))
+        .transpose()?;
     let keypoints = visual
         .akaze_keypoints
         .and_then(|value| i64::try_from(value).ok());
     conn.execute(
         r#"
         INSERT INTO feature_cache (
-            exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, feature_version, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+            exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, akaze_points, feature_version, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
         ON CONFLICT(exact_hash, size_bytes) DO UPDATE SET
             akaze_status = excluded.akaze_status,
             akaze_keypoints = excluded.akaze_keypoints,
             akaze_descriptors = excluded.akaze_descriptors,
+            akaze_points = excluded.akaze_points,
             feature_version = excluded.feature_version,
             updated_at = excluded.updated_at
         "#,
@@ -224,6 +241,7 @@ pub fn save_feature_cache(
             visual.akaze_status.as_db_str(),
             keypoints,
             descriptors,
+            points,
             FEATURE_VERSION,
         ],
     )?;
@@ -292,6 +310,7 @@ mod tests {
             .unwrap();
         assert_eq!(second.phash, first.phash);
         assert_eq!(second.akaze_status, first.akaze_status);
+        assert_eq!(second.akaze_points, first.akaze_points);
         assert_eq!(second.akaze_descriptors, first.akaze_descriptors);
 
         let count: i64 = catalog

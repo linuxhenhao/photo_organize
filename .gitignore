@@ -9,3 +9,4 @@ token.txt
 target/
 __pycache__/
 *.pyc
+docs/group_bad_cases/group-189-investigation/

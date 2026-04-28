@@ -787,6 +787,7 @@ fn process_catalog_input(
             size_bytes_hint: input.size_bytes,
             akaze_status: AkazeStatus::Unavailable,
             akaze_keypoints: None,
+            akaze_points: None,
             akaze_descriptors: None,
         }
     };

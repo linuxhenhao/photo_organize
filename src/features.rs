@@ -12,6 +12,12 @@ const PHASH_MAX_DIMENSION: u32 = 256;
 const AKAZE_MAX_DIMENSION: u32 = 640;
 const AKAZE_MIN_DIMENSION: u32 = 40;
 const MAX_KEYPOINTS_FOR_MATCH: usize = 500;
+const LOWE_RATIO_THRESHOLD: f32 = 0.75;
+const MATCH_DISTANCE_THRESHOLD: u32 = 96;
+const RANSAC_REPROJECTION_THRESHOLD: f32 = 8.0;
+const RANSAC_MIN_INLIER_RATIO: f32 = 0.4;
+const RANSAC_EXHAUSTIVE_LIMIT: usize = 12;
+const RANSAC_MAX_RANDOM_SAMPLES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AkazeStatus {
@@ -63,7 +69,14 @@ pub struct VisualFeatures {
     pub size_bytes_hint: i64,
     pub akaze_status: AkazeStatus,
     pub akaze_keypoints: Option<usize>,
+    pub akaze_points: Option<Vec<AkazePoint>>,
     pub akaze_descriptors: Option<Vec<Vec<u8>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AkazePoint {
+    pub x: f32,
+    pub y: f32,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -148,7 +161,8 @@ pub fn compute_visual_features_from_image(image: &DynamicImage) -> VisualFeature
     let phash = hash.to_base64();
     let phash_bits = i64::try_from(hash.as_bytes().len() * 8).unwrap_or(64);
     let phash_value = phash_to_u64(&phash).unwrap_or(0);
-    let (akaze_status, akaze_keypoints, akaze_descriptors) = extract_akaze_features(&akaze_image);
+    let (akaze_status, akaze_keypoints, akaze_points, akaze_descriptors) =
+        extract_akaze_features(&akaze_image);
     VisualFeatures {
         exact_hash: String::new(),
         phash,
@@ -159,15 +173,21 @@ pub fn compute_visual_features_from_image(image: &DynamicImage) -> VisualFeature
         size_bytes_hint: 0,
         akaze_status,
         akaze_keypoints,
+        akaze_points,
         akaze_descriptors,
     }
 }
 
 fn extract_akaze_features(
     image: &DynamicImage,
-) -> (AkazeStatus, Option<usize>, Option<Vec<Vec<u8>>>) {
+) -> (
+    AkazeStatus,
+    Option<usize>,
+    Option<Vec<AkazePoint>>,
+    Option<Vec<Vec<u8>>>,
+) {
     if image.width().min(image.height()) < AKAZE_MIN_DIMENSION {
-        return (AkazeStatus::TooSmall, None, None);
+        return (AkazeStatus::TooSmall, None, None, None);
     }
 
     let sparse = extract_akaze_features_with(image, Akaze::sparse());
@@ -180,7 +200,12 @@ fn extract_akaze_features(
 fn extract_akaze_features_with(
     image: &DynamicImage,
     akaze: Akaze,
-) -> (AkazeStatus, Option<usize>, Option<Vec<Vec<u8>>>) {
+) -> (
+    AkazeStatus,
+    Option<usize>,
+    Option<Vec<AkazePoint>>,
+    Option<Vec<Vec<u8>>>,
+) {
     let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| akaze.extract(image)));
     let Ok((keypoints, descriptors)) = extracted else {
         tracing::warn!(
@@ -188,21 +213,296 @@ fn extract_akaze_features_with(
             height = image.height(),
             "akaze extractor panicked; continuing without descriptors"
         );
-        return (AkazeStatus::DecodeError, None, None);
+        return (AkazeStatus::DecodeError, None, None, None);
     };
 
     let akaze_keypoints = (!keypoints.is_empty()).then_some(keypoints.len());
-    let (akaze_status, akaze_descriptors) = if keypoints.is_empty() && descriptors.is_empty() {
-        (AkazeStatus::NoKeypoints, None)
-    } else if descriptors.is_empty() {
-        (AkazeStatus::DecodeError, None)
-    } else {
-        (
-            AkazeStatus::Ready,
-            Some(descriptors.iter().map(|d| d.bytes().to_vec()).collect()),
-        )
-    };
-    (akaze_status, akaze_keypoints, akaze_descriptors)
+    let (akaze_status, akaze_points, akaze_descriptors) =
+        if keypoints.is_empty() && descriptors.is_empty() {
+            (AkazeStatus::NoKeypoints, None, None)
+        } else if descriptors.is_empty() {
+            (AkazeStatus::DecodeError, None, None)
+        } else if keypoints.len() != descriptors.len() {
+            tracing::warn!(
+                width = image.width(),
+                height = image.height(),
+                keypoints = keypoints.len(),
+                descriptors = descriptors.len(),
+                "akaze extractor returned mismatched keypoints and descriptors"
+            );
+            (AkazeStatus::DecodeError, None, None)
+        } else {
+            (
+                AkazeStatus::Ready,
+                Some(
+                    keypoints
+                        .iter()
+                        .map(|point| AkazePoint {
+                            x: point.point.0,
+                            y: point.point.1,
+                        })
+                        .collect(),
+                ),
+                Some(descriptors.iter().map(|d| d.bytes().to_vec()).collect()),
+            )
+        };
+    (
+        akaze_status,
+        akaze_keypoints,
+        akaze_points,
+        akaze_descriptors,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TentativeMatch {
+    a_index: usize,
+    b_index: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NeighborMatch {
+    best_index: usize,
+    best_distance: u32,
+    second_distance: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AffineModel {
+    a11: f32,
+    a12: f32,
+    a13: f32,
+    a21: f32,
+    a22: f32,
+    a23: f32,
+}
+
+impl AffineModel {
+    fn project(self, point: AkazePoint) -> AkazePoint {
+        AkazePoint {
+            x: self.a11 * point.x + self.a12 * point.y + self.a13,
+            y: self.a21 * point.x + self.a22 * point.y + self.a23,
+        }
+    }
+}
+
+fn collect_mutual_matches(a_descs: &[Vec<u8>], b_descs: &[Vec<u8>]) -> Vec<TentativeMatch> {
+    if a_descs.len() < 2 || b_descs.len() < 2 {
+        return Vec::new();
+    }
+
+    let forward: Vec<_> = a_descs
+        .iter()
+        .map(|desc| best_two_neighbors(desc, b_descs))
+        .collect();
+    let reverse: Vec<_> = b_descs
+        .iter()
+        .map(|desc| best_two_neighbors(desc, a_descs))
+        .collect();
+
+    let mut matches = Vec::new();
+    for (a_index, neighbor) in forward.iter().enumerate() {
+        let Some(neighbor) = neighbor.as_ref().copied().filter(satisfies_lowe_ratio) else {
+            continue;
+        };
+        let Some(reverse_neighbor) = reverse[neighbor.best_index]
+            .as_ref()
+            .copied()
+            .filter(satisfies_lowe_ratio)
+        else {
+            continue;
+        };
+        if reverse_neighbor.best_index == a_index {
+            matches.push(TentativeMatch {
+                a_index,
+                b_index: neighbor.best_index,
+            });
+        }
+    }
+    matches
+}
+
+fn best_two_neighbors(desc: &[u8], candidates: &[Vec<u8>]) -> Option<NeighborMatch> {
+    if candidates.len() < 2 {
+        return None;
+    }
+
+    let mut best_index = 0usize;
+    let mut best_distance = u32::MAX;
+    let mut second_distance = u32::MAX;
+    for (index, candidate) in candidates.iter().enumerate() {
+        let distance = hamming_distance(desc, candidate);
+        if distance < best_distance {
+            second_distance = best_distance;
+            best_distance = distance;
+            best_index = index;
+        } else if distance < second_distance {
+            second_distance = distance;
+        }
+    }
+
+    Some(NeighborMatch {
+        best_index,
+        best_distance,
+        second_distance,
+    })
+}
+
+fn satisfies_lowe_ratio(m: &NeighborMatch) -> bool {
+    (m.best_distance as f32) < (m.second_distance as f32) * LOWE_RATIO_THRESHOLD
+        && m.best_distance < MATCH_DISTANCE_THRESHOLD
+}
+
+fn affine_ransac_inliers(
+    a_points: &[AkazePoint],
+    b_points: &[AkazePoint],
+    matches: &[TentativeMatch],
+) -> usize {
+    if matches.len() < 3 {
+        return 0;
+    }
+
+    let mut best_inliers = 0usize;
+    if matches.len() <= RANSAC_EXHAUSTIVE_LIMIT {
+        for i in 0..matches.len() - 2 {
+            for j in i + 1..matches.len() - 1 {
+                for k in j + 1..matches.len() {
+                    if let Some(model) =
+                        estimate_affine(a_points, b_points, [matches[i], matches[j], matches[k]])
+                    {
+                        best_inliers = best_inliers
+                            .max(count_affine_inliers(model, a_points, b_points, matches));
+                    }
+                }
+            }
+        }
+        return best_inliers;
+    }
+
+    let mut state = ransac_seed(matches.len());
+    for _ in 0..RANSAC_MAX_RANDOM_SAMPLES {
+        let sample = random_triplet(matches.len(), &mut state);
+        if let Some(model) = estimate_affine(
+            a_points,
+            b_points,
+            [matches[sample[0]], matches[sample[1]], matches[sample[2]]],
+        ) {
+            best_inliers =
+                best_inliers.max(count_affine_inliers(model, a_points, b_points, matches));
+            if best_inliers == matches.len() {
+                break;
+            }
+        }
+    }
+    best_inliers
+}
+
+fn estimate_affine(
+    a_points: &[AkazePoint],
+    b_points: &[AkazePoint],
+    sample: [TentativeMatch; 3],
+) -> Option<AffineModel> {
+    let mut matrix = [[0.0f32; 7]; 6];
+    for (row, matched) in sample.iter().enumerate() {
+        let a = a_points[matched.a_index];
+        let b = b_points[matched.b_index];
+        matrix[row * 2] = [a.x, a.y, 1.0, 0.0, 0.0, 0.0, b.x];
+        matrix[row * 2 + 1] = [0.0, 0.0, 0.0, a.x, a.y, 1.0, b.y];
+    }
+
+    let solution = solve_linear_system(&mut matrix)?;
+    Some(AffineModel {
+        a11: solution[0],
+        a12: solution[1],
+        a13: solution[2],
+        a21: solution[3],
+        a22: solution[4],
+        a23: solution[5],
+    })
+}
+
+fn solve_linear_system(matrix: &mut [[f32; 7]; 6]) -> Option<[f32; 6]> {
+    for pivot in 0..6 {
+        let mut pivot_row = pivot;
+        let mut pivot_value = matrix[pivot][pivot].abs();
+        for row in pivot + 1..6 {
+            let value = matrix[row][pivot].abs();
+            if value > pivot_value {
+                pivot_row = row;
+                pivot_value = value;
+            }
+        }
+        if pivot_value <= 1e-6 {
+            return None;
+        }
+        if pivot_row != pivot {
+            matrix.swap(pivot, pivot_row);
+        }
+
+        let scale = matrix[pivot][pivot];
+        for col in pivot..7 {
+            matrix[pivot][col] /= scale;
+        }
+        for row in 0..6 {
+            if row == pivot {
+                continue;
+            }
+            let factor = matrix[row][pivot];
+            if factor.abs() <= 1e-6 {
+                continue;
+            }
+            for col in pivot..7 {
+                matrix[row][col] -= factor * matrix[pivot][col];
+            }
+        }
+    }
+
+    let mut solution = [0.0f32; 6];
+    for row in 0..6 {
+        solution[row] = matrix[row][6];
+    }
+    Some(solution)
+}
+
+fn count_affine_inliers(
+    model: AffineModel,
+    a_points: &[AkazePoint],
+    b_points: &[AkazePoint],
+    matches: &[TentativeMatch],
+) -> usize {
+    let threshold_sq = RANSAC_REPROJECTION_THRESHOLD * RANSAC_REPROJECTION_THRESHOLD;
+    matches
+        .iter()
+        .filter(|matched| {
+            let projected = model.project(a_points[matched.a_index]);
+            let target = b_points[matched.b_index];
+            let dx = projected.x - target.x;
+            let dy = projected.y - target.y;
+            dx * dx + dy * dy <= threshold_sq
+        })
+        .count()
+}
+
+fn ransac_seed(match_count: usize) -> u64 {
+    0x9E37_79B9_7F4A_7C15u64 ^ (match_count as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+}
+
+fn random_triplet(len: usize, state: &mut u64) -> [usize; 3] {
+    let first = next_index(len, state);
+    let mut second = next_index(len, state);
+    while second == first {
+        second = next_index(len, state);
+    }
+    let mut third = next_index(len, state);
+    while third == first || third == second {
+        third = next_index(len, state);
+    }
+    [first, second, third]
+}
+
+fn next_index(len: usize, state: &mut u64) -> usize {
+    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+    ((*state >> 32) as usize) % len
 }
 
 pub fn compute_base_features_from_image(image: &DynamicImage) -> VisualFeatures {
@@ -229,6 +529,7 @@ pub fn compute_base_features_from_image(image: &DynamicImage) -> VisualFeatures 
         size_bytes_hint: 0,
         akaze_status: AkazeStatus::Pending,
         akaze_keypoints: None,
+        akaze_points: None,
         akaze_descriptors: None,
     }
 }
@@ -303,6 +604,15 @@ pub fn akaze_confirm(
     let Some(b_descs) = b_descs else {
         return false;
     };
+    let Some(a_points) = a.akaze_points.as_ref() else {
+        return false;
+    };
+    let Some(b_points) = b.akaze_points.as_ref() else {
+        return false;
+    };
+    if a_descs.len() != a_points.len() || b_descs.len() != b_points.len() {
+        return false;
+    }
 
     // 2. Minimum keypoint count protection
     if a_descs.len() < 25 || b_descs.len() < 25 {
@@ -310,39 +620,22 @@ pub fn akaze_confirm(
     }
 
     // Performance protection: limit number of descriptors to compare
-    let a_subset = &a_descs[..a_descs.len().min(MAX_KEYPOINTS_FOR_MATCH)];
-    let b_subset = &b_descs[..b_descs.len().min(MAX_KEYPOINTS_FOR_MATCH)];
+    let a_len = a_descs.len().min(MAX_KEYPOINTS_FOR_MATCH);
+    let b_len = b_descs.len().min(MAX_KEYPOINTS_FOR_MATCH);
+    let a_descs = &a_descs[..a_len];
+    let b_descs = &b_descs[..b_len];
+    let a_points = &a_points[..a_len];
+    let b_points = &b_points[..b_len];
 
-    let mut good_matches = 0usize;
-    let ratio_threshold = 0.75f32;
-
-    // 3. Lowe's Ratio Test
-    for desc_a in a_subset {
-        let mut min_dist1 = u32::MAX;
-        let mut min_dist2 = u32::MAX;
-
-        for desc_b in b_subset {
-            let dist = hamming_distance(desc_a, desc_b);
-            if dist < min_dist1 {
-                min_dist2 = min_dist1;
-                min_dist1 = dist;
-            } else if dist < min_dist2 {
-                min_dist2 = dist;
-            }
-        }
-
-        // Ratio Test: Best match must be significantly better than the second best
-        if (min_dist1 as f32) < (min_dist2 as f32) * ratio_threshold && min_dist1 < 96 {
-            good_matches += 1;
-        }
+    // Use symmetric tentative matches, then require a consistent affine geometry.
+    let matches = collect_mutual_matches(a_descs, b_descs);
+    if matches.len() < min_matches.max(3) {
+        return false;
     }
 
-    // 4. Final judgment: absolute count + relative ratio
-    let min_points = a_subset.len().min(b_subset.len());
-    let match_ratio = good_matches as f32 / min_points as f32;
-
-    // We require at least min_matches AND at least 15% of the points to match
-    good_matches >= min_matches && match_ratio >= 0.15
+    let inliers = affine_ransac_inliers(a_points, b_points, &matches);
+    let inlier_ratio = inliers as f32 / matches.len() as f32;
+    inliers >= min_matches.max(3) && inlier_ratio >= RANSAC_MIN_INLIER_RATIO
 }
 
 fn hamming_distance(left: &[u8], right: &[u8]) -> u32 {
@@ -364,6 +657,41 @@ pub fn phash_to_u64(phash: &str) -> Option<u64> {
         value = (value << 8) | u64::from(*byte);
     }
     Some(value)
+}
+
+pub fn serialize_akaze_points(points: &[AkazePoint]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(
+        &u32::try_from(points.len())
+            .context("too many akaze points")?
+            .to_le_bytes(),
+    );
+    for point in points {
+        out.extend_from_slice(&point.x.to_le_bytes());
+        out.extend_from_slice(&point.y.to_le_bytes());
+    }
+    Ok(out)
+}
+
+pub fn deserialize_akaze_points(blob: &[u8]) -> Result<Vec<AkazePoint>> {
+    if blob.len() < 4 {
+        anyhow::bail!("point blob too small");
+    }
+
+    let mut offset = 0usize;
+    let count = read_u32(blob, &mut offset)? as usize;
+    let mut points = Vec::with_capacity(count);
+    for _ in 0..count {
+        let x = read_f32(blob, &mut offset)?;
+        let y = read_f32(blob, &mut offset)?;
+        points.push(AkazePoint { x, y });
+    }
+
+    if offset != blob.len() {
+        anyhow::bail!("point blob has trailing bytes");
+    }
+
+    Ok(points)
 }
 
 pub fn serialize_akaze_descriptors(descriptors: &[Vec<u8>]) -> Result<Vec<u8>> {
@@ -413,6 +741,20 @@ fn read_u32(blob: &[u8], offset: &mut usize) -> Result<u32> {
         anyhow::bail!("descriptor blob truncated");
     }
     let value = u32::from_le_bytes([
+        blob[*offset],
+        blob[*offset + 1],
+        blob[*offset + 2],
+        blob[*offset + 3],
+    ]);
+    *offset += 4;
+    Ok(value)
+}
+
+fn read_f32(blob: &[u8], offset: &mut usize) -> Result<f32> {
+    if blob.len() < *offset + 4 {
+        anyhow::bail!("point blob truncated");
+    }
+    let value = f32::from_le_bytes([
         blob[*offset],
         blob[*offset + 1],
         blob[*offset + 2],
@@ -623,6 +965,25 @@ mod tests {
             .join(name)
     }
 
+    fn group_189_snapshot_path(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("docs")
+            .join("group_bad_cases")
+            .join("group-189-investigation")
+            .join("snapshot")
+            .join("group-189")
+            .join("files")
+            .join("repo")
+            .join(name)
+    }
+
+    fn visual_features_for_path(path: &Path, mime_type: &str) -> VisualFeatures {
+        let bytes = fs::read(path).unwrap();
+        compute_visual_features_for_mime_from_bytes(&bytes, path, mime_type)
+            .unwrap()
+            .unwrap()
+    }
+
     #[test]
     fn compute_visual_features_for_arw_raw_preview() {
         let arw = fixture_path("source/DSC00903.ARW");
@@ -777,6 +1138,7 @@ mod tests {
         assert!(!features.phash.is_empty());
         assert_eq!(features.akaze_status, AkazeStatus::TooSmall);
         assert!(features.akaze_keypoints.is_none());
+        assert!(features.akaze_points.is_none());
         assert!(features.akaze_descriptors.is_none());
     }
 
@@ -793,6 +1155,7 @@ mod tests {
         assert!(!features.phash.is_empty());
         assert_eq!(features.akaze_status, AkazeStatus::TooSmall);
         assert!(features.akaze_keypoints.is_none());
+        assert!(features.akaze_points.is_none());
         assert!(features.akaze_descriptors.is_none());
     }
 
@@ -809,6 +1172,48 @@ mod tests {
         let features = compute_visual_features_from_image(&image);
         assert_eq!(features.akaze_status, AkazeStatus::Ready);
         assert!(features.akaze_keypoints.unwrap_or(0) > 0);
+        assert_eq!(
+            features.akaze_keypoints,
+            features.akaze_points.as_ref().map(Vec::len)
+        );
         assert!(features.akaze_descriptors.is_some());
+    }
+
+    #[test]
+    fn akaze_point_blob_roundtrips() {
+        let points = vec![AkazePoint { x: 1.5, y: 2.5 }, AkazePoint { x: 3.0, y: 4.0 }];
+        let blob = serialize_akaze_points(&points).unwrap();
+        let decoded = deserialize_akaze_points(&blob).unwrap();
+        assert_eq!(decoded, points);
+    }
+
+    #[test]
+    fn akaze_confirm_accepts_group_189_photo_derivative_pair() {
+        let original = visual_features_for_path(
+            &group_189_snapshot_path("2015/10/01/IMG_2999.JPG"),
+            "image/jpeg",
+        );
+        let derivative = visual_features_for_path(
+            &group_189_snapshot_path("2025/03/17/defaultimg_2999.jpg"),
+            "image/jpeg",
+        );
+
+        assert!(akaze_confirm(&original, &derivative, 10, 14));
+        assert!(akaze_confirm(&derivative, &original, 10, 14));
+    }
+
+    #[test]
+    fn akaze_confirm_rejects_group_189_photo_to_text_bridge() {
+        let photo = visual_features_for_path(
+            &group_189_snapshot_path("2025/03/17/defaultimg_2999.jpg"),
+            "image/jpeg",
+        );
+        let text = visual_features_for_path(
+            &group_189_snapshot_path("2017/06/08/type2_Cochin_24pt_Cell_26x28.png"),
+            "image/png",
+        );
+
+        assert!(!akaze_confirm(&photo, &text, 10, 14));
+        assert!(!akaze_confirm(&text, &photo, 10, 14));
     }
 }

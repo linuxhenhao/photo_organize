@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
-pub const FEATURE_VERSION: i64 = 6;
+pub const FEATURE_VERSION: i64 = 7;
 
 pub fn open_scan_db(path: impl AsRef<Path>) -> Result<Connection> {
     let conn = Connection::open(path.as_ref())
@@ -84,6 +84,7 @@ fn init_catalog_schema(conn: &Connection) -> Result<()> {
             akaze_status TEXT NOT NULL DEFAULT 'pending',
             akaze_keypoints INTEGER,
             akaze_descriptors BLOB,
+            akaze_points BLOB,
             feature_version INTEGER NOT NULL,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (exact_hash, size_bytes)
@@ -103,6 +104,9 @@ fn migrate_feature_cache_schema(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    if !table_has_column(conn, "feature_cache", "akaze_points")? {
+        conn.execute("ALTER TABLE feature_cache ADD COLUMN akaze_points BLOB", [])?;
+    }
     normalize_feature_cache_rows(conn)?;
     Ok(())
 }
@@ -116,6 +120,7 @@ fn normalize_feature_cache_rows(conn: &Connection) -> Result<()> {
             feature_version = ?1
         WHERE
             akaze_descriptors IS NOT NULL
+            AND akaze_points IS NOT NULL
             AND (
                 akaze_status IS NULL
                 OR akaze_status = ''
@@ -161,6 +166,17 @@ fn normalize_feature_cache_rows(conn: &Connection) -> Result<()> {
         r#"
         DELETE FROM feature_cache
         WHERE
+            akaze_descriptors IS NOT NULL
+            AND akaze_points IS NULL
+            AND feature_version < ?1
+        "#,
+        params![FEATURE_VERSION],
+    )?;
+
+    conn.execute(
+        r#"
+        DELETE FROM feature_cache
+        WHERE
             akaze_descriptors IS NULL
             AND akaze_status = 'no_keypoints'
             AND feature_version < ?1
@@ -185,7 +201,7 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::serialize_akaze_descriptors;
+    use crate::features::{AkazePoint, serialize_akaze_descriptors, serialize_akaze_points};
     use tempfile::tempdir;
 
     #[test]
@@ -227,15 +243,14 @@ mod tests {
         let has_status = table_has_column(&migrated, "feature_cache", "akaze_status").unwrap();
         assert!(has_status);
 
-        let ready_row: (String, i64) = migrated
+        let ready_count: i64 = migrated
             .query_row(
-                "SELECT akaze_status, feature_version FROM feature_cache WHERE exact_hash = 'ready-hash'",
+                "SELECT COUNT(*) FROM feature_cache WHERE exact_hash = 'ready-hash'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(ready_row.0, "ready");
-        assert_eq!(ready_row.1, FEATURE_VERSION);
+        assert_eq!(ready_count, 0);
 
         let stale_row: (String, i64) = migrated
             .query_row(
@@ -318,6 +333,49 @@ mod tests {
             .unwrap();
         assert_eq!(too_small_row.0, "too_small");
         assert_eq!(too_small_row.1, FEATURE_VERSION);
+    }
+
+    #[test]
+    fn open_catalog_db_keeps_geometry_aware_ready_rows() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE feature_cache (
+                exact_hash TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                akaze_status TEXT NOT NULL DEFAULT 'pending',
+                akaze_keypoints INTEGER,
+                akaze_descriptors BLOB,
+                akaze_points BLOB,
+                feature_version INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (exact_hash, size_bytes)
+            );
+            "#,
+        )
+        .unwrap();
+        let ready_blob = serialize_akaze_descriptors(&[vec![1, 2, 3, 4]]).unwrap();
+        let points_blob = serialize_akaze_points(&[AkazePoint { x: 1.0, y: 2.0 }]).unwrap();
+        conn.execute(
+            "INSERT INTO feature_cache (exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, akaze_points, feature_version, updated_at)
+             VALUES (?1, ?2, 'ready', ?3, ?4, ?5, ?6, datetime('now'))",
+            params!["ready-hash", 10_i64, 1_i64, ready_blob, points_blob, FEATURE_VERSION - 1],
+        )
+        .unwrap();
+        drop(conn);
+
+        let migrated = open_catalog_db(&db_path).unwrap();
+        let ready_row: (String, i64) = migrated
+            .query_row(
+                "SELECT akaze_status, feature_version FROM feature_cache WHERE exact_hash = 'ready-hash'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ready_row.0, "ready");
+        assert_eq!(ready_row.1, FEATURE_VERSION);
     }
 }
 

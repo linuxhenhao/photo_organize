@@ -293,6 +293,7 @@ fn empty_visual_features() -> VisualFeatures {
         size_bytes_hint: 0,
         akaze_status: AkazeStatus::Pending,
         akaze_keypoints: None,
+        akaze_points: None,
         akaze_descriptors: None,
     }
 }
