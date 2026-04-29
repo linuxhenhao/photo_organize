@@ -5,9 +5,12 @@ use crate::features::{
     serialize_akaze_descriptors, serialize_akaze_points, supports_visual_features,
 };
 use anyhow::{Context, Result};
+use lru::LruCache;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::Path;
+#[cfg(test)]
+use std::mem::size_of;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FeatureCacheKey {
@@ -27,9 +30,27 @@ pub struct FeatureRequest<'a> {
     pub height: i64,
 }
 
-#[derive(Debug, Default)]
+// Committed fixture measurements put ready-feature payloads at roughly
+// 0.7-6.8 KiB as a lower-bound heap estimate. A synthetic RSS probe of the
+// current LruCache<FeatureCacheKey, VisualFeatures> shape with a representative
+// "large ready feature" landed at about 7.9 KiB per cached entry including
+// cache/key overhead, so 4096 entries is about 31.9 MiB of cache usage.
+const FEATURE_LOADER_MEMO_CAPACITY: usize = 4096;
+
+#[derive(Debug)]
 pub struct FeatureLoader {
-    memo: HashMap<FeatureCacheKey, VisualFeatures>,
+    memo: LruCache<FeatureCacheKey, VisualFeatures>,
+}
+
+impl Default for FeatureLoader {
+    fn default() -> Self {
+        Self {
+            memo: LruCache::new(
+                NonZeroUsize::new(FEATURE_LOADER_MEMO_CAPACITY)
+                    .expect("feature loader memo capacity must be non-zero"),
+            ),
+        }
+    }
 }
 
 impl FeatureLoader {
@@ -44,7 +65,7 @@ impl FeatureLoader {
                 exact_hash: request.exact_hash.to_string(),
                 size_bytes: request.size_bytes,
             };
-            self.memo.insert(key, fallback.clone());
+            self.maybe_memoize(key, &fallback);
             return Ok(fallback);
         }
 
@@ -57,14 +78,14 @@ impl FeatureLoader {
         }
 
         if let Some(cached) = load_cached_feature(conn, &key, request)? {
-            self.memo.insert(key, cached.clone());
+            self.maybe_memoize(key, &cached);
             return Ok(cached);
         }
 
         let mut computed = compute_feature(request)?;
         computed.size_bytes_hint = request.size_bytes;
         save_feature_cache(conn, request.size_bytes, &computed)?;
-        self.memo.insert(key, computed.clone());
+        self.maybe_memoize(key, &computed);
         Ok(computed)
     }
 
@@ -81,6 +102,23 @@ impl FeatureLoader {
         })?;
         feat.size_bytes_hint = item.size_bytes;
         Ok(feat)
+    }
+
+    fn maybe_memoize(&mut self, key: FeatureCacheKey, features: &VisualFeatures) {
+        self.memo.put(key, features.clone());
+    }
+
+    #[cfg(test)]
+    fn memo_len(&self) -> usize {
+        self.memo.len()
+    }
+
+    #[cfg(test)]
+    fn memo_contains(&self, exact_hash: &str, size_bytes: i64) -> bool {
+        self.memo.contains(&FeatureCacheKey {
+            exact_hash: exact_hash.to_string(),
+            size_bytes,
+        })
     }
 }
 
@@ -104,6 +142,24 @@ fn compute_feature(request: FeatureRequest<'_>) -> Result<VisualFeatures> {
     }
 
     Ok(fallback_features(request, AkazeStatus::DecodeError))
+}
+
+#[cfg(test)]
+fn estimated_feature_bytes(features: &VisualFeatures) -> usize {
+    let mut total = size_of::<VisualFeatures>();
+    total += features.exact_hash.capacity();
+    total += features.phash.capacity();
+
+    if let Some(points) = features.akaze_points.as_ref() {
+        total += points.capacity() * size_of::<crate::features::AkazePoint>();
+    }
+
+    if let Some(descriptors) = features.akaze_descriptors.as_ref() {
+        total += descriptors.capacity() * size_of::<Vec<u8>>();
+        total += descriptors.iter().map(|desc| desc.capacity()).sum::<usize>();
+    }
+
+    total
 }
 
 fn fallback_features(request: FeatureRequest<'_>, akaze_status: AkazeStatus) -> VisualFeatures {
@@ -263,6 +319,12 @@ mod tests {
             .join(name)
     }
 
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data")
+            .join(name)
+    }
+
     #[test]
     fn loader_reuses_db_cache_for_same_hash_and_size() {
         let tmp = tempdir().unwrap();
@@ -320,6 +382,148 @@ mod tests {
     }
 
     #[test]
+    fn loader_memoizes_ready_features() {
+        let tmp = tempdir().unwrap();
+        let catalog = open_catalog_db(tmp.path().join("catalog.db")).unwrap();
+        let exact_hash = "ready-hash";
+        let size_bytes = 123_i64;
+        let expected = VisualFeatures {
+            exact_hash: exact_hash.to_string(),
+            phash: "AAAAAAAAAAA=".to_string(),
+            phash_bits: 64,
+            phash_value: 0,
+            width: 640,
+            height: 480,
+            size_bytes_hint: size_bytes,
+            akaze_status: AkazeStatus::Ready,
+            akaze_keypoints: Some(2),
+            akaze_points: Some(vec![
+                crate::features::AkazePoint { x: 1.0, y: 2.0 },
+                crate::features::AkazePoint { x: 3.0, y: 4.0 },
+            ]),
+            akaze_descriptors: Some(vec![vec![1, 2, 3], vec![4, 5, 6]]),
+        };
+        save_feature_cache(&catalog, size_bytes, &expected).unwrap();
+
+        let mut loader = FeatureLoader::default();
+        let features = loader
+            .load(
+                &catalog,
+                FeatureRequest {
+                    path: &tmp.path().join("missing-but-cacheable.jpg"),
+                    mime_type: "image/jpeg",
+                    exact_hash,
+                    size_bytes,
+                    phash_hint: &expected.phash,
+                    phash_bits: expected.phash_bits,
+                    width: expected.width,
+                    height: expected.height,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(features.akaze_status, AkazeStatus::Ready);
+        assert_eq!(features.akaze_points, expected.akaze_points);
+        assert_eq!(features.akaze_descriptors, expected.akaze_descriptors);
+        assert_eq!(loader.memo_len(), 1);
+        assert!(loader.memo_contains(exact_hash, size_bytes));
+    }
+
+    #[test]
+    fn loader_evicts_oldest_ready_features_when_capacity_is_exceeded() {
+        let tmp = tempdir().unwrap();
+        let catalog = open_catalog_db(tmp.path().join("catalog.db")).unwrap();
+        let mut loader = FeatureLoader::default();
+
+        for index in 0..=FEATURE_LOADER_MEMO_CAPACITY {
+            let exact_hash = format!("ready-hash-{index}");
+            let size_bytes = 1000 + index as i64;
+            let expected = VisualFeatures {
+                exact_hash: exact_hash.clone(),
+                phash: "AAAAAAAAAAA=".to_string(),
+                phash_bits: 64,
+                phash_value: 0,
+                width: 640,
+                height: 480,
+                size_bytes_hint: size_bytes,
+                akaze_status: AkazeStatus::Ready,
+                akaze_keypoints: Some(1),
+                akaze_points: Some(vec![crate::features::AkazePoint { x: 1.0, y: 2.0 }]),
+                akaze_descriptors: Some(vec![vec![1, 2, 3]]),
+            };
+            save_feature_cache(&catalog, size_bytes, &expected).unwrap();
+
+            let features = loader
+                .load(
+                    &catalog,
+                    FeatureRequest {
+                        path: &tmp.path().join(format!("cached-{index}.jpg")),
+                        mime_type: "image/jpeg",
+                        exact_hash: &exact_hash,
+                        size_bytes,
+                        phash_hint: &expected.phash,
+                        phash_bits: expected.phash_bits,
+                        width: expected.width,
+                        height: expected.height,
+                    },
+                )
+                .unwrap();
+            assert_eq!(features.akaze_status, AkazeStatus::Ready);
+        }
+
+        assert_eq!(loader.memo_len(), FEATURE_LOADER_MEMO_CAPACITY);
+        assert!(!loader.memo_contains("ready-hash-0", 1000));
+        assert!(loader.memo_contains(
+            &format!("ready-hash-{}", FEATURE_LOADER_MEMO_CAPACITY),
+            1000 + FEATURE_LOADER_MEMO_CAPACITY as i64
+        ));
+    }
+
+    #[test]
+    #[ignore = "diagnostic measurement for feature cache sizing"]
+    fn report_feature_memory_estimates() {
+        let samples = [
+            ("source_mock/img_2023_05_01.jpg", "image/jpeg"),
+            ("source_mock/img_2023_05_02.jpg", "image/jpeg"),
+            ("source/DSC00903.ARW", "image/x-sony-arw"),
+            ("source/IMG_5798.CR2", "image/x-canon-cr2"),
+            ("problematic_images/IMG_5887.JPG", "image/jpeg"),
+        ];
+
+        for (rel, mime) in samples {
+            let path = fixture_path(rel);
+            let bytes = fs::read(&path).unwrap();
+            let exact_hash = exact_hash(&bytes);
+            let size_bytes = i64::try_from(bytes.len()).unwrap();
+            let mut loader = FeatureLoader::default();
+            let catalog = open_catalog_db(tempdir().unwrap().path().join("catalog.db")).unwrap();
+            let features = loader
+                .load(
+                    &catalog,
+                    FeatureRequest {
+                        path: &path,
+                        mime_type: mime,
+                        exact_hash: &exact_hash,
+                        size_bytes,
+                        phash_hint: "",
+                        phash_bits: 0,
+                        width: 0,
+                        height: 0,
+                    },
+                )
+                .unwrap();
+            eprintln!(
+                "{} status={:?} keypoints={:?} descriptors={} estimated_bytes={}",
+                rel,
+                features.akaze_status,
+                features.akaze_keypoints,
+                features.akaze_descriptors.as_ref().map_or(0, Vec::len),
+                estimated_feature_bytes(&features)
+            );
+        }
+    }
+
+    #[test]
     fn loader_skips_non_visual_files_without_reading() {
         let tmp = tempdir().unwrap();
         let catalog = open_catalog_db(tmp.path().join("catalog.db")).unwrap();
@@ -342,6 +546,7 @@ mod tests {
         assert!(features.phash.is_empty());
         assert_eq!(features.akaze_status, AkazeStatus::Unavailable);
         assert!(features.akaze_descriptors.is_none());
+        assert_eq!(loader.memo_len(), 1);
 
         let count: i64 = catalog
             .query_row("SELECT COUNT(*) FROM feature_cache", [], |row| row.get(0))
