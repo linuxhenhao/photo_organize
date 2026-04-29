@@ -74,6 +74,12 @@ struct GroupParams {
 const DEFAULT_PAGE_SIZE: usize = 20;
 const MAX_PAGE_SIZE: usize = 200;
 
+#[derive(Debug, Serialize)]
+struct PagingRequest {
+    page_index: usize,
+    page_size: usize,
+}
+
 #[derive(Debug, Deserialize)]
 struct ResolveRequest {
     kept: Option<Vec<String>>,
@@ -119,6 +125,21 @@ where
     Ok(())
 }
 
+fn normalize_group_params(params: &GroupParams) -> PagingRequest {
+    let page_size = params
+        .page_size
+        .or(params.limit)
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let page_index = params
+        .page_index
+        .unwrap_or_else(|| params.page.unwrap_or(1).saturating_sub(1));
+    PagingRequest {
+        page_index,
+        page_size,
+    }
+}
+
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
@@ -130,9 +151,10 @@ fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn index() -> Html<&'static str> {
-    Html(
-        r#"<!doctype html>
+async fn index(Query(params): Query<GroupParams>) -> Html<String> {
+    let initial_paging = serde_json::to_string(&normalize_group_params(&params))
+        .expect("paging request should serialize");
+    let html = r#"<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -253,18 +275,6 @@ async fn index() -> Html<&'static str> {
         current_page: 1,
         limit: 20
     };
-
-    function getInitialPaging() {
-      const params = new URLSearchParams(window.location.search);
-      const pageIndexParam = params.get('page_index') ?? (params.has('page') ? String(Math.max(0, Number(params.get('page')) - 1)) : null);
-      const pageSizeParam = params.get('page_size') ?? params.get('limit');
-      const pageIndex = Number.parseInt(pageIndexParam ?? '0', 10);
-      const pageSize = Number.parseInt(pageSizeParam ?? String(pagedData.page_size), 10);
-      return {
-        page_index: Number.isFinite(pageIndex) && pageIndex >= 0 ? pageIndex : 0,
-        page_size: Number.isFinite(pageSize) && pageSize > 0 ? pageSize : pagedData.page_size,
-      };
-    }
 
     function syncBrowserUrl() {
       const url = new URL(window.location.href);
@@ -484,12 +494,16 @@ async fn index() -> Html<&'static str> {
       }
     }
 
-    const initialPaging = getInitialPaging();
+    const initialPaging = __INITIAL_PAGING__;
+    pagedData.page_index = initialPaging.page_index;
+    pagedData.page_size = initialPaging.page_size;
+    pagedData.current_page = initialPaging.page_index + 1;
+    pagedData.limit = initialPaging.page_size;
     fetchGroups(initialPaging.page_index, initialPaging.page_size);
   </script>
 </body>
-</html>"#,
-    )
+</html>"#;
+    Html(html.replace("__INITIAL_PAGING__", &initial_paging))
 }
 
 async fn list_groups(
@@ -497,14 +511,9 @@ async fn list_groups(
     Query(params): Query<GroupParams>,
 ) -> Result<Json<PagedGroups>, (StatusCode, String)> {
     let conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
-    let page_size = params
-        .page_size
-        .or(params.limit)
-        .unwrap_or(DEFAULT_PAGE_SIZE)
-        .clamp(1, MAX_PAGE_SIZE);
-    let requested_page_index = params
-        .page_index
-        .unwrap_or_else(|| params.page.unwrap_or(1).saturating_sub(1));
+    let paging = normalize_group_params(&params);
+    let page_size = paging.page_size;
+    let requested_page_index = paging.page_index;
 
     let total_groups: i64 = conn
         .query_row(
@@ -1028,6 +1037,28 @@ mod tests {
         assert!(html.contains("page_index"));
         assert!(html.contains("page_size"));
         assert!(html.contains("changePageSize"));
+    }
+
+    #[tokio::test]
+    async fn index_html_embeds_initial_paging_from_query() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        open_catalog_db(&db_path).unwrap();
+
+        let app = router(AppState { db_path, dest });
+        let request = axum::http::Request::builder()
+            .uri("/?page_index=2&page_size=1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains(r#"const initialPaging = {"page_index":2,"page_size":1};"#));
     }
 
     #[tokio::test]
