@@ -42,19 +42,6 @@ pub fn run(scan_db: &Path, roots: &[PathBuf]) -> Result<()> {
     scan_with_db_path(scan_db, roots)
 }
 
-#[allow(dead_code)]
-pub fn scan_with_conn(conn: &mut Connection, roots: &[PathBuf]) -> Result<()> {
-    let items = collect_discovered_files(roots)?;
-    interrupt::check()?;
-    let run_id = now_string();
-    let tx = conn.transaction()?;
-    upsert_items(&tx, &items, &run_id)?;
-    mark_missing_unseen(&tx, &run_id)?;
-    tx.commit()?;
-    tracing::info!(count = items.len(), "scan complete");
-    Ok(())
-}
-
 fn scan_with_db_path(scan_db: &Path, roots: &[PathBuf]) -> Result<()> {
     let files = collect_file_paths(roots)?;
     let total = files.len();
@@ -138,32 +125,6 @@ pub(crate) fn collect_file_paths(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(files)
-}
-
-#[allow(dead_code)]
-pub(crate) fn collect_discovered_files(roots: &[PathBuf]) -> Result<Vec<DiscoveredFile>> {
-    let files = collect_file_paths(roots)?;
-    let progress = ProgressReporter::new("scan discover", files.len());
-    progress.log_start();
-    let items: Vec<DiscoveredFile> = files
-        .par_iter()
-        .filter_map(|path| {
-            if interrupt::requested() {
-                return None;
-            }
-            let result = match discover_file(path) {
-                Ok(item) => Some(item),
-                Err(err) => {
-                    tracing::warn!(path = %path.display(), error = %err, "scan failed");
-                    None
-                }
-            };
-            progress.item_done();
-            result
-        })
-        .collect();
-    interrupt::check()?;
-    Ok(items)
 }
 
 pub(crate) fn discover_file(path: &Path) -> Result<DiscoveredFile> {
@@ -481,9 +442,7 @@ mod tests {
         run(&scan_db, &[src.clone()]).unwrap();
 
         fs::remove_file(&b).unwrap();
-        interrupt::request_for_test();
-        let result = run(&scan_db, &[src]);
-        interrupt::reset();
+        let result = interrupt::run_with_requested_interrupt(|| run(&scan_db, &[src]));
         assert!(result.is_err());
 
         let conn = open_scan_db(&scan_db).unwrap();

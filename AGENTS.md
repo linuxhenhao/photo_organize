@@ -1,7 +1,9 @@
 # Module Guidelines
 
+This is the primary agent context file for the `photo-org` Rust project. It complements the detailed design rationale in `docs/rust-rewrite-design.md`.
+
 ## Scope
-`photo-org-rs` is the Rust rewrite workspace for the photo organizer spec.
+`photo-org` is the Rust rewrite workspace for the photo organizer.
 
 It owns the new `photo-org` binary, the SQLite schema for `catalog.db` and scan databases, source scanning, target import, target adoption via `initcache`, and the local duplicate-resolution web server.
 It also handles RAW preview extraction in pure Rust when possible so camera RAW files can participate in scan/import grouping without shelling out to `exiftool`.
@@ -9,9 +11,13 @@ It also handles RAW preview extraction in pure Rust when possible so camera RAW 
 Repeated `initcache` runs should reuse prior `target_items` facts when file `size_bytes` and stored `modified_at` are unchanged, and only fall back to re-reading file content and recomputing hashes when that fingerprint changes.
 Long-running `scan`, `import`, and `initcache` paths should emit periodic progress logs with total, processed, and remaining counts so operators can tell that work is advancing.
 
+For the full design rationale, crate selection, and data-model decisions, see `docs/rust-rewrite-design.md`.
+
 Current internal structure also includes:
 - `feature_loader`: loads second-stage AKAZE data through a cache-first path and persists it in `catalog.db`.
 - `phash_index`: keeps an in-memory BK-tree over persisted 64-bit pHash values so `import` and `initcache` only run AKAZE on threshold-matching candidates.
+- `util`: MIME detection, EXIF date parsing, filename-safe normalization, path-safety checks, and the `ProgressReporter` used for periodic progress logs.
+- `interrupt`: shared Ctrl+C signal handling, exposing `check()` for sync bail-out and `wait()` for async graceful shutdown.
 
 ## Command Workflows
 
@@ -33,8 +39,11 @@ Current internal structure also includes:
 ## Storage Structure
 
 - **`catalog.db`**: The central repository for the organized collection.
-    - `target_items`: Current state of all files in the target directory, including `group_id` and `keep_state`.
-    - `feature_cache`: Content-based cache (exact hash + size) for AKAZE keypoints and descriptors to avoid redundant re-decoding.
+    - `target_items`: Current state of all files in the target directory, including `group_id`, `keep_state`, and `group_status`.
+      - `group_status`: Flow-control column used by `initcache`. Starts as `'pending'` on ingest, then serially flipped to `'completed'` after grouping. The pre-warm and grouping passes only process rows where `group_status = 'pending'`.
+      - `keep_state`: One of `'undecided'`, `'kept'`, or `'rejected'`. Set by `serve` resolution and used to filter unresolved groups.
+      - `is_group_primary`: Marks the preferred representative in a duplicate group.
+    - `feature_cache`: Content-based cache (exact hash + size) for AKAZE keypoints and descriptors to avoid redundant re-decoding. Includes `akaze_status`, `akaze_points`, and `feature_version` for schema migration.
     - `operations_log`: Audit log of changes (imports, group resolutions).
 - **`scan-db`**: A source-specific database (usually `import-scan.db`) used as a staging area during `scan` and `import` to track discovered source files and their metadata.
 
@@ -82,6 +91,9 @@ Current sizing guidance for this crate:
 - `AKAZE`: target about `640px` max dimension for better speed on current fixtures.
 - If a single shared size is required, prefer something around `640px`; `256px` is too small for reliable AKAZE.
 
+## Profiling
+Set `PHOTO_ORG_PROFILE_INITCACHE=1` to emit per-stage timing breakdowns for `initcache` runs. The profiling summary includes input feature calls, candidate loads, distance checks, AKAZE confirm calls, and DB transaction costs.
+
 ## Testing
 Add focused Rust tests next to the implementation or under `tests/` when behavior changes.
 Run `cargo test` for every code change in this crate.
@@ -89,3 +101,5 @@ Run `cargo test` for every code change in this crate.
 For Bookworm-targeted release builds inside Docker, use `./container_build.sh`. It uses the `photo-org-build:bookworm` image (building it automatically if missing) and mounts the host Cargo registry and git caches into the container so repeated builds do not re-download Rust dependencies.
 
 The expensive full-tree `initcache` regression lives in `tests/initcache_full_test_data.rs` and is intentionally `#[ignore]`; run it explicitly when changing import/initcache candidate selection, feature caching, or target adoption behavior.
+
+Integration smoke test: `./integration_test.sh`.

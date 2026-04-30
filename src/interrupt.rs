@@ -8,6 +8,9 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static INSTALL_HANDLER: Once = Once::new();
 static NOTIFY: OnceLock<Notify> = OnceLock::new();
 
+#[cfg(test)]
+static IN_INTERRUPT_TEST: AtomicBool = AtomicBool::new(false);
+
 fn notifier() -> &'static Notify {
     NOTIFY.get_or_init(Notify::new)
 }
@@ -34,14 +37,22 @@ pub fn reset() {
 }
 
 pub fn requested() -> bool {
-    INTERRUPTED.load(Ordering::SeqCst)
+    if !INTERRUPTED.load(Ordering::SeqCst) {
+        return false;
+    }
+    #[cfg(test)]
+    {
+        IN_INTERRUPT_TEST.load(Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    true
 }
 
 pub fn check() -> Result<()> {
-    if requested() {
-        bail!("interrupted");
+    if !requested() {
+        return Ok(());
     }
-    Ok(())
+    bail!("interrupted");
 }
 
 pub async fn wait() {
@@ -55,4 +66,32 @@ pub async fn wait() {
 pub fn request_for_test() {
     INTERRUPTED.store(true, Ordering::SeqCst);
     notifier().notify_waiters();
+}
+
+#[cfg(test)]
+pub fn run_with_requested_interrupt<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    enter_interrupt_test();
+    request_for_test();
+    let result = f();
+    release_interrupt_test();
+    result
+}
+
+#[cfg(test)]
+pub(crate) fn enter_interrupt_test() {
+    while IN_INTERRUPT_TEST
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn release_interrupt_test() {
+    reset();
+    IN_INTERRUPT_TEST.store(false, Ordering::Release);
 }

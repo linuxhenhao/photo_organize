@@ -739,6 +739,25 @@ async fn resolve_bulk(
     Json(request): Json<BulkResolveRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
+
+    for res in &request.resolutions {
+        let kept_set: HashSet<_> = res.kept.iter().collect();
+        let rejected_set: HashSet<_> = res.rejected.iter().collect();
+        if !kept_set.is_disjoint(&rejected_set) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "kept and rejected sets overlap in group {}",
+                    res.group_id
+                ),
+            ));
+        }
+        for path in kept_set.iter().chain(rejected_set.iter()) {
+            ensure_under_root(&state.dest, PathBuf::from(path).as_path())
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        }
+    }
+
     let tx = conn.transaction().map_err(internal_error)?;
 
     for res in request.resolutions {
@@ -949,16 +968,15 @@ async fn image(
             img
         } else {
             // Try RAW preview
-            use rsraw::{RawImage, ThumbFormat};
+            use crate::features::select_best_thumbnail;
+            use rsraw::RawImage;
             let mut raw =
                 RawImage::open(&bytes).map_err(|e| anyhow::anyhow!("rsraw open error: {}", e))?;
             let thumbs = raw
                 .extract_thumbs()
                 .map_err(|e| anyhow::anyhow!("rsraw extract error: {}", e))?;
-            let thumb = thumbs
-                .iter()
-                .find(|t| matches!(t.format, ThumbFormat::Jpeg))
-                .ok_or_else(|| anyhow::anyhow!("no jpeg preview found in raw"))?;
+            let thumb = select_best_thumbnail(&thumbs, requested_size)
+                .ok_or_else(|| anyhow::anyhow!("no decodable raw preview found"))?;
             image::load_from_memory(&thumb.data).map_err(anyhow::Error::from)?
         };
 
@@ -1396,10 +1414,11 @@ mod tests {
         let server = tokio::spawn(run(db_path, dest, "127.0.0.1".to_string(), 0));
 
         tokio::time::sleep(Duration::from_millis(100)).await;
+        interrupt::enter_interrupt_test();
         interrupt::request_for_test();
 
         let result = timeout(Duration::from_secs(2), server).await;
-        interrupt::reset();
+        interrupt::release_interrupt_test();
         assert!(result.is_ok(), "serve did not stop after interrupt");
         let join = result.unwrap().unwrap();
         assert!(join.is_ok(), "serve exited with error: {join:?}");

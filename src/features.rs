@@ -788,7 +788,7 @@ where
     Ok(convert_direct_image(image))
 }
 
-fn select_best_thumbnail(thumbs: &[ThumbnailImage], min_dimension: u32) -> Option<&ThumbnailImage> {
+pub fn select_best_thumbnail(thumbs: &[ThumbnailImage], min_dimension: u32) -> Option<&ThumbnailImage> {
     let supported: Vec<_> = thumbs
         .iter()
         .filter(|thumb| {

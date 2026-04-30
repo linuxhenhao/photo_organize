@@ -580,44 +580,81 @@ fn import_from_scan_db(
         .values()
         .map(|candidates| choose_canonical(candidates))
         .collect();
-    tracing::info!(
-        count = canonical_rows.len(),
-        "starting parallel feature pre-warming for import"
-    );
-    let prewarm_progress = ProgressReporter::new("pre-warm features", canonical_rows.len());
-    prewarm_progress.log_start();
 
-    canonical_rows.par_iter().for_each(|row| {
-        if interrupt::requested() {
-            return;
-        }
+    let prewarm_conn = open_catalog_db(catalog_db)?;
+    let mut to_prewarm = Vec::new();
+    for row in &canonical_rows {
         if !supports_visual_features(Path::new(&row.source_path), &row.mime_type)
             || row.phash.is_empty()
         {
-            prewarm_progress.item_done();
-            return;
+            continue;
         }
+        if has_reusable_feature_cache(&prewarm_conn, &row.exact_hash, row.size_bytes)? {
+            continue;
+        }
+        to_prewarm.push(DiscoveredFile {
+            path: PathBuf::from(&row.source_path),
+            size_bytes: row.size_bytes,
+            mime_type: row.mime_type.clone(),
+            created_at: String::new(),
+            exact_hash: row.exact_hash.clone(),
+            phash: row.phash.clone(),
+            phash_bits: row.phash_bits,
+            width: row.width,
+            height: row.height,
+            scan_status: String::new(),
+            last_scanned_at: String::new(),
+            meta_json: String::new(),
+        });
+    }
+    drop(prewarm_conn);
 
-        if let Ok(mut conn) = open_catalog_db(catalog_db) {
-            let mut loader = FeatureLoader::default();
-            let _ = loader.load(
-                &mut conn,
-                FeatureRequest {
-                    path: Path::new(&row.source_path),
-                    mime_type: &row.mime_type,
-                    exact_hash: &row.exact_hash,
-                    size_bytes: row.size_bytes,
-                    phash_hint: &row.phash,
-                    phash_bits: row.phash_bits,
-                    width: row.width,
-                    height: row.height,
-                },
-            );
-        }
-        prewarm_progress.item_done();
-    });
-    interrupt::check()?;
-    tracing::info!("feature pre-warming complete");
+    if !to_prewarm.is_empty() {
+        tracing::info!(
+            count = to_prewarm.len(),
+            "starting parallel feature pre-warming for import"
+        );
+        let prewarm_progress = ProgressReporter::new("pre-warm features", to_prewarm.len());
+        prewarm_progress.log_start();
+
+        let (tx_chan, rx_chan) = mpsc::sync_channel::<VisualFeatures>(100);
+        let db_path = catalog_db.to_path_buf();
+
+        let consumer = std::thread::spawn(move || -> Result<usize> {
+            let mut conn = open_catalog_db(&db_path)?;
+            let mut buffer = Vec::with_capacity(100);
+            let mut count = 0;
+            while let Ok(feat) = rx_chan.recv() {
+                buffer.push(feat);
+                if buffer.len() >= 100 {
+                    write_feature_batch(&mut conn, &buffer)?;
+                    count += buffer.len();
+                    buffer.clear();
+                }
+            }
+            if !buffer.is_empty() {
+                write_feature_batch(&mut conn, &buffer)?;
+                count += buffer.len();
+            }
+            Ok(count)
+        });
+
+        to_prewarm.par_iter().for_each(|item| {
+            if interrupt::requested() {
+                return;
+            }
+            let loader = FeatureLoader::default();
+            if let Ok(feat) = loader.compute_only(item) {
+                let _ = tx_chan.send(feat);
+            }
+            prewarm_progress.item_done();
+        });
+
+        drop(tx_chan);
+        let cached = consumer.join().expect("consumer thread panicked")?;
+        interrupt::check()?;
+        tracing::info!(cached, "feature pre-warming complete");
+    }
     // --- End Pre-warming Phase ---
 
     let mut imported = 0usize;
