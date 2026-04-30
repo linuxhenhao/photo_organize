@@ -233,8 +233,8 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
     .member-info { padding: 1rem; display: flex; flex-direction: column; gap: 0.8rem; flex-grow: 1; }
     .path { word-break: break-word; margin: 0; font-family: monospace; font-weight: bold; color: #e2e8f0; }
     .meta-grid { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; color: var(--text-muted); font-size: 0.8rem; }
-    .member-actions { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.6rem; margin-top: auto; }
-    .member-action { padding: 0.65rem 0.75rem; background: rgba(30, 41, 59, 0.9); color: var(--text); border-color: rgba(148, 163, 184, 0.14); font-weight: 600; }
+    .member-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 0.6rem; margin-top: auto; }
+    .member-action { padding: 0.65rem 0.75rem; background: rgba(30, 41, 59, 0.9); color: var(--text); border-color: rgba(148, 163, 184, 0.14); font-weight: 600; font-size: 0.8125rem; }
     .member-action:hover:not(:disabled) { background: #334155; transform: translateY(-1px); }
     .member-action:disabled { opacity: 0.45; cursor: not-allowed; }
     .member-action.keep.active { background: var(--success-bg); border-color: rgba(34, 197, 94, 0.4); color: #bbf7d0; }
