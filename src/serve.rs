@@ -685,7 +685,7 @@ async fn list_groups(
         WHERE group_id IS NOT NULL
         GROUP BY group_id
         HAVING SUM(CASE WHEN keep_state = 'undecided' THEN 1 ELSE 0 END) > 0
-        ORDER BY group_id
+        ORDER BY MIN(created_at) ASC
         LIMIT ?1 OFFSET ?2
         "#,
         )
