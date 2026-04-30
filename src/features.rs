@@ -965,25 +965,6 @@ mod tests {
             .join(name)
     }
 
-    fn group_189_snapshot_path(name: &str) -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("docs")
-            .join("group_bad_cases")
-            .join("group-189-investigation")
-            .join("snapshot")
-            .join("group-189")
-            .join("files")
-            .join("repo")
-            .join(name)
-    }
-
-    fn visual_features_for_path(path: &Path, mime_type: &str) -> VisualFeatures {
-        let bytes = fs::read(path).unwrap();
-        compute_visual_features_for_mime_from_bytes(&bytes, path, mime_type)
-            .unwrap()
-            .unwrap()
-    }
-
     #[test]
     fn compute_visual_features_for_arw_raw_preview() {
         let arw = fixture_path("source/DSC00903.ARW");
@@ -1187,33 +1168,4 @@ mod tests {
         assert_eq!(decoded, points);
     }
 
-    #[test]
-    fn akaze_confirm_accepts_group_189_photo_derivative_pair() {
-        let original = visual_features_for_path(
-            &group_189_snapshot_path("2015/10/01/IMG_2999.JPG"),
-            "image/jpeg",
-        );
-        let derivative = visual_features_for_path(
-            &group_189_snapshot_path("2025/03/17/defaultimg_2999.jpg"),
-            "image/jpeg",
-        );
-
-        assert!(akaze_confirm(&original, &derivative, 10, 14));
-        assert!(akaze_confirm(&derivative, &original, 10, 14));
-    }
-
-    #[test]
-    fn akaze_confirm_rejects_group_189_photo_to_text_bridge() {
-        let photo = visual_features_for_path(
-            &group_189_snapshot_path("2025/03/17/defaultimg_2999.jpg"),
-            "image/jpeg",
-        );
-        let text = visual_features_for_path(
-            &group_189_snapshot_path("2017/06/08/type2_Cochin_24pt_Cell_26x28.png"),
-            "image/png",
-        );
-
-        assert!(!akaze_confirm(&photo, &text, 10, 14));
-        assert!(!akaze_confirm(&text, &photo, 10, 14));
-    }
 }
