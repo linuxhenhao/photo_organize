@@ -72,7 +72,7 @@ struct GroupParams {
 }
 
 const DEFAULT_PAGE_SIZE: usize = 20;
-const MAX_PAGE_SIZE: usize = 200;
+const MAX_PAGE_SIZE: usize = 1000;
 
 #[derive(Debug, Serialize)]
 struct PagingRequest {
@@ -419,7 +419,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
           </div>
           <div class="toolbar-block pagination-meta">
             <label class="page-size-label">page_index <input class="page-input" id="${container.id}-page-index" type="number" min="0" max="${Math.max(pagedData.total_pages - 1, 0)}" value="${pagedData.page_index}" onchange="changePageIndex(this.value)"></label>
-            <label class="page-size-label">page_size <input class="page-input" id="${container.id}-page-size" type="number" min="1" max="200" value="${pagedData.page_size}" onchange="changePageSize(this.value)"></label>
+            <label class="page-size-label">page_size <input class="page-input" id="${container.id}-page-size" type="number" min="1" max="1000" value="${pagedData.page_size}" onchange="changePageSize(this.value)"></label>
           </div>
           <button class="btn-bulk" onclick="confirmAllOnPage()">Confirm all on this page</button>
         </div>
