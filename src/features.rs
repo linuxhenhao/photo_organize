@@ -549,7 +549,10 @@ pub fn compute_base_features_from_bytes(
             if let Ok(thumbs) = raw.extract_thumbs() {
                 if let Some(preview) = select_best_thumbnail(&thumbs, PHASH_MAX_DIMENSION) {
                     if let Ok(image) = decode_thumbnail_image(preview) {
-                        return Ok(Some(compute_base_features_from_image(&image)));
+                        return Ok(Some(raw_sensor_dimensions(
+                            compute_base_features_from_image(&image),
+                            &raw,
+                        )));
                     }
                 }
             }
@@ -773,7 +776,20 @@ fn compute_raw_preview_features_from_bytes(bytes: &[u8], path: &Path) -> Result<
         .with_context(|| format!("no decodable raw preview in {}", path.display()))?;
     let image = decode_thumbnail_image(preview)
         .with_context(|| format!("decode raw preview {}", path.display()))?;
-    Ok(compute_visual_features_from_image(&image))
+    Ok(raw_sensor_dimensions(
+        compute_visual_features_from_image(&image),
+        &raw,
+    ))
+}
+
+fn raw_sensor_dimensions(mut features: VisualFeatures, raw: &RawImage) -> VisualFeatures {
+    let w = raw.width();
+    let h = raw.height();
+    if w > 0 && h > 0 {
+        features.width = i64::from(w);
+        features.height = i64::from(h);
+    }
+    features
 }
 
 fn decode_image_from_reader<R>(reader: R, path: &Path) -> Result<DynamicImage>
