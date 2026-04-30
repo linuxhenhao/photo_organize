@@ -187,7 +187,9 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
     header { padding: 1rem 1.5rem; background: rgba(2, 6, 23, 0.92); backdrop-filter: blur(16px); border-bottom: 1px solid rgba(148, 163, 184, 0.12); position: sticky; top: 0; z-index: 10; display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
     h1 { margin: 0; font-size: 1.15rem; }
     .brand-subtitle { font-weight: 300; opacity: 0.6; }
-    .header-stats { display: flex; gap: 0.75rem; flex-wrap: wrap; justify-content: flex-end; }
+    .header-stats { display: flex; gap: 0.75rem; flex-wrap: wrap; justify-content: flex-end; align-items: center; }
+    .header-stats-desktop { display: flex; gap: 0.75rem; flex-wrap: wrap; justify-content: flex-end; }
+    .header-stats-mobile { display: none; }
     .header-pill { padding: 0.45rem 0.8rem; border-radius: 999px; background: rgba(15, 23, 42, 0.88); border: 1px solid rgba(148, 163, 184, 0.15); color: var(--text-muted); font-size: 0.8125rem; white-space: nowrap; }
     main { padding: 1.5rem; max-width: 1600px; margin: 0 auto; }
 
@@ -256,8 +258,12 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
     #overlay img { max-width: 98vw; max-height: 94vh; object-fit: contain; }
 
     @media (max-width: 720px) {
-      header { padding: 1rem; flex-direction: column; align-items: flex-start; }
-      .header-stats { justify-content: flex-start; width: 100%; }
+      header { padding: 0.8rem 1rem; align-items: center; gap: 0.75rem; }
+      h1 { font-size: 1rem; }
+      .header-stats { justify-content: flex-end; min-width: 0; flex: 1; }
+      .header-stats-desktop { display: none; }
+      .header-stats-mobile { display: block; min-width: 0; }
+      .header-pill { padding: 0.35rem 0.65rem; font-size: 0.74rem; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
       main { padding: 1rem; }
       .toolbar, .group-header, .group-footer { padding: 1rem; }
       .toolbar { margin-bottom: 1rem; }
@@ -353,9 +359,14 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
       const visibleMembers = pagedData.groups.reduce((sum, group) => sum + group.members.length, 0);
       statsHeader.innerHTML = `
         <div class="header-stats">
-          <div class="header-pill">${pagedData.total_groups} pending groups</div>
-          <div class="header-pill">Page ${pagedData.current_page} / ${Math.max(pagedData.total_pages, 1)}</div>
-          <div class="header-pill">${visibleMembers} items on screen</div>
+          <div class="header-stats-desktop">
+            <div class="header-pill">${pagedData.total_groups} pending groups</div>
+            <div class="header-pill">Page ${pagedData.current_page} / ${Math.max(pagedData.total_pages, 1)}</div>
+            <div class="header-pill">${visibleMembers} items on screen</div>
+          </div>
+          <div class="header-stats-mobile">
+            <div class="header-pill">${pagedData.total_groups} groups • ${visibleMembers} items • p${pagedData.current_page}/${Math.max(pagedData.total_pages, 1)}</div>
+          </div>
         </div>
       `;
     }

@@ -7,10 +7,10 @@ use crate::features::{
 use anyhow::{Context, Result};
 use lru::LruCache;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::num::NonZeroUsize;
-use std::path::Path;
 #[cfg(test)]
 use std::mem::size_of;
+use std::num::NonZeroUsize;
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FeatureCacheKey {
@@ -156,7 +156,10 @@ fn estimated_feature_bytes(features: &VisualFeatures) -> usize {
 
     if let Some(descriptors) = features.akaze_descriptors.as_ref() {
         total += descriptors.capacity() * size_of::<Vec<u8>>();
-        total += descriptors.iter().map(|desc| desc.capacity()).sum::<usize>();
+        total += descriptors
+            .iter()
+            .map(|desc| desc.capacity())
+            .sum::<usize>();
     }
 
     total
