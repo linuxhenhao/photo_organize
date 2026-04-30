@@ -1,82 +1,229 @@
-# Photo Organizer
+# photo-org
 
-## Overview
-`photo_organize` is a high-performance Go-based command-line tool for organizing large collections of photos and videos. It scans source directories, extracts metadata into an SQLite database, and organizes files into a structured target directory with advanced deduplication capabilities, including **perceptual image matching**.
+`photo-org` is the Rust rewrite of the local-first photo organizer workflow.
 
-## Features
-- **Parallel Scanning**: Uses a worker pool of 10 goroutines for concurrent metadata extraction.
-- **Intelligent Metadata Extraction**: 
-    - Prioritizes EXIF data (via `exiftool`) for accurate creation dates.
-    - Fallback to filename date patterns and filesystem birth times.
-- **Advanced Deduplication**:
-    - **Binary Match**: Uses MMH3 hashing for exact file duplicates.
-    - **Perceptual Match**: Uses **dHash** and a custom **BK-Tree** to identify visually similar images.
-    - **AI Verification**: Optional ORB feature matching (OpenCV) for deep verification of thumbnail/master relationships.
-- **High-Performance Web UI**: 
-    - Dedicated, lightweight Web UI binary (`photo-web-ui`) for duplicate resolution.
-    - Full metadata and thumbnail relationships are cached in SQLite as native **JSON** objects.
-- **Optimized Storage**: 
-    - Database uses **WAL (Write-Ahead Logging)** mode for high-concurrency safety.
-    - Transaction-based batch updates for performance.
-- **Structured Organization**: 
-    - Imports files into a `[target_dir]/YYYY/MM/DD/` hierarchy.
-    - Automatic conflict resolution with suffixing (e.g., `-1`, `-2`).
+It provides one binary with four commands:
 
-## Installation
+- `scan`: discover source files and write source-side facts into a scan database
+- `import`: scan sources, copy canonical files into the target library, and create duplicate groups in `catalog.db`
+- `initcache`: adopt an existing target library directly into `catalog.db` without a target-side scan database
+- `serve`: run the local duplicate-resolution web UI
 
-### Prerequisites
-- **Go**: 1.24 or higher.
-- **Exiftool**: Must be installed and available in your system `PATH`.
-- **OpenCV (Optional)**: Required only if building `photo-organizer` with advanced ORB verification.
+## Current Scope
 
-### Building
-The project produces two main binaries:
+This crate owns:
 
-1. **photo-organizer**: The core CLI for scanning, importing, and maintenance. Built with **OpenCV (gocv)** by default for advanced ORB verification.
-   ```bash
-   # Standard build (with OpenCV/ORB support)
-   go build -tags gocv -o photo-organizer ./cmd/photo-organizer
+- the `photo-org` CLI
+- the SQLite schema for `catalog.db` and source scan databases
+- parallel source scanning with hashes, pHash, dimensions, and MIME detection
+- target import into `DEST/YYYY/MM/DD/...`
+- target adoption via `initcache`
+- the local web UI for resolving duplicate groups
+- RAW preview extraction in Rust so RAW files can participate in scan/import grouping
+- persisted feature caching in `catalog.db.feature_cache`
 
-   # Lightweight build (no OpenCV dependency)
-   go build -o photo-organizer ./cmd/photo-organizer
-   ```
+## Highlights
 
-2. **photo-web-ui**: The lightweight web interface for resolving duplicates. This binary has **no OpenCV dependency** and can run in any environment.
-   ```bash
-   go build -o photo-web-ui ./cmd/photo-web-ui
-   ```
+- Rust-only main workflow: no Go binaries, no OpenCV build, no `photo-web-ui`
+- Local-first storage: state lives in SQLite plus the target directory
+- Parallel scanning and feature extraction with progress logging
+- Exact duplicate detection using content hashes
+- Cheap in-memory pHash candidate filtering backed by persisted 64-bit pHash values
+- Second-stage AKAZE matching with content-based feature caching
+- `initcache` reuses prior `target_items` facts when size and stored mtime still match
+- Mobile-friendly and desktop-friendly local review UI at `serve`
 
-## Usage
+## Build
 
-### 1. Scan Source Directories
-Scan your source folders to populate the metadata database.
+Debug build:
+
 ```bash
-./photo-organizer scan -db photos.db -src /path/to/source1,/path/to/source2
+cargo build
 ```
 
-### 2. Import into Target Directory
-Copy files from the database to your organized photo gallery with deduplication.
+Release build:
+
 ```bash
-./photo-organizer import -db photos.db -dest /path/to/organized_photos
+cargo build --release
 ```
 
-### 3. Initialize Target Cache
-Pre-index an existing organized directory to avoid re-calculating hashes during future imports.
+For the Bookworm-targeted Docker release build used by this repo:
+
 ```bash
-./photo-organizer initcache -dest /path/to/organized_photos
+./container_build.sh
 ```
 
-### 4. Serve Web UI for Deduplication
-Launch the interactive web interface to resolve visual duplicates.
+That script builds inside the `photo-org-build:bookworm` image and mounts host Cargo caches to avoid repeated dependency downloads.
+
+## Requirements
+
+Core runtime requirements:
+
+- Rust toolchain with Cargo
+- a filesystem the process can read from and write to
+
+Not required for the main workflow:
+
+- Go
+- OpenCV
+- `exiftool`
+
+Notes:
+
+- SQLite is bundled through `rusqlite`, so you do not need a system SQLite development package to build this crate.
+- The integration script uses tools such as `sqlite3`, `curl`, and `python3`.
+
+## Command Usage
+
+Top-level help:
+
 ```bash
-./photo-web-ui -dest /path/to/organized_photos -host 127.0.0.1 -port 8080
+cargo run -- --help
 ```
-- `-dest`: The organized directory containing `cache.db`.
-- `-host`: IP address to bind (default `127.0.0.1`).
-- `-port`: Port for the web server (default `8080`).
+
+### 1. Scan
+
+Scan source directories into a source-side scan database.
+
+```bash
+cargo run -- scan \
+  --scan-db /path/to/import-scan.db \
+  --src /photos/inbox \
+  --src /photos/cards
+```
+
+This writes file discovery facts into `source_items` in the scan database.
+
+### 2. Import
+
+Import canonical files into the target library and group likely duplicates in `catalog.db`.
+
+Use an existing scan database:
+
+```bash
+cargo run -- import \
+  --db /path/to/catalog.db \
+  --scan-db /path/to/import-scan.db \
+  --dest /path/to/library
+```
+
+Or let `import` run `scan` first:
+
+```bash
+cargo run -- import \
+  --db /path/to/catalog.db \
+  --src /photos/inbox \
+  --src /photos/cards \
+  --dest /path/to/library
+```
+
+When `--src` is provided and `--scan-db` is omitted, `import` uses:
+
+```text
+DEST/.photo-org/import-scan.db
+```
+
+Tuning flags:
+
+```text
+--phash-threshold      default 14
+--akaze-min-matches    default 10
+```
+
+### 3. Initcache
+
+Adopt an existing target library into `catalog.db`.
+
+```bash
+cargo run -- initcache \
+  --db /path/to/catalog.db \
+  --dest /path/to/library
+```
+
+`initcache` works in three stages:
+
+1. ingest target files into `target_items`
+2. pre-warm missing visual features
+3. group pending candidates serially
+
+Important behavior:
+
+- it scans target-file facts directly into `catalog.db.target_items`
+- it does not depend on a persistent target-side `source_items` database
+- repeated runs reuse prior facts when file size and stored mtime are unchanged
+
+Optional profiling summary:
+
+```bash
+PHOTO_ORG_PROFILE_INITCACHE=1 cargo run -- initcache --db /path/to/catalog.db --dest /path/to/library
+```
+
+### 4. Serve
+
+Run the local review UI for unresolved duplicate groups.
+
+```bash
+cargo run -- serve \
+  --db /path/to/catalog.db \
+  --dest /path/to/library \
+  --host 127.0.0.1 \
+  --port 8080
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8080/
+```
+
+The UI serves group pages from `catalog.db`, supports page navigation with `page_index` and `page_size`, and lets you confirm keep/reject/primary decisions locally.
+
+## Databases
+
+### `catalog.db`
+
+Main target-side database. Important tables include:
+
+- `target_items`: current files in the target library plus group and keep state
+- `feature_cache`: persisted AKAZE cache keyed by content hash and size
+- `operations_log`: audit log for review actions
+
+### Scan database
+
+Used by `scan` and optionally by `import`.
+
+- stores source-side discovery facts in `source_items`
+- typically named `import-scan.db`, but the path is user-controlled
+
+## Logging
+
+The binary uses `tracing`.
+
+- default behavior enables `warn` globally and `photo_org=info`
+- you can override with `RUST_LOG`
+
+Example:
+
+```bash
+RUST_LOG=photo_org=debug cargo run -- scan --scan-db /tmp/scan.db --src /photos/inbox
+```
 
 ## Development
-- **Integration Tests**: Run `./integration_test.sh` to verify build and functionality.
+
+Run tests:
+
+```bash
+cargo test
+```
+
+Integration-style smoke test:
+
+```bash
+./integration_test.sh
+```
+
+The expensive full-tree `initcache` regression is intentionally ignored by default in `tests/initcache_full_test_data.rs`; run it explicitly when changing import/initcache candidate selection or target adoption behavior.
 
 ## License
+
 MIT

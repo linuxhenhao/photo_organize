@@ -158,96 +158,143 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>photo-org local review</title>
   <style>
     :root {
       --bg: #020617;
+      --bg-elevated: #081121;
       --card-bg: #0f172a;
+      --surface: #1e293b;
+      --surface-strong: #334155;
       --text: #f8fafc;
       --text-muted: #94a3b8;
       --primary: #3b82f6;
       --primary-hover: #60a5fa;
       --danger: #ef4444;
+      --danger-bg: rgba(239, 68, 68, 0.18);
       --success: #22c55e;
+      --success-bg: rgba(34, 197, 94, 0.18);
       --border: #1e293b;
       --star: #f59e0b;
+      --star-bg: rgba(245, 158, 11, 0.18);
+      --shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
     }
-    body { font-family: sans-serif; margin: 0; background: var(--bg); color: var(--text); line-height: 1.5; }
-    header { padding: 1rem 2rem; background: #020617; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; display: flex; justify-content: space-between; align-items: center; }
-    h1 { margin: 0; font-size: 1.25rem; }
-    main { padding: 2rem; max-width: 1600px; margin: 0 auto; }
-    
-    .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; background: #1e293b; padding: 1rem 1.5rem; border-radius: 0.75rem; border: 1px solid var(--border); gap: 1rem; flex-wrap: wrap; }
-    .pagination { display: flex; gap: 0.5rem; align-items: center; }
-    .pagination-meta { display: flex; gap: 1rem; align-items: center; color: var(--text-muted); font-size: 0.875rem; flex-wrap: wrap; }
-    .page-btn { padding: 0.5rem 1rem; background: #334155; border: 1px solid var(--border); border-radius: 0.5rem; color: #fff; cursor: pointer; }
-    .page-btn:disabled { opacity: 0.3; cursor: not-allowed; }
-    .page-btn.active { background: var(--primary); border-color: var(--primary); }
-    .page-size-input { width: 5rem; padding: 0.45rem 0.6rem; background: #0f172a; border: 1px solid var(--border); border-radius: 0.5rem; color: #fff; }
-    
-    .group { border: 1px solid var(--border); border-radius: 1rem; margin-bottom: 4rem; background: var(--card-bg); overflow: hidden; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }
-    .group-header { padding: 1rem 1.5rem; background: #1e293b; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
-    .group-id { font-weight: bold; font-size: 1.1rem; }
-    
-    .members { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1.5rem; padding: 1.5rem; }
-    .member { border: 2px solid var(--border); border-radius: 0.75rem; background: #020617; overflow: hidden; display: flex; flex-direction: column; transition: all 0.2s; position: relative; }
-    
-    .member.rejected .img-container img { filter: brightness(0.5); opacity: 0.8; }
-    .member.rejected:hover .img-container img { filter: none; opacity: 1; }
-    .member.rejected { border-color: #334155; border-style: dashed; }
-    .member.kept { border-color: var(--success); }
-    .member.primary { border-color: var(--star); border-style: solid; box-shadow: 0 0 15px rgba(245, 158, 11, 0.2); }
-    
-    .img-container { aspect-ratio: 1; background: #000; overflow: hidden; cursor: pointer; position: relative; }
-    img { width: 100%; height: 100%; object-fit: contain; pointer-events: none; transition: all 0.2s; }
-    
-    .star-btn { position: absolute; top: 0.75rem; right: 0.75rem; width: 2.5rem; height: 2.5rem; background: rgba(0,0,0,0.6); border-radius: 50%; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 1.5rem; cursor: pointer; z-index: 5; transition: all 0.2s; border: 1px solid rgba(255,255,255,0.2); }
-    .star-btn:hover { background: rgba(245, 158, 11, 0.8); transform: scale(1.1); }
-    .member.primary .star-btn { color: var(--star); background: rgba(0,0,0,0.8); border-color: var(--star); }
-    
-    .rejected-icon { position: absolute; top: 0.75rem; left: 0.75rem; width: 2.5rem; height: 2.5rem; background: var(--danger); border-radius: 50%; display: none; align-items: center; justify-content: center; font-size: 1.25rem; color: #fff; font-weight: bold; z-index: 4; pointer-events: none; box-shadow: 0 0 10px rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.2); }
-    .member.rejected .rejected-icon { display: flex; }
-    .member.rejected:hover .rejected-icon { opacity: 0.2; }
+    * { box-sizing: border-box; }
+    body { font-family: sans-serif; margin: 0; background: radial-gradient(circle at top, #0b1730 0, var(--bg) 22rem); color: var(--text); line-height: 1.5; }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    header { padding: 1rem 1.5rem; background: rgba(2, 6, 23, 0.92); backdrop-filter: blur(16px); border-bottom: 1px solid rgba(148, 163, 184, 0.12); position: sticky; top: 0; z-index: 10; display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+    h1 { margin: 0; font-size: 1.15rem; }
+    .brand-subtitle { font-weight: 300; opacity: 0.6; }
+    .header-stats { display: flex; gap: 0.75rem; flex-wrap: wrap; justify-content: flex-end; }
+    .header-pill { padding: 0.45rem 0.8rem; border-radius: 999px; background: rgba(15, 23, 42, 0.88); border: 1px solid rgba(148, 163, 184, 0.15); color: var(--text-muted); font-size: 0.8125rem; white-space: nowrap; }
+    main { padding: 1.5rem; max-width: 1600px; margin: 0 auto; }
 
-    .member-info { padding: 1rem; flex-grow: 1; font-size: 0.875rem; pointer-events: none; }
-    .path { word-break: break-all; margin-bottom: 0.25rem; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: bold; }
-    .meta { color: var(--text-muted); font-size: 0.75rem; }
-    
-    .group-footer { padding: 1.25rem 1.5rem; background: #1e293b; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
-    .group-stats { font-size: 0.875rem; color: var(--text-muted); }
-    .btn-resolve { background: var(--primary); color: white; border: 0; padding: 0.75rem 2.5rem; border-radius: 0.5rem; font-weight: bold; cursor: pointer; transition: background 0.2s; }
+    .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; background: rgba(15, 23, 42, 0.92); padding: 1rem 1.25rem; border-radius: 1rem; border: 1px solid rgba(148, 163, 184, 0.12); gap: 1rem; flex-wrap: wrap; box-shadow: var(--shadow); }
+    .toolbar-block { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+    .pagination { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+    .pagination-status { color: var(--text-muted); font-size: 0.9375rem; }
+    .pagination-meta { display: flex; gap: 1rem; align-items: center; color: var(--text-muted); font-size: 0.875rem; flex-wrap: wrap; }
+    .page-btn, .btn-resolve, .btn-bulk, .member-action { min-height: 2.75rem; border-radius: 0.75rem; border: 1px solid transparent; transition: background 0.2s, border-color 0.2s, color 0.2s, transform 0.2s; }
+    .page-btn { padding: 0.6rem 1rem; background: var(--surface-strong); border-color: rgba(148, 163, 184, 0.12); color: #fff; }
+    .page-btn:hover:not(:disabled) { background: #475569; }
+    .page-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+    .page-size-label { display: flex; align-items: center; gap: 0.5rem; }
+    .page-input { width: 5.5rem; padding: 0.55rem 0.7rem; background: var(--bg-elevated); border: 1px solid rgba(148, 163, 184, 0.16); border-radius: 0.75rem; color: #fff; }
+
+    .group { border: 1px solid rgba(148, 163, 184, 0.12); border-radius: 1.25rem; margin-bottom: 2rem; background: rgba(15, 23, 42, 0.94); overflow: hidden; box-shadow: var(--shadow); }
+    .group-header { padding: 1rem 1.25rem; background: rgba(30, 41, 59, 0.9); border-bottom: 1px solid rgba(148, 163, 184, 0.12); display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+    .group-heading { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+    .group-id { font-weight: bold; font-size: 1.05rem; }
+    .group-summary { font-size: 0.875rem; color: var(--text-muted); }
+
+    .members { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 1.25rem; padding: 1.25rem; }
+    .member { border: 2px solid rgba(148, 163, 184, 0.12); border-radius: 1rem; background: var(--bg-elevated); overflow: hidden; display: flex; flex-direction: column; transition: border-color 0.2s, box-shadow 0.2s; position: relative; min-width: 0; }
+    .member.rejected { border-color: rgba(148, 163, 184, 0.18); border-style: dashed; }
+    .member.kept { border-color: rgba(34, 197, 94, 0.55); }
+    .member.primary { border-color: rgba(245, 158, 11, 0.72); box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.18), 0 14px 35px rgba(245, 158, 11, 0.12); }
+    .member.rejected .img-container img { filter: brightness(0.52); opacity: 0.82; }
+    .member.rejected:hover .img-container img { filter: none; opacity: 1; }
+
+    .img-container { aspect-ratio: 1; background: #000; overflow: hidden; cursor: zoom-in; position: relative; }
+    img { width: 100%; height: 100%; object-fit: contain; pointer-events: none; transition: all 0.2s; }
+    .img-container::after { content: "Tap to preview"; position: absolute; right: 0.75rem; bottom: 0.75rem; padding: 0.35rem 0.6rem; border-radius: 999px; background: rgba(2, 6, 23, 0.72); border: 1px solid rgba(148, 163, 184, 0.18); color: #e2e8f0; font-size: 0.75rem; letter-spacing: 0.01em; }
+
+    .member-status { position: absolute; top: 0.75rem; left: 0.75rem; display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.35rem 0.65rem; border-radius: 999px; font-size: 0.75rem; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase; z-index: 2; }
+    .member-status.primary { background: var(--star-bg); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.35); }
+    .member-status.kept { background: var(--success-bg); color: #86efac; border: 1px solid rgba(34, 197, 94, 0.3); }
+    .member-status.rejected { background: var(--danger-bg); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.3); }
+
+    .member-info { padding: 1rem; display: flex; flex-direction: column; gap: 0.8rem; flex-grow: 1; }
+    .path { word-break: break-word; margin: 0; font-family: monospace; font-weight: bold; color: #e2e8f0; }
+    .meta-grid { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; color: var(--text-muted); font-size: 0.8rem; }
+    .member-actions { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.6rem; margin-top: auto; }
+    .member-action { padding: 0.65rem 0.75rem; background: rgba(30, 41, 59, 0.9); color: var(--text); border-color: rgba(148, 163, 184, 0.14); font-weight: 600; }
+    .member-action:hover:not(:disabled) { background: #334155; transform: translateY(-1px); }
+    .member-action:disabled { opacity: 0.45; cursor: not-allowed; }
+    .member-action.keep.active { background: var(--success-bg); border-color: rgba(34, 197, 94, 0.4); color: #bbf7d0; }
+    .member-action.reject.active { background: var(--danger-bg); border-color: rgba(239, 68, 68, 0.4); color: #fecaca; }
+    .member-action.primary.active { background: var(--star-bg); border-color: rgba(245, 158, 11, 0.4); color: #fde68a; }
+
+    .group-footer { padding: 1rem 1.25rem 1.25rem; background: rgba(30, 41, 59, 0.72); border-top: 1px solid rgba(148, 163, 184, 0.12); display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+    .group-stats { font-size: 0.9rem; color: var(--text-muted); }
+    .btn-resolve { background: var(--primary); color: white; padding: 0.75rem 1.5rem; font-weight: bold; }
     .btn-resolve:hover { background: var(--primary-hover); }
     .btn-resolve:disabled { opacity: 0.5; cursor: not-allowed; }
-    
-    .btn-bulk { background: var(--success); color: #000; font-weight: bold; padding: 0.75rem 1.5rem; border-radius: 0.5rem; border: 0; cursor: pointer; }
+
+    .btn-bulk { background: var(--success); color: #04110a; font-weight: bold; padding: 0.75rem 1.1rem; }
     .btn-bulk:hover { background: #4ade80; }
 
-    .status-badge { padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; margin-left: 0.5rem; }
-    .status-pending { background: #f59e0b; color: #000; }
+    .status-badge { padding: 0.28rem 0.7rem; border-radius: 9999px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; background: rgba(245, 158, 11, 0.16); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.3); }
+    .empty-state { text-align: center; padding: clamp(3rem, 12vw, 8rem) 1rem; }
+    .empty-title { font-size: clamp(1.2rem, 4vw, 1.5rem); margin-bottom: 0.5rem; }
+    .empty-copy { color: var(--text-muted); max-width: 30rem; margin: 0 auto; }
+    .error-copy { color: #fecaca; }
 
-    #overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.95); display: none; justify-content: center; align-items: center; z-index: 100; cursor: pointer; }
-    #overlay img { max-width: 98vw; max-height: 98vh; object-fit: contain; }
+    #overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.95); display: none; justify-content: center; align-items: center; z-index: 100; cursor: pointer; padding: 1rem; }
+    #overlay img { max-width: 98vw; max-height: 94vh; object-fit: contain; }
+
+    @media (max-width: 720px) {
+      header { padding: 1rem; flex-direction: column; align-items: flex-start; }
+      .header-stats { justify-content: flex-start; width: 100%; }
+      main { padding: 1rem; }
+      .toolbar, .group-header, .group-footer { padding: 1rem; }
+      .toolbar { margin-bottom: 1rem; }
+      .toolbar-block, .pagination, .pagination-meta { width: 100%; }
+      .pagination { justify-content: space-between; }
+      .pagination-status { width: 100%; }
+      .page-btn, .btn-bulk, .btn-resolve { width: 100%; }
+      .page-size-label { width: 100%; justify-content: space-between; }
+      .page-input { width: 6rem; }
+      .group-header, .group-footer { flex-direction: column; align-items: stretch; }
+      .members { grid-template-columns: 1fr; gap: 1rem; padding: 1rem; }
+      .member-info { padding: 0.9rem; }
+      .member-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .img-container::after { content: "Preview"; }
+    }
   </style>
 </head>
 <body>
   <header>
-    <h1>photo-org <span style="font-weight: 300; opacity: 0.6">local review</span></h1>
+    <h1>photo-org <span class="brand-subtitle">local review</span></h1>
     <div id="stats-header"></div>
   </header>
   <main>
     <div id="top-toolbar"></div>
     <div id="groups-container">
-        <div style="text-align: center; padding: 10rem;">
-            <div style="font-size: 1.5rem; margin-bottom: 1rem;">Loading Groups...</div>
-        </div>
+      <div class="empty-state">
+        <div class="empty-title">Loading groups...</div>
+      </div>
     </div>
     <div id="bottom-toolbar"></div>
   </main>
-  <div id="overlay"><img src="" alt=""></div>
+  <div id="overlay"><img src="" alt="Full-size preview"></div>
   <script>
     const groupsContainer = document.getElementById('groups-container');
     const topToolbar = document.getElementById('top-toolbar');
     const bottomToolbar = document.getElementById('bottom-toolbar');
+    const statsHeader = document.getElementById('stats-header');
     const overlay = document.getElementById('overlay');
     const overlayImg = overlay.querySelector('img');
 
@@ -266,14 +313,27 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
       return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
     }
 
+    function loadingMarkup(message) {
+      return `<div class="empty-state"><div class="empty-title">${message}</div></div>`;
+    }
+
+    function emptyMarkup(title, subtitle, extraClass = '') {
+      return `
+        <div class="empty-state">
+          <div class="empty-title ${extraClass}">${title}</div>
+          ${subtitle ? `<div class="empty-copy ${extraClass}">${subtitle}</div>` : ''}
+        </div>
+      `;
+    }
+
     let pagedData = {
-        groups: [],
-        total_groups: 0,
-        total_pages: 0,
-        page_index: 0,
-        page_size: 20,
-        current_page: 1,
-        limit: 20
+      groups: [],
+      total_groups: 0,
+      total_pages: 0,
+      page_index: 0,
+      page_size: 20,
+      current_page: 1,
+      limit: 20
     };
 
     function syncBrowserUrl() {
@@ -285,36 +345,49 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
       window.history.replaceState(null, '', url);
     }
 
+    function renderHeaderStats() {
+      if (pagedData.total_groups === 0) {
+        statsHeader.innerHTML = '<div class="header-stats"><div class="header-pill">No pending groups</div></div>';
+        return;
+      }
+      const visibleMembers = pagedData.groups.reduce((sum, group) => sum + group.members.length, 0);
+      statsHeader.innerHTML = `
+        <div class="header-stats">
+          <div class="header-pill">${pagedData.total_groups} pending groups</div>
+          <div class="header-pill">Page ${pagedData.current_page} / ${Math.max(pagedData.total_pages, 1)}</div>
+          <div class="header-pill">${visibleMembers} items on screen</div>
+        </div>
+      `;
+    }
+
     async function fetchGroups(pageIndex = pagedData.page_index, pageSize = pagedData.page_size) {
       try {
-        groupsContainer.innerHTML = '<div style="text-align: center; padding: 10rem;"><div style="font-size: 1.5rem;">Loading Page ' + (pageIndex + 1) + '...</div></div>';
+        groupsContainer.innerHTML = loadingMarkup(`Loading page ${pageIndex + 1}...`);
         window.scrollTo(0, 0);
 
         const resp = await fetch(`/api/groups?page_index=${pageIndex}&page_size=${pageSize}`);
         pagedData = await resp.json();
         syncBrowserUrl();
-        
-        // Initialize UI state
+
         pagedData.groups.forEach(group => {
-            group.members.forEach(m => {
-                m.ui_primary = m.is_group_primary;
-                // Default logic: only keep if it's already marked 'kept' 
-                // OR if it's 'undecided' AND it is the primary version.
-                if (m.keep_state === 'undecided') {
-                    m.ui_keep = m.ui_primary;
-                } else {
-                    m.ui_keep = (m.keep_state === 'kept');
-                }
-            });
+          group.members.forEach(member => {
+            member.ui_primary = member.is_group_primary;
+            if (member.keep_state === 'undecided') {
+              member.ui_keep = member.ui_primary;
+            } else {
+              member.ui_keep = member.keep_state === 'kept';
+            }
+          });
         });
-        
+
         renderUI();
       } catch (err) {
-        groupsContainer.innerHTML = `<div style="color: var(--danger); padding: 4rem; text-align: center">Error loading groups: ${err.message}</div>`;
+        groupsContainer.innerHTML = emptyMarkup(`Error loading groups`, err.message, 'error-copy');
       }
     }
 
     function renderUI() {
+      renderHeaderStats();
       renderToolbar(topToolbar);
       renderGroups();
       renderToolbar(bottomToolbar);
@@ -328,18 +401,28 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
 
       container.innerHTML = `
         <div class="toolbar">
-          <div class="pagination">
-            <button class="page-btn" ${pagedData.page_index <= 0 ? 'disabled' : ''} onclick="fetchGroups(${pagedData.page_index - 1}, ${pagedData.page_size})">Prev</button>
-            <span style="margin: 0 1rem">Page <strong>${pagedData.current_page}</strong> of ${pagedData.total_pages} (${pagedData.total_groups} groups)</span>
-            <button class="page-btn" ${pagedData.page_index + 1 >= pagedData.total_pages ? 'disabled' : ''} onclick="fetchGroups(${pagedData.page_index + 1}, ${pagedData.page_size})">Next</button>
+          <div class="toolbar-block pagination">
+            <button class="page-btn" ${pagedData.page_index <= 0 ? 'disabled' : ''} onclick="fetchGroups(${pagedData.page_index - 1}, ${pagedData.page_size})">Prev page</button>
+            <div class="pagination-status">Page <strong>${pagedData.current_page}</strong> of ${pagedData.total_pages} with ${pagedData.total_groups} pending groups</div>
+            <button class="page-btn" ${pagedData.page_index + 1 >= pagedData.total_pages ? 'disabled' : ''} onclick="fetchGroups(${pagedData.page_index + 1}, ${pagedData.page_size})">Next page</button>
           </div>
-          <div class="pagination-meta">
-            <span>page_index=<strong>${pagedData.page_index}</strong></span>
-            <label>page_size <input class="page-size-input" id="${container.id}-page-size" type="number" min="1" max="200" value="${pagedData.page_size}" onchange="changePageSize(this.value)"></label>
+          <div class="toolbar-block pagination-meta">
+            <label class="page-size-label">page_index <input class="page-input" id="${container.id}-page-index" type="number" min="0" max="${Math.max(pagedData.total_pages - 1, 0)}" value="${pagedData.page_index}" onchange="changePageIndex(this.value)"></label>
+            <label class="page-size-label">page_size <input class="page-input" id="${container.id}-page-size" type="number" min="1" max="200" value="${pagedData.page_size}" onchange="changePageSize(this.value)"></label>
           </div>
-          <button class="btn-bulk" onclick="confirmAllOnPage()">Confirm All on This Page</button>
+          <button class="btn-bulk" onclick="confirmAllOnPage()">Confirm all on this page</button>
         </div>
       `;
+    }
+
+    function changePageIndex(value) {
+      const nextIndex = Number.parseInt(value, 10);
+      if (!Number.isFinite(nextIndex) || nextIndex < 0) {
+        renderUI();
+        return;
+      }
+      const maxIndex = Math.max(pagedData.total_pages - 1, 0);
+      fetchGroups(Math.min(nextIndex, maxIndex), pagedData.page_size);
     }
 
     function changePageSize(value) {
@@ -351,9 +434,26 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
       fetchGroups(0, nextSize);
     }
 
+    function setKeepState(groupId, memberId, keep) {
+      const group = pagedData.groups.find(g => g.group_id === groupId);
+      const member = group.members.find(m => m.id === memberId);
+      if (!keep && member.ui_primary) return;
+      member.ui_keep = keep;
+      renderUI();
+    }
+
+    function setPrimary(groupId, memberId) {
+      const group = pagedData.groups.find(g => g.group_id === groupId);
+      group.members.forEach(member => {
+        member.ui_primary = member.id === memberId;
+        if (member.ui_primary) member.ui_keep = true;
+      });
+      renderUI();
+    }
+
     function renderGroups() {
       if (pagedData.groups.length === 0) {
-        groupsContainer.innerHTML = '<div style="text-align: center; padding: 10rem;"><div style="font-size: 1.5rem; color: var(--success)">All clear!</div><div style="color: var(--text-muted)">No pending duplicate groups found.</div></div>';
+        groupsContainer.innerHTML = emptyMarkup('All clear!', 'No pending duplicate groups found.');
         return;
       }
 
@@ -361,38 +461,50 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
       pagedData.groups.forEach(group => {
         const groupEl = document.createElement('div');
         groupEl.className = 'group';
-        
+
         const header = document.createElement('div');
         header.className = 'group-header';
         header.innerHTML = `
-          <div class="group-id">Group ID: ${group.group_id} <span class="status-badge status-pending">Pending</span></div>
-          <div style="font-size: 0.875rem; opacity: 0.7">${group.members.length} versions</div>
+          <div class="group-heading">
+            <div class="group-id">Group ${group.group_id}</div>
+            <span class="status-badge">Pending</span>
+          </div>
+          <div class="group-summary">${group.members.length} versions to compare</div>
         `;
         groupEl.appendChild(header);
 
         const membersList = document.createElement('div');
         membersList.className = 'members';
-        
+
         group.members.forEach(member => {
           const memberEl = document.createElement('div');
           memberEl.className = 'member' + (member.ui_primary ? ' primary' : '') + (member.ui_keep ? ' kept' : ' rejected');
           memberEl.id = `member-${member.id}`;
-          
+
           const imgPath = encodeURIComponent(member.target_path);
           const thumbSrc = `/image?path=${imgPath}&size=400`;
           const fullSrc = `/image?path=${imgPath}&size=1600`;
+          const fileName = member.target_path.split('/').pop();
+          const statusClass = member.ui_primary ? 'primary' : (member.ui_keep ? 'kept' : 'rejected');
+          const statusLabel = member.ui_primary ? 'Primary' : (member.ui_keep ? 'Keep' : 'Reject');
 
           memberEl.innerHTML = `
-            <div class="img-container" onclick="handleImageClick(event, ${group.group_id}, ${member.id})">
-              <div class="star-btn" onclick="handleStarClick(event, ${group.group_id}, ${member.id})" title="Set as Primary">★</div>
-              <div class="rejected-icon">✕</div>
-              <img src="${thumbSrc}" loading="lazy">
+            <div class="img-container" onclick="showOverlay('${fullSrc}')">
+              <div class="member-status ${statusClass}">${statusLabel}</div>
+              <img src="${thumbSrc}" loading="lazy" alt="${fileName}">
             </div>
             <div class="member-info">
-              <div class="path" title="${member.target_path}">${member.target_path.split('/').pop()}</div>
-              <div class="meta">
-                ${member.width} × ${member.height} • ${formatSize(member.size_bytes)}<br>
-                ${member.mime_type}
+              <p class="path" title="${member.target_path}">${fileName}</p>
+              <div class="meta-grid">
+                <span>${member.width} × ${member.height}</span>
+                <span>${formatSize(member.size_bytes)}</span>
+                <span>${member.mime_type}</span>
+              </div>
+              <div class="member-actions">
+                <button class="member-action keep ${member.ui_keep ? 'active' : ''}" onclick="setKeepState(${group.group_id}, ${member.id}, true)">Keep</button>
+                <button class="member-action reject ${!member.ui_keep ? 'active' : ''}" onclick="setKeepState(${group.group_id}, ${member.id}, false)" ${member.ui_primary ? 'disabled' : ''}>Reject</button>
+                <button class="member-action primary ${member.ui_primary ? 'active' : ''}" onclick="setPrimary(${group.group_id}, ${member.id})">Primary</button>
+                <button class="member-action" onclick="showOverlay('${fullSrc}')">Preview</button>
               </div>
             </div>
           `;
@@ -400,43 +512,25 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         });
         groupEl.appendChild(membersList);
 
-        const keptCount = group.members.filter(m => m.ui_keep).length;
-        const rejectedCount = group.members.filter(m => !m.ui_keep).length;
+        const keptCount = group.members.filter(member => member.ui_keep).length;
+        const rejectedCount = group.members.filter(member => !member.ui_keep).length;
 
         const footer = document.createElement('div');
         footer.className = 'group-footer';
         footer.innerHTML = `
-            <div class="group-stats">
-                Keeping <strong>${keptCount}</strong>, discarding <strong>${rejectedCount}</strong>
-            </div>
+          <div class="group-stats">
+            Keeping <strong>${keptCount}</strong>, discarding <strong>${rejectedCount}</strong>
+          </div>
         `;
         const resolveBtn = document.createElement('button');
         resolveBtn.className = 'btn-resolve';
-        resolveBtn.innerText = 'Confirm Decisions';
+        resolveBtn.innerText = 'Confirm decisions';
         resolveBtn.onclick = () => resolveGroup(group.group_id);
         footer.appendChild(resolveBtn);
         groupEl.appendChild(footer);
 
         groupsContainer.appendChild(groupEl);
       });
-    }
-
-    function handleImageClick(event, groupId, memberId) {
-      const group = pagedData.groups.find(g => g.group_id === groupId);
-      const member = group.members.find(m => m.id === memberId);
-      if (member.ui_primary && member.ui_keep) return;
-      member.ui_keep = !member.ui_keep;
-      renderUI();
-    }
-
-    function handleStarClick(event, groupId, memberId) {
-      event.stopPropagation();
-      const group = pagedData.groups.find(g => g.group_id === groupId);
-      group.members.forEach(m => {
-          m.ui_primary = (m.id === memberId);
-          if (m.ui_primary) m.ui_keep = true;
-      });
-      renderUI();
     }
 
     async function resolveGroup(groupId) {
@@ -1036,7 +1130,36 @@ mod tests {
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains("page_index"));
         assert!(html.contains("page_size"));
+        assert!(html.contains("changePageIndex"));
         assert!(html.contains("changePageSize"));
+    }
+
+    #[tokio::test]
+    async fn index_html_includes_mobile_responsive_controls() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        open_catalog_db(&db_path).unwrap();
+
+        let app = router(AppState { db_path, dest });
+        let request = axum::http::Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            html.contains(
+                r#"<meta name="viewport" content="width=device-width, initial-scale=1">"#
+            )
+        );
+        assert!(html.contains("member-actions"));
+        assert!(html.contains("Tap to preview"));
     }
 
     #[tokio::test]

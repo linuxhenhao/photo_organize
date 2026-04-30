@@ -22,6 +22,7 @@ Current internal structure also includes:
     - **Stage 2 (Pre-warm)**: Parallel computation of missing visual features for potential duplicates.
     - **Stage 3 (Grouping)**: Serial grouping and primary-member selection based on resolution and size.
 - **`serve`**: Management phase. Provides a web interface for resolving 'undecided' groups and managing the catalog state.
+  See `docs/web-server.md` for the current web-server route map, preview path, and state-mutation rules.
 
 ## Parallel Design & Safety
 
