@@ -219,9 +219,11 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
     .member.rejected .img-container img { filter: brightness(0.52); opacity: 0.82; }
     .member.rejected:hover .img-container img { filter: none; opacity: 1; }
 
-    .img-container { aspect-ratio: 1; background: #000; overflow: hidden; cursor: zoom-in; position: relative; }
+    .img-container { aspect-ratio: 1; background: #000; overflow: hidden; cursor: pointer; position: relative; }
     img { width: 100%; height: 100%; object-fit: contain; pointer-events: none; transition: all 0.2s; }
-    .img-container::after { content: "Tap to preview"; position: absolute; right: 0.75rem; bottom: 0.75rem; padding: 0.35rem 0.6rem; border-radius: 999px; background: rgba(2, 6, 23, 0.72); border: 1px solid rgba(148, 163, 184, 0.18); color: #e2e8f0; font-size: 0.75rem; letter-spacing: 0.01em; }
+    .img-container::after { content: "Click image to keep/reject"; position: absolute; right: 0.75rem; bottom: 0.75rem; padding: 0.35rem 0.6rem; border-radius: 999px; background: rgba(2, 6, 23, 0.72); border: 1px solid rgba(148, 163, 184, 0.18); color: #e2e8f0; font-size: 0.75rem; letter-spacing: 0.01em; }
+    .preview-badge { position: absolute; top: 0.75rem; right: 0.75rem; z-index: 2; min-height: auto; padding: 0.4rem 0.7rem; border-radius: 999px; border: 1px solid rgba(148, 163, 184, 0.18); background: rgba(2, 6, 23, 0.78); color: #e2e8f0; font-size: 0.75rem; font-weight: 700; letter-spacing: 0.01em; }
+    .preview-badge:hover { background: rgba(15, 23, 42, 0.92); }
 
     .member-status { position: absolute; top: 0.75rem; left: 0.75rem; display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.35rem 0.65rem; border-radius: 999px; font-size: 0.75rem; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase; z-index: 2; }
     .member-status.primary { background: var(--star-bg); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.35); }
@@ -257,6 +259,11 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
     #overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.95); display: none; justify-content: center; align-items: center; z-index: 100; cursor: pointer; padding: 1rem; }
     #overlay img { max-width: 98vw; max-height: 94vh; object-fit: contain; }
 
+    @media (hover: none), (pointer: coarse) {
+      .img-container { cursor: zoom-in; }
+      .img-container::after { content: "Tap image to preview"; }
+    }
+
     @media (max-width: 720px) {
       header { padding: 0.8rem 1rem; align-items: center; gap: 0.75rem; }
       h1 { font-size: 1rem; }
@@ -277,7 +284,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
       .members { grid-template-columns: 1fr; gap: 1rem; padding: 1rem; }
       .member-info { padding: 0.9rem; }
       .member-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .img-container::after { content: "Preview"; }
+      .img-container::after { content: "Tap image to preview"; }
     }
   </style>
 </head>
@@ -309,6 +316,10 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
     function showOverlay(src) {
       overlayImg.src = src;
       overlay.style.display = 'flex';
+    }
+
+    function usePreviewFirstImageClick() {
+      return window.matchMedia('(max-width: 720px), (hover: none), (pointer: coarse)').matches;
     }
 
     function formatSize(bytes) {
@@ -453,6 +464,14 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
       renderUI();
     }
 
+    function toggleKeepState(groupId, memberId) {
+      const group = pagedData.groups.find(g => g.group_id === groupId);
+      const member = group.members.find(m => m.id === memberId);
+      if (member.ui_primary && member.ui_keep) return;
+      member.ui_keep = !member.ui_keep;
+      renderUI();
+    }
+
     function setPrimary(groupId, memberId) {
       const group = pagedData.groups.find(g => g.group_id === groupId);
       group.members.forEach(member => {
@@ -460,6 +479,19 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         if (member.ui_primary) member.ui_keep = true;
       });
       renderUI();
+    }
+
+    function handleImageClick(groupId, memberId, previewSrc) {
+      if (usePreviewFirstImageClick()) {
+        showOverlay(previewSrc);
+        return;
+      }
+      toggleKeepState(groupId, memberId);
+    }
+
+    function handlePreviewClick(event, previewSrc) {
+      event.stopPropagation();
+      showOverlay(previewSrc);
     }
 
     function renderGroups() {
@@ -500,8 +532,9 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
           const statusLabel = member.ui_primary ? 'Primary' : (member.ui_keep ? 'Keep' : 'Reject');
 
           memberEl.innerHTML = `
-            <div class="img-container" onclick="showOverlay('${fullSrc}')">
+            <div class="img-container" onclick="handleImageClick(${group.group_id}, ${member.id}, '${fullSrc}')">
               <div class="member-status ${statusClass}">${statusLabel}</div>
+              <button class="preview-badge" type="button" onclick="handlePreviewClick(event, '${fullSrc}')" aria-label="Preview ${fileName}">Preview</button>
               <img src="${thumbSrc}" loading="lazy" alt="${fileName}">
             </div>
             <div class="member-info">
@@ -1170,7 +1203,8 @@ mod tests {
             )
         );
         assert!(html.contains("member-actions"));
-        assert!(html.contains("Tap to preview"));
+        assert!(html.contains("Tap image to preview"));
+        assert!(html.contains("Click image to keep/reject"));
     }
 
     #[tokio::test]
