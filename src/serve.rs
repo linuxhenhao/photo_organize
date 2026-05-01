@@ -1141,22 +1141,54 @@ fn resolve_ugos_thumb(path: &StdPath) -> Option<PathBuf> {
 }
 
 fn move_to_trash(dest: &PathBuf, target_path: &str, group_id: i64) -> Result<PathBuf> {
-    let path = PathBuf::from(target_path);
-    ensure_under_root(dest, &path)?;
+    let path = dest.join(target_path);
     let trash_dir = dest
         .join(".photo-org")
         .join("trash")
         .join(format!("group-{}", group_id));
-    fs::create_dir_all(&trash_dir)?;
-    let file_name = safe_file_name(&path);
-    let mut candidate = trash_dir.join(file_name);
-    let mut idx = 0usize;
-    while candidate.exists() {
-        idx += 1;
-        candidate = trash_dir.join(format!("{}-{}", idx, safe_file_name(&path)));
+
+    // If the file already exists at the target path, move it to trash.
+    if path.exists() {
+        ensure_under_root(dest, &path)?;
+        fs::create_dir_all(&trash_dir)?;
+        let file_name = safe_file_name(&path);
+        let mut candidate = trash_dir.join(&file_name);
+        let mut idx = 0usize;
+        while candidate.exists() {
+            // If the file at candidate has the same size, we might consider it already moved,
+            // but to be safe and simple, we follow the original indexing logic.
+            idx += 1;
+            candidate = trash_dir.join(format!("{}-{}", idx, file_name));
+        }
+        fs::rename(&path, &candidate)?;
+        return Ok(candidate);
     }
-    fs::rename(&path, &candidate)?;
-    Ok(candidate)
+
+    // If the file is NOT at the target path, check if it's already in the trash.
+    if trash_dir.exists() {
+        let expected_name = safe_file_name(&PathBuf::from(target_path));
+        // Check for the base name or indexed versions.
+        // We prioritize the most recent one if multiple exist, or just the first one found.
+        let mut idx = 0usize;
+        loop {
+            let candidate = if idx == 0 {
+                trash_dir.join(&expected_name)
+            } else {
+                trash_dir.join(format!("{}-{}", idx, expected_name))
+            };
+            
+            if candidate.exists() {
+                // Found it already in trash!
+                return Ok(candidate);
+            }
+            
+            if idx > 100 { break; } // Safety break
+            idx += 1;
+        }
+    }
+
+    // If we reach here, the file is missing from both source and trash.
+    Err(anyhow::anyhow!("File not found at source or in trash: {}", target_path))
 }
 
 fn is_logical_trash_path(path: &StdPath) -> bool {
