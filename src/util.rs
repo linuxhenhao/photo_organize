@@ -7,15 +7,36 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
-pub fn canonicalize_for_check(path: impl AsRef<Path>) -> Result<PathBuf> {
-    fs::canonicalize(path.as_ref())
-        .with_context(|| format!("canonicalize {}", path.as_ref().display()))
-}
-
 pub fn ensure_under_root(root: &Path, candidate: &Path) -> Result<()> {
-    let root = canonicalize_for_check(root)?;
-    let candidate = canonicalize_for_check(candidate)?;
-    if candidate == root || candidate.starts_with(&root) {
+    // 1. Root must exist for canonicalization to be meaningful
+    let root_abs = fs::canonicalize(root)
+        .with_context(|| format!("canonicalize root {}", root.display()))?;
+
+    // 2. For the candidate, we join it with root if it's relative.
+    // We want to check if the LOGICAL path would be under root, 
+    // even if the file is already gone.
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root_abs.join(candidate)
+    };
+
+    // 3. Normalize the path (lexically) to remove ".." components
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::Normal(c) => normalized.push(c),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::RootDir => normalized.push(Component::RootDir),
+            Component::Prefix(p) => normalized.push(Component::Prefix(p)),
+        }
+    }
+
+    // 4. Perform the security check
+    if normalized.starts_with(&root_abs) {
         Ok(())
     } else {
         anyhow::bail!(
