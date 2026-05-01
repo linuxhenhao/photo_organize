@@ -769,10 +769,24 @@ fn validate_path_idempotent(
     target_path: &str,
     group_id: i64,
 ) -> Result<PathBuf, (StatusCode, String)> {
-    let original_abs = dest.join(target_path);
-    // 1. Try strict check at original location
-    if let Ok(()) = ensure_under_root(dest, &original_abs) {
-        return Ok(original_abs);
+    // 1. Correctly resolve the original path.
+    // If target_path starts with the name of the dest directory (e.g. "repo/"),
+    // and dest itself ends with that name, we should be careful about joining.
+    // The most robust way is to join target_path with the PARENT of dest if it's relative
+    // to the Multimedia root, but simpler: check if target_path exists relative to CWD,
+    // or relative to dest.
+    
+    let candidates = [
+        PathBuf::from(target_path), // relative to CWD
+        dest.join(target_path),      // relative to dest root
+    ];
+
+    for original_abs in candidates {
+        if original_abs.exists() {
+            if let Ok(()) = ensure_under_root(dest, &original_abs) {
+                return Ok(original_abs);
+            }
+        }
     }
 
     // 2. If original is missing, check if it's already in the trash
