@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::future::Future;
 use std::io::Cursor;
-use std::path::{Path as StdPath, PathBuf};
+use std::path::{Component, Path as StdPath, PathBuf};
 use tokio::net::TcpListener;
 
 static UGOS_MODE: Lazy<bool> = Lazy::new(detect_ugos_system);
@@ -147,6 +147,10 @@ fn router(state: AppState) -> Router {
         .route("/api/groups/{id}/resolve", post(resolve_group))
         .route("/api/groups/resolve_bulk", post(resolve_bulk))
         .route("/api/groups/{id}/archive", get(archive_group))
+        .route(
+            "/api/groups/{group_id}/members/{member_id}/delete_trash",
+            post(delete_trash_member),
+        )
         .route("/image", get(image))
         .with_state(state)
 }
@@ -494,6 +498,28 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
       showOverlay(previewSrc);
     }
 
+    function isTrashMember(member) {
+      return member.target_path.includes('/.photo-org/trash/');
+    }
+
+    async function deleteTrashMember(groupId, memberId, fileName) {
+      if (!confirm(`Permanently delete trash file ${fileName}?`)) return;
+
+      try {
+        const resp = await fetch(`/api/groups/${groupId}/members/${memberId}/delete_trash`, {
+          method: 'POST'
+        });
+
+        if (resp.ok) {
+          fetchGroups(pagedData.page_index, pagedData.page_size);
+        } else {
+          alert('Failed to delete trash file: ' + await resp.text());
+        }
+      } catch (err) {
+        alert('Error: ' + err.message);
+      }
+    }
+
     function renderGroups() {
       if (pagedData.groups.length === 0) {
         groupsContainer.innerHTML = emptyMarkup('All clear!', 'No pending duplicate groups found.');
@@ -528,6 +554,9 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
           const thumbSrc = `/image?path=${imgPath}&size=400`;
           const fullSrc = `/image?path=${imgPath}&size=1600`;
           const fileName = member.target_path.split('/').pop();
+          const deleteButton = isTrashMember(member)
+            ? `<button class="member-action reject" onclick="deleteTrashMember(${group.group_id}, ${member.id}, ${JSON.stringify(fileName)})">Delete trash file</button>`
+            : '';
           const statusClass = member.ui_primary ? 'primary' : (member.ui_keep ? 'kept' : 'rejected');
           const statusLabel = member.ui_primary ? 'Primary' : (member.ui_keep ? 'Keep' : 'Reject');
 
@@ -549,6 +578,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
                 <button class="member-action reject ${!member.ui_keep ? 'active' : ''}" onclick="setKeepState(${group.group_id}, ${member.id}, false)" ${member.ui_primary ? 'disabled' : ''}>Reject</button>
                 <button class="member-action primary ${member.ui_primary ? 'active' : ''}" onclick="setPrimary(${group.group_id}, ${member.id})">Primary</button>
                 <button class="member-action" onclick="showOverlay('${fullSrc}')">Preview</button>
+                ${deleteButton}
               </div>
             </div>
           `;
@@ -916,6 +946,87 @@ async fn archive_group(
     Ok(Json(json!({ "group_id": id, "members": group })))
 }
 
+async fn delete_trash_member(
+    Path((group_id, member_id)): Path<(i64, i64)>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
+    let group = load_group_members(&conn, group_id).map_err(internal_error)?;
+    let member = group
+        .iter()
+        .find(|member| member.id == member_id)
+        .cloned()
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "group member not found".to_string()))?;
+    let member_path = PathBuf::from(&member.target_path);
+    if !is_logical_trash_path(&member_path) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "member is not under .photo-org/trash".into(),
+        ));
+    }
+
+    let file_deleted = if member_path.exists() {
+        ensure_under_root(&state.dest, &member_path).map_err(internal_error)?;
+        if member_path.is_dir() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "trash member path must be a file".into(),
+            ));
+        }
+        fs::remove_file(&member_path).map_err(internal_error)?;
+        true
+    } else {
+        false
+    };
+
+    let tx = conn.transaction().map_err(internal_error)?;
+    tx.execute("DELETE FROM target_items WHERE id = ?1", rusqlite::params![member_id])
+        .map_err(internal_error)?;
+
+    let remaining = load_group_members(&tx, group_id).map_err(internal_error)?;
+    let group_cleared = remaining.len() <= 1;
+    if group_cleared {
+        for survivor in &remaining {
+            tx.execute(
+                "UPDATE target_items SET group_id = NULL, keep_state = 'undecided', is_group_primary = 0 WHERE id = ?1",
+                rusqlite::params![survivor.id],
+            )
+            .map_err(internal_error)?;
+        }
+    } else if remaining.iter().all(|member| !member.is_group_primary) {
+        if let Some(primary_id) = choose_best_primary_member(&remaining) {
+            tx.execute(
+                "UPDATE target_items SET is_group_primary = CASE WHEN id = ?1 THEN 1 ELSE 0 END WHERE group_id = ?2",
+                rusqlite::params![primary_id, group_id],
+            )
+            .map_err(internal_error)?;
+        }
+    }
+
+    insert_operation(
+        &tx,
+        "delete_trash_member",
+        &json!({
+            "group_id": group_id,
+            "member_id": member_id,
+            "target_path": member.target_path,
+            "file_deleted": file_deleted,
+            "group_cleared": group_cleared
+        })
+        .to_string(),
+    )
+    .map_err(internal_error)?;
+    tx.commit().map_err(internal_error)?;
+
+    Ok(Json(json!({
+        "group_id": group_id,
+        "member_id": member_id,
+        "status": "ok",
+        "file_deleted": file_deleted,
+        "group_cleared": group_cleared
+    })))
+}
+
 async fn image(
     State(state): State<AppState>,
     Query(query): Query<ImageQuery>,
@@ -1048,6 +1159,35 @@ fn move_to_trash(dest: &PathBuf, target_path: &str, group_id: i64) -> Result<Pat
     Ok(candidate)
 }
 
+fn is_logical_trash_path(path: &StdPath) -> bool {
+    let mut saw_photo_org = false;
+    for component in path.components() {
+        let Component::Normal(part) = component else {
+            saw_photo_org = false;
+            continue;
+        };
+        let part = part.to_string_lossy();
+        if saw_photo_org && part == "trash" {
+            return true;
+        }
+        saw_photo_org = part == ".photo-org";
+    }
+    false
+}
+
+fn choose_best_primary_member(members: &[MemberRow]) -> Option<i64> {
+    members
+        .iter()
+        .max_by_key(|member| {
+            (
+                i128::from(member.width) * i128::from(member.height),
+                member.size_bytes,
+                -member.id,
+            )
+        })
+        .map(|member| member.id)
+}
+
 fn load_group_members(conn: &rusqlite::Connection, group_id: i64) -> Result<Vec<MemberRow>> {
     let mut stmt = conn.prepare(
         r#"
@@ -1076,7 +1216,7 @@ fn load_group_members(conn: &rusqlite::Connection, group_id: i64) -> Result<Vec<
     Ok(rows)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct MemberRow {
     id: i64,
     target_path: String,
@@ -1365,6 +1505,111 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delete_trash_member_removes_file_and_dissolves_singleton_group() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let keep_path = dest.join("2024/06/09/keep.png");
+        let trash_path = dest.join(".photo-org/trash/group-1/reject.png");
+        fs::create_dir_all(keep_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(trash_path.parent().unwrap()).unwrap();
+        make_png(&keep_path, [255, 0, 0]);
+        make_png(&trash_path, [0, 255, 0]);
+
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO target_items (
+                target_path, size_bytes, mime_type, created_at, exact_hash, phash, phash_bits,
+                width, height, group_id, keep_state, is_group_primary, origin_source_id, meta_json
+            ) VALUES
+                (?1, 1, 'image/png', '2024-06-09T00:00:00Z', 'a', 'p', 64, 32, 32, 1, 'undecided', 1, NULL, '{}'),
+                (?2, 1, 'image/png', '2024-06-09T00:00:00Z', 'b', 'p', 64, 32, 32, 1, 'rejected', 0, NULL, '{}')
+            "#,
+            rusqlite::params![
+                keep_path.to_string_lossy().to_string(),
+                trash_path.to_string_lossy().to_string(),
+            ],
+        )
+        .unwrap();
+
+        let app = router(AppState {
+            db_path: db_path.clone(),
+            dest: dest.clone(),
+        });
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/groups/1/members/2/delete_trash")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!trash_path.exists());
+
+        let conn = open_catalog_db(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM target_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let survivor: (Option<i64>, String, i64) = conn
+            .query_row(
+                "SELECT group_id, keep_state, is_group_primary FROM target_items WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(survivor.0, None);
+        assert_eq!(survivor.1, "undecided");
+        assert_eq!(survivor.2, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_trash_member_rejects_non_trash_path() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let keep_path = dest.join("2024/06/09/keep.png");
+        let reject_path = dest.join("2024/06/09/reject.png");
+        fs::create_dir_all(keep_path.parent().unwrap()).unwrap();
+        make_png(&keep_path, [255, 0, 0]);
+        make_png(&reject_path, [0, 255, 0]);
+
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO target_items (
+                target_path, size_bytes, mime_type, created_at, exact_hash, phash, phash_bits,
+                width, height, group_id, keep_state, is_group_primary, origin_source_id, meta_json
+            ) VALUES
+                (?1, 1, 'image/png', '2024-06-09T00:00:00Z', 'a', 'p', 64, 32, 32, 1, 'undecided', 1, NULL, '{}'),
+                (?2, 1, 'image/png', '2024-06-09T00:00:00Z', 'b', 'p', 64, 32, 32, 1, 'rejected', 0, NULL, '{}')
+            "#,
+            rusqlite::params![
+                keep_path.to_string_lossy().to_string(),
+                reject_path.to_string_lossy().to_string(),
+            ],
+        )
+        .unwrap();
+
+        let app = router(AppState {
+            db_path: db_path.clone(),
+            dest: dest.clone(),
+        });
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/groups/1/members/2/delete_trash")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(reject_path.exists());
     }
 
     #[tokio::test]

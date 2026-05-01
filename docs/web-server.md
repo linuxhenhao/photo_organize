@@ -47,6 +47,8 @@ Current routes:
   Resolves every group on the current page in one transaction.
 - `GET /api/groups/{id}/archive`
   Returns the raw member list for one group. Today this is a read-only JSON view, not a write path.
+- `POST /api/groups/{group_id}/members/{member_id}/delete_trash`
+  Permanently deletes one member file that is already under `.photo-org/trash/` and removes its row from `target_items`.
 - `GET /image`
   Returns a preview for one target file path.
 
@@ -123,6 +125,18 @@ Bulk resolve applies multiple group decisions inside one transaction. It also mo
 Current caveat:
 
 - bulk resolve is less defensive than single-group resolve and assumes the client sent coherent per-group decisions
+
+### `POST /api/groups/{group_id}/members/{member_id}/delete_trash`
+
+Trash-member deletion is intentionally narrower than resolve:
+
+- the row must belong to the requested group
+- the stored `target_path` must already point under `.photo-org/trash/`
+- the file is permanently removed from disk if it still exists
+- the `target_items` row is deleted
+- if that leaves only one member in the group, the survivor is de-grouped by clearing `group_id` and `is_group_primary`
+
+This path is for manual cleanup of already-rejected trash files, not for normal duplicate resolution.
 
 ## Filesystem Safety Rules
 
