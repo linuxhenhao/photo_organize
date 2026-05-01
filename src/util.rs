@@ -26,6 +26,25 @@ pub fn ensure_under_root(root: &Path, candidate: &Path) -> Result<()> {
     }
 }
 
+/// The "logical root" for target_path storage is the parent of the --dest directory.
+/// For example, if --dest is "repo", the target_path in DB is "repo/2023/xxx.jpg".
+/// To find it physically, we join the parent of --dest with "repo/2023/xxx.jpg".
+pub fn target_base_path(dest: &Path) -> PathBuf {
+    dest.parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Resolves a logical target_path from the database to a physical path on disk.
+pub fn resolve_physical_path(dest: &Path, target_path: &str) -> PathBuf {
+    target_base_path(dest).join(target_path)
+}
+
+/// A centralized check for ensuring a path is safely under the target root.
+pub fn ensure_under_target_root(dest: &Path, candidate: &Path) -> Result<()> {
+    ensure_under_root(&target_base_path(dest), candidate)
+}
+
 pub fn is_excluded_dir(path: &Path) -> bool {
     path.components().any(|component| match component {
         Component::Normal(part) => {

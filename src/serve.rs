@@ -1,6 +1,9 @@
 use crate::db::{insert_operation, open_catalog_db};
 use crate::interrupt;
-use crate::util::{best_effort_mime, ensure_under_root, safe_file_name};
+use crate::util::{
+    best_effort_mime, ensure_under_root, ensure_under_target_root, resolve_physical_path,
+    safe_file_name, target_base_path,
+};
 use anyhow::Result;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode};
@@ -769,14 +772,10 @@ fn validate_path_idempotent(
     target_path: &str,
     group_id: i64,
 ) -> Result<PathBuf, (StatusCode, String)> {
-    // According to src/import.rs, target_path is stored relative to dest.parent().
-    // For example, if --dest is "repo", the parent is the current directory ".",
-    // and target_path "repo/xxx.jpg" is correctly located at "./repo/xxx.jpg".
-    let base = dest.parent().unwrap_or(dest);
-    let original_abs = base.join(target_path);
+    let original_abs = resolve_physical_path(dest, target_path);
 
     // 1. Try strict check at the logically correct location
-    if let Ok(()) = ensure_under_root(base, &original_abs) {
+    if let Ok(()) = ensure_under_target_root(dest, &original_abs) {
         return Ok(original_abs);
     }
 
@@ -805,13 +804,15 @@ fn find_in_trash(dest: &PathBuf, target_path: &str, group_id: i64) -> Option<Pat
         return None;
     }
 
+    // Since target_path in DB includes the "repo/" prefix (or whatever dest is),
+    // but the file in trash might only use the basename, we use the original path's basename.
     let expected_name = safe_file_name(StdPath::new(target_path));
     let mut idx = 0usize;
     loop {
         let candidate = if idx == 0 {
             trash_dir.join(&expected_name)
         } else {
-            trash_dir.join(format!("{}-{}", idx, expected_name))
+            trash_dir.join(format!("{}-{}", idx, &expected_name))
         };
 
         if candidate.exists() {
@@ -1197,8 +1198,7 @@ fn resolve_ugos_thumb(path: &StdPath) -> Option<PathBuf> {
 }
 
 fn move_to_trash(dest: &PathBuf, target_path: &str, group_id: i64) -> Result<PathBuf> {
-    let base = dest.parent().unwrap_or(dest);
-    let path = base.join(target_path);
+    let path = resolve_physical_path(dest, target_path);
     let trash_dir = dest
         .join(".photo-org")
         .join("trash")
@@ -1206,7 +1206,7 @@ fn move_to_trash(dest: &PathBuf, target_path: &str, group_id: i64) -> Result<Pat
 
     // If the file already exists at the target path, move it to trash.
     if path.exists() {
-        ensure_under_root(base, &path)?;
+        ensure_under_target_root(dest, &path)?;
         fs::create_dir_all(&trash_dir)?;
         let file_name = safe_file_name(&path);
         let mut candidate = trash_dir.join(&file_name);
