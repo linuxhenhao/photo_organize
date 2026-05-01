@@ -2,7 +2,7 @@ use crate::db::{insert_operation, open_catalog_db};
 use crate::interrupt;
 use crate::util::{
     best_effort_mime, ensure_under_root, ensure_under_target_root, resolve_physical_path,
-    safe_file_name, target_base_path,
+    safe_file_name,
 };
 use anyhow::Result;
 use axum::extract::{Path, Query, State};

@@ -30,9 +30,10 @@ pub fn ensure_under_root(root: &Path, candidate: &Path) -> Result<()> {
 /// For example, if --dest is "repo", the target_path in DB is "repo/2023/xxx.jpg".
 /// To find it physically, we join the parent of --dest with "repo/2023/xxx.jpg".
 pub fn target_base_path(dest: &Path) -> PathBuf {
-    dest.parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."))
+    match dest.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
 }
 
 /// Resolves a logical target_path from the database to a physical path on disk.
@@ -885,5 +886,40 @@ mod tests {
             .num_seconds()
             .try_into()
             .unwrap()
+    }
+
+    #[test]
+    fn path_resolution_consistent_with_db_storage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("repo");
+        fs::create_dir_all(&dest).unwrap();
+
+        // 1. target_base_path should be the parent of dest
+        let base = target_base_path(&dest);
+        assert_eq!(base, tmp.path());
+
+        // 2. resolve_physical_path should correctly join
+        let target_path = "repo/2023/05/01/img.jpg";
+        let physical = resolve_physical_path(&dest, target_path);
+        assert_eq!(physical, tmp.path().join(target_path));
+
+        // 3. ensure_under_target_root safety check
+        let safe_file = tmp.path().join("repo/safe.jpg");
+        fs::write(&safe_file, "data").unwrap();
+        assert!(ensure_under_target_root(&dest, &safe_file).is_ok());
+
+        // For unsafe file, we need something TRULY outside the logical base (tmp.path())
+        let unsafe_tmp = tempfile::tempdir().unwrap();
+        let unsafe_file = unsafe_tmp.path().join("outside.jpg");
+        fs::write(&unsafe_file, "data").unwrap();
+        assert!(ensure_under_target_root(&dest, &unsafe_file).is_err());
+    }
+
+    #[test]
+    fn path_resolution_handles_relative_dest() {
+        let dest = Path::new("repo");
+        // target_base_path("repo") -> "."
+        assert_eq!(target_base_path(dest), Path::new("."));
+        assert_eq!(resolve_physical_path(dest, "repo/a.jpg"), Path::new("./repo/a.jpg"));
     }
 }
