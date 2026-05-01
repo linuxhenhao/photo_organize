@@ -764,6 +764,62 @@ async fn list_groups(
     }))
 }
 
+fn validate_path_idempotent(
+    dest: &PathBuf,
+    target_path: &str,
+    group_id: i64,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let original_abs = dest.join(target_path);
+    // 1. Try strict check at original location
+    if let Ok(()) = ensure_under_root(dest, &original_abs) {
+        return Ok(original_abs);
+    }
+
+    // 2. If original is missing, check if it's already in the trash
+    let expected_trash = find_in_trash(dest, target_path, group_id);
+    if let Some(trash_path) = expected_trash {
+        // Double check the found trash path is also safe
+        ensure_under_root(dest, &trash_path).map_err(internal_error)?;
+        return Ok(trash_path);
+    }
+
+    // 3. If neither, it's a real error
+    Err((
+        StatusCode::BAD_REQUEST,
+        format!("file not found at source or in trash: {}", target_path),
+    ))
+}
+
+fn find_in_trash(dest: &PathBuf, target_path: &str, group_id: i64) -> Option<PathBuf> {
+    let trash_dir = dest
+        .join(".photo-org")
+        .join("trash")
+        .join(format!("group-{}", group_id));
+    if !trash_dir.exists() {
+        return None;
+    }
+
+    let expected_name = safe_file_name(StdPath::new(target_path));
+    let mut idx = 0usize;
+    loop {
+        let candidate = if idx == 0 {
+            trash_dir.join(&expected_name)
+        } else {
+            trash_dir.join(format!("{}-{}", idx, expected_name))
+        };
+
+        if candidate.exists() {
+            return Some(candidate);
+        }
+
+        if idx > 100 {
+            break;
+        }
+        idx += 1;
+    }
+    None
+}
+
 async fn resolve_bulk(
     State(state): State<AppState>,
     Json(request): Json<BulkResolveRequest>,
@@ -783,8 +839,7 @@ async fn resolve_bulk(
             ));
         }
         for path in kept_set.iter().chain(rejected_set.iter()) {
-            ensure_under_root(&state.dest, PathBuf::from(path).as_path())
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            validate_path_idempotent(&state.dest, path, res.group_id)?;
         }
     }
 
@@ -865,12 +920,7 @@ async fn resolve_group(
         ));
     }
     for path in kept_set.iter().chain(rejected_set.iter()) {
-        if !group.iter().any(|member| &member.target_path == *path) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "requested path is not in the group".into(),
-            ));
-        }
+        validate_path_idempotent(&state.dest, path, id)?;
     }
     if let Some(primary_path) = primary.as_ref() {
         if !group
