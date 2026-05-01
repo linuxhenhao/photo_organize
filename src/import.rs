@@ -71,6 +71,7 @@ struct CatalogInput {
 #[derive(Debug, Clone)]
 struct ExistingTargetFact {
     size_bytes: i64,
+    created_at: String,
     exact_hash: String,
     modified_at: Option<String>,
 }
@@ -468,6 +469,7 @@ fn grouping_pass_initcache(
     progress.log_start();
 
     let mut batch = Vec::new();
+    let mut touched_group_ids = HashSet::new();
     for row in pending {
         if interrupt::requested() {
             if !batch.is_empty() {
@@ -484,7 +486,15 @@ fn grouping_pass_initcache(
             phash_threshold,
             akaze_min_matches,
             "completed",
-        )?;
+        )
+        .map(|updated| {
+            if let Some(group_id) = row.group_id {
+                touched_group_ids.insert(group_id);
+            }
+            if let Some(group_id) = updated.group_id {
+                touched_group_ids.insert(group_id);
+            }
+        })?;
 
         batch.push(row.id);
         if batch.len() >= 100 {
@@ -498,6 +508,8 @@ fn grouping_pass_initcache(
         mark_completed_batch(&mut conn, &batch)?;
     }
 
+    repair_touched_group_primaries(&mut conn, &touched_group_ids)?;
+
     Ok(())
 }
 
@@ -508,6 +520,34 @@ fn mark_completed_batch(conn: &mut Connection, ids: &[i64]) -> Result<()> {
             tx.prepare("UPDATE target_items SET group_status = 'completed' WHERE id = ?1")?;
         for id in ids {
             stmt.execute(params![id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn repair_touched_group_primaries(conn: &mut Connection, group_ids: &HashSet<i64>) -> Result<()> {
+    if group_ids.is_empty() {
+        return Ok(());
+    }
+
+    let progress = ProgressReporter::new("initcache repair primary", group_ids.len());
+    progress.log_start();
+
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "UPDATE target_items SET is_group_primary = CASE WHEN id = ?1 THEN 1 ELSE 0 END WHERE group_id = ?2",
+        )?;
+        for group_id in group_ids {
+            interrupt::check()?;
+            let members = load_group_members(&tx, *group_id)?;
+            let primary_count = members.iter().filter(|m| m.is_group_primary).count();
+            if primary_count != 1 {
+                let primary_id = choose_primary_member(&members)?;
+                stmt.execute(params![primary_id, group_id])?;
+            }
+            progress.item_done();
         }
     }
     tx.commit()?;
@@ -541,6 +581,9 @@ fn discover_or_reuse_target_file(
 
     if let Some(previous) = existing.get(&path_key) {
         if previous.exact_hash.is_empty() {
+            return Ok(Some(discover_file(path)?));
+        }
+        if previous.created_at.trim().is_empty() {
             return Ok(Some(discover_file(path)?));
         }
         if previous.size_bytes == size_bytes && previous.modified_at == modified_at {
@@ -1066,18 +1109,21 @@ fn upsert_catalog_item(
 }
 
 fn load_existing_target_facts(conn: &Connection) -> Result<HashMap<String, ExistingTargetFact>> {
-    let mut stmt =
-        conn.prepare("SELECT target_path, size_bytes, exact_hash, meta_json FROM target_items")?;
+    let mut stmt = conn.prepare(
+        "SELECT target_path, size_bytes, created_at, exact_hash, meta_json FROM target_items",
+    )?;
     let rows = stmt
         .query_map([], |row| {
             let target_path = row.get::<_, String>(0)?;
             let size_bytes = row.get::<_, i64>(1)?;
-            let exact_hash = row.get::<_, String>(2)?;
-            let meta_json = row.get::<_, String>(3)?;
+            let created_at = row.get::<_, String>(2)?;
+            let exact_hash = row.get::<_, String>(3)?;
+            let meta_json = row.get::<_, String>(4)?;
             Ok((
                 target_path,
                 ExistingTargetFact {
                     size_bytes,
+                    created_at,
                     exact_hash,
                     modified_at: extract_modified_at(&meta_json),
                 },
@@ -1417,6 +1463,94 @@ mod tests {
             extract_modified_at(&meta_json).is_some(),
             "expected initcache regrouping to preserve fingerprint.modified_at, got {meta_json}"
         );
+    }
+
+    #[test]
+    fn initcache_backfills_missing_created_at_for_unchanged_files() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let image = dest.join("img_2023_05_01.jpg");
+        copy_mock_fixture("img_2023_05_01.jpg", &image);
+        let expected_created_at = discover_file(&image).unwrap().created_at;
+
+        let catalog_db = tmp.path().join("catalog.db");
+        initcache(&catalog_db, &dest, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let path = image.to_string_lossy().to_string();
+        catalog
+            .execute(
+                "UPDATE target_items SET created_at = '' WHERE target_path = ?1",
+                params![&path],
+            )
+            .unwrap();
+        drop(catalog);
+
+        initcache(&catalog_db, &dest, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let restored_created_at: String = catalog
+            .query_row(
+                "SELECT created_at FROM target_items WHERE target_path = ?1",
+                params![&path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_created_at, expected_created_at);
+    }
+
+    #[test]
+    fn initcache_repairs_missing_primary_for_touched_pending_group() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+
+        let a = dest.join("2024-06-09_a.jpg");
+        let b = dest.join("2024-06-09_b.jpg");
+        copy_source_fixture("DSC00903.thumb.jpg", &a);
+        fs::copy(&a, &b).unwrap();
+        append_trailing_byte(&b);
+
+        let catalog_db = tmp.path().join("catalog.db");
+        initcache(&catalog_db, &dest, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let group_id: i64 = catalog
+            .query_row(
+                "SELECT group_id FROM target_items WHERE target_path = ?1",
+                params![a.to_string_lossy().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        catalog
+            .execute(
+                "UPDATE target_items SET is_group_primary = 0, group_status = 'pending' WHERE group_id = ?1",
+                params![group_id],
+            )
+            .unwrap();
+        drop(catalog);
+
+        initcache(&catalog_db, &dest, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let primary_count: i64 = catalog
+            .query_row(
+                "SELECT COUNT(*) FROM target_items WHERE group_id = ?1 AND is_group_primary != 0",
+                params![group_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let completed_count: i64 = catalog
+            .query_row(
+                "SELECT COUNT(*) FROM target_items WHERE group_id = ?1 AND group_status = 'completed'",
+                params![group_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(primary_count, 1);
+        assert_eq!(completed_count, 2);
     }
 
     #[cfg(unix)]

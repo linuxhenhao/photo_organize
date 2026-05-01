@@ -6,7 +6,7 @@ use crate::features::{
 use crate::interrupt;
 use crate::util::{
     ProgressReporter, best_effort_mime, fallback_file_time, filename_date, is_excluded_dir,
-    parse_exif_datetime,
+    parse_exif_datetime, parse_video_container_datetime,
 };
 use anyhow::{Context, Result};
 use blake3::Hasher as Blake3Hasher;
@@ -133,8 +133,8 @@ pub(crate) fn discover_file(path: &Path) -> Result<DiscoveredFile> {
     let now = now_string();
     let sniff_bytes = read_prefix(&mut file, MIME_PREFIX_BYTES)?;
     let mime_type = best_effort_mime(path, &sniff_bytes);
-    let created_at =
-        metadata_time(path, &meta, &mut file).unwrap_or_else(|| fallback_file_time(&meta));
+    let created_at = metadata_time(path, &mime_type, &meta, &mut file)
+        .unwrap_or_else(|| fallback_file_time(&meta));
     let exact_hash = exact_hash_file(&mut file)?;
     let visual = if supports_visual_features(path, &mime_type) {
         if is_raw_like_mime(&mime_type) {
@@ -179,7 +179,15 @@ pub(crate) fn discover_file(path: &Path) -> Result<DiscoveredFile> {
     })
 }
 
-fn metadata_time(path: &Path, meta: &std::fs::Metadata, file: &mut File) -> Option<String> {
+fn metadata_time(
+    path: &Path,
+    mime_type: &str,
+    meta: &std::fs::Metadata,
+    file: &mut File,
+) -> Option<String> {
+    if let Some(ts) = parse_video_container_datetime(file, mime_type) {
+        return Some(ts);
+    }
     let _ = file.seek(SeekFrom::Start(0));
     let mut reader = BufReader::new(file);
     if let Ok(exif) = exif::Reader::new().read_from_container(&mut reader) {
@@ -429,6 +437,24 @@ mod tests {
     }
 
     #[test]
+    fn metadata_time_prefers_video_container_timestamp() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("clip.mp4");
+        fs::write(
+            &path,
+            minimal_mp4_with_mvhd_v0(quicktime_seconds_for("2025-01-02T03:04:56+00:00")),
+        )
+        .unwrap();
+
+        let meta = fs::metadata(&path).unwrap();
+        let mut file = File::open(&path).unwrap();
+
+        let actual = metadata_time(&path, "video/mp4", &meta, &mut file);
+
+        assert_eq!(actual.as_deref(), Some("2025-01-02T03:04:56+00:00"));
+    }
+
+    #[test]
     fn interrupted_scan_does_not_mark_unseen_rows_missing() {
         let tmp = tempdir().unwrap();
         let src = tmp.path().join("src");
@@ -454,5 +480,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "present");
+    }
+
+    fn minimal_mp4_with_mvhd_v0(seconds: u64) -> Vec<u8> {
+        let creation = u32::try_from(seconds).unwrap().to_be_bytes();
+        let mut mvhd = Vec::new();
+        mvhd.extend_from_slice(&16_u32.to_be_bytes());
+        mvhd.extend_from_slice(b"mvhd");
+        mvhd.extend_from_slice(&[0, 0, 0, 0]);
+        mvhd.extend_from_slice(&creation);
+
+        let moov_len = 8 + mvhd.len() as u32;
+        let mut moov = Vec::new();
+        moov.extend_from_slice(&moov_len.to_be_bytes());
+        moov.extend_from_slice(b"moov");
+        moov.extend_from_slice(&mvhd);
+
+        let mut ftyp = Vec::new();
+        ftyp.extend_from_slice(&24_u32.to_be_bytes());
+        ftyp.extend_from_slice(b"ftyp");
+        ftyp.extend_from_slice(b"isom");
+        ftyp.extend_from_slice(&0_u32.to_be_bytes());
+        ftyp.extend_from_slice(b"isom");
+        ftyp.extend_from_slice(b"mp41");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&ftyp);
+        bytes.extend_from_slice(&moov);
+        bytes
+    }
+
+    fn quicktime_seconds_for(rfc3339: &str) -> u64 {
+        use chrono::{DateTime, NaiveDate, Utc};
+
+        let target = DateTime::parse_from_rfc3339(rfc3339).unwrap();
+        let epoch = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(1904, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            Utc,
+        );
+        target
+            .with_timezone(&Utc)
+            .signed_duration_since(epoch)
+            .num_seconds()
+            .try_into()
+            .unwrap()
     }
 }
