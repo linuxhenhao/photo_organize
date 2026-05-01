@@ -769,30 +769,22 @@ fn validate_path_idempotent(
     target_path: &str,
     group_id: i64,
 ) -> Result<PathBuf, (StatusCode, String)> {
-    // 1. Correctly resolve the original path.
-    // If target_path starts with the name of the dest directory (e.g. "repo/"),
-    // and dest itself ends with that name, we should be careful about joining.
-    // The most robust way is to join target_path with the PARENT of dest if it's relative
-    // to the Multimedia root, but simpler: check if target_path exists relative to CWD,
-    // or relative to dest.
-    
-    let candidates = [
-        PathBuf::from(target_path), // relative to CWD
-        dest.join(target_path),      // relative to dest root
-    ];
+    // According to src/import.rs, target_path is stored relative to dest.parent().
+    // For example, if --dest is "repo", the parent is the current directory ".",
+    // and target_path "repo/xxx.jpg" is correctly located at "./repo/xxx.jpg".
+    let base = dest.parent().unwrap_or(dest);
+    let original_abs = base.join(target_path);
 
-    for original_abs in candidates {
-        if original_abs.exists() {
-            if let Ok(()) = ensure_under_root(dest, &original_abs) {
-                return Ok(original_abs);
-            }
-        }
+    // 1. Try strict check at the logically correct location
+    if let Ok(()) = ensure_under_root(base, &original_abs) {
+        return Ok(original_abs);
     }
 
-    // 2. If original is missing, check if it's already in the trash
+    // 2. If original is missing, check if it's already in the trash.
+    // Trash is always under dest/.photo-org/trash/
     let expected_trash = find_in_trash(dest, target_path, group_id);
     if let Some(trash_path) = expected_trash {
-        // Double check the found trash path is also safe
+        // Double check the found trash path is also safe (under dest root)
         ensure_under_root(dest, &trash_path).map_err(internal_error)?;
         return Ok(trash_path);
     }
@@ -1205,7 +1197,8 @@ fn resolve_ugos_thumb(path: &StdPath) -> Option<PathBuf> {
 }
 
 fn move_to_trash(dest: &PathBuf, target_path: &str, group_id: i64) -> Result<PathBuf> {
-    let path = dest.join(target_path);
+    let base = dest.parent().unwrap_or(dest);
+    let path = base.join(target_path);
     let trash_dir = dest
         .join(".photo-org")
         .join("trash")
@@ -1213,7 +1206,7 @@ fn move_to_trash(dest: &PathBuf, target_path: &str, group_id: i64) -> Result<Pat
 
     // If the file already exists at the target path, move it to trash.
     if path.exists() {
-        ensure_under_root(dest, &path)?;
+        ensure_under_root(base, &path)?;
         fs::create_dir_all(&trash_dir)?;
         let file_name = safe_file_name(&path);
         let mut candidate = trash_dir.join(&file_name);
