@@ -12,6 +12,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use image::ImageFormat;
 use once_cell::sync::Lazy;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
@@ -41,6 +42,7 @@ struct PagedGroups {
     total_pages: usize,
     page_index: usize,
     page_size: usize,
+    review_mode: String,
     current_page: usize,
     limit: usize,
 }
@@ -72,6 +74,8 @@ struct GroupParams {
     page_size: Option<usize>,
     page: Option<usize>,
     limit: Option<usize>,
+    group_id: Option<i64>,
+    view: Option<String>,
 }
 
 const DEFAULT_PAGE_SIZE: usize = 20;
@@ -81,6 +85,13 @@ const MAX_PAGE_SIZE: usize = 1000;
 struct PagingRequest {
     page_index: usize,
     page_size: usize,
+    group_id: Option<i64>,
+    review_mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteTrashMembersRequest {
+    member_ids: Vec<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +151,8 @@ fn normalize_group_params(params: &GroupParams) -> PagingRequest {
     PagingRequest {
         page_index,
         page_size,
+        group_id: params.group_id,
+        review_mode: params.view.clone().unwrap_or_else(|| "pending".to_string()),
     }
 }
 
@@ -149,6 +162,8 @@ fn router(state: AppState) -> Router {
         .route("/api/groups", get(list_groups))
         .route("/api/groups/{id}/resolve", post(resolve_group))
         .route("/api/groups/resolve_bulk", post(resolve_bulk))
+        .route("/api/groups/{id}/delete_trash", post(delete_trash_group))
+        .route("/api/groups/delete_trash_bulk", post(delete_trash_bulk))
         .route("/api/groups/{id}/archive", get(archive_group))
         .route(
             "/api/groups/{group_id}/members/{member_id}/delete_trash",
@@ -198,6 +213,10 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
     .header-stats-desktop { display: flex; gap: 0.75rem; flex-wrap: wrap; justify-content: flex-end; }
     .header-stats-mobile { display: none; }
     .header-pill { padding: 0.45rem 0.8rem; border-radius: 999px; background: rgba(15, 23, 42, 0.88); border: 1px solid rgba(148, 163, 184, 0.15); color: var(--text-muted); font-size: 0.8125rem; white-space: nowrap; }
+    .header-mode-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; justify-content: flex-end; }
+    .header-mode-btn { min-height: 2.4rem; padding: 0.55rem 0.9rem; border-radius: 999px; border: 1px solid rgba(148, 163, 184, 0.16); background: rgba(15, 23, 42, 0.92); color: var(--text); font-weight: 700; }
+    .header-mode-btn:hover:not(:disabled) { background: #334155; }
+    .header-mode-btn:disabled { opacity: 0.55; cursor: not-allowed; }
     main { padding: 1.5rem; max-width: 1600px; margin: 0 auto; }
 
     .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; background: rgba(15, 23, 42, 0.92); padding: 1rem 1.25rem; border-radius: 1rem; border: 1px solid rgba(148, 163, 184, 0.12); gap: 1rem; flex-wrap: wrap; box-shadow: var(--shadow); }
@@ -277,6 +296,8 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
       .header-stats { justify-content: flex-end; min-width: 0; flex: 1; }
       .header-stats-desktop { display: none; }
       .header-stats-mobile { display: block; min-width: 0; }
+      .header-mode-actions { width: 100%; justify-content: stretch; }
+      .header-mode-btn { width: 100%; }
       .header-pill { padding: 0.35rem 0.65rem; font-size: 0.74rem; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
       main { padding: 1rem; }
       .toolbar, .group-header, .group-footer { padding: 1rem; }
@@ -356,45 +377,86 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
       total_pages: 0,
       page_index: 0,
       page_size: 20,
+      group_id: null,
+      review_mode: 'pending',
       current_page: 1,
       limit: 20
     };
+
+    function isTrashReviewMode() {
+      return pagedData.review_mode === 'trash';
+    }
 
     function syncBrowserUrl() {
       const url = new URL(window.location.href);
       url.searchParams.set('page_index', String(pagedData.page_index));
       url.searchParams.set('page_size', String(pagedData.page_size));
+      if (isTrashReviewMode()) {
+        url.searchParams.set('view', 'trash');
+      } else {
+        url.searchParams.delete('view');
+      }
+      if (pagedData.group_id !== null && pagedData.group_id !== undefined && pagedData.group_id !== '') {
+        url.searchParams.set('group_id', String(pagedData.group_id));
+      } else {
+        url.searchParams.delete('group_id');
+      }
       url.searchParams.delete('page');
       url.searchParams.delete('limit');
       window.history.replaceState(null, '', url);
     }
 
     function renderHeaderStats() {
+      const modeActions = `
+        <div class="header-mode-actions">
+          <button class="header-mode-btn" onclick="setReviewMode('pending')" ${!isTrashReviewMode() ? 'disabled' : ''}>Pending review</button>
+          <button class="header-mode-btn" onclick="setReviewMode('trash')" ${isTrashReviewMode() ? 'disabled' : ''}>Trash review</button>
+        </div>
+      `;
       if (pagedData.total_groups === 0) {
-        statsHeader.innerHTML = '<div class="header-stats"><div class="header-pill">No pending groups</div></div>';
+        const emptyLabel = pagedData.group_id
+          ? `Group ${pagedData.group_id} not found`
+          : (isTrashReviewMode() ? 'No trash-review groups' : 'No pending groups');
+        statsHeader.innerHTML = `<div class="header-stats">${modeActions}<div class="header-pill">${emptyLabel}</div></div>`;
         return;
       }
       const visibleMembers = pagedData.groups.reduce((sum, group) => sum + group.members.length, 0);
+      const trashMembers = pagedData.groups.reduce((sum, group) => sum + group.members.filter(isTrashMember).length, 0);
+      const scopePill = pagedData.group_id
+        ? `<div class="header-pill">Group filter ${pagedData.group_id}</div>`
+        : `<div class="header-pill">${pagedData.total_groups} ${isTrashReviewMode() ? 'trash-review' : 'pending'} groups</div>`;
       statsHeader.innerHTML = `
         <div class="header-stats">
+          ${modeActions}
           <div class="header-stats-desktop">
-            <div class="header-pill">${pagedData.total_groups} pending groups</div>
+            ${scopePill}
             <div class="header-pill">Page ${pagedData.current_page} / ${Math.max(pagedData.total_pages, 1)}</div>
             <div class="header-pill">${visibleMembers} items on screen</div>
+            ${isTrashReviewMode() ? `<div class="header-pill">${trashMembers} trash files on screen</div>` : ''}
           </div>
           <div class="header-stats-mobile">
-            <div class="header-pill">${pagedData.total_groups} groups • ${visibleMembers} items • p${pagedData.current_page}/${Math.max(pagedData.total_pages, 1)}</div>
+            <div class="header-pill">${pagedData.group_id ? `group ${pagedData.group_id}` : `${pagedData.total_groups} groups`} • ${visibleMembers} items${isTrashReviewMode() ? ` • ${trashMembers} trash` : ''} • p${pagedData.current_page}/${Math.max(pagedData.total_pages, 1)}</div>
           </div>
         </div>
       `;
     }
 
-    async function fetchGroups(pageIndex = pagedData.page_index, pageSize = pagedData.page_size) {
+    async function fetchGroups(pageIndex = pagedData.page_index, pageSize = pagedData.page_size, groupId = pagedData.group_id, reviewMode = pagedData.review_mode) {
       try {
         groupsContainer.innerHTML = loadingMarkup(`Loading page ${pageIndex + 1}...`);
         window.scrollTo(0, 0);
 
-        const resp = await fetch(`/api/groups?page_index=${pageIndex}&page_size=${pageSize}`);
+        const params = new URLSearchParams({
+          page_index: String(pageIndex),
+          page_size: String(pageSize)
+        });
+        if (groupId !== null && groupId !== undefined && groupId !== '') {
+          params.set('group_id', String(groupId));
+        }
+        if (reviewMode === 'trash') {
+          params.set('view', 'trash');
+        }
+        const resp = await fetch(`/api/groups?${params.toString()}`);
         pagedData = await resp.json();
         syncBrowserUrl();
 
@@ -428,18 +490,27 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         return;
       }
 
+      const canBulkDeleteTrash = pagedData.groups.some(group => group.members.some(isTrashMember));
+
       container.innerHTML = `
         <div class="toolbar">
           <div class="toolbar-block pagination">
-            <button class="page-btn" ${pagedData.page_index <= 0 ? 'disabled' : ''} onclick="fetchGroups(${pagedData.page_index - 1}, ${pagedData.page_size})">Prev page</button>
-            <div class="pagination-status">Page <strong>${pagedData.current_page}</strong> of ${pagedData.total_pages} with ${pagedData.total_groups} pending groups</div>
-            <button class="page-btn" ${pagedData.page_index + 1 >= pagedData.total_pages ? 'disabled' : ''} onclick="fetchGroups(${pagedData.page_index + 1}, ${pagedData.page_size})">Next page</button>
+            <button class="page-btn" ${pagedData.page_index <= 0 ? 'disabled' : ''} onclick="fetchGroups(${pagedData.page_index - 1}, ${pagedData.page_size}, pagedData.group_id, pagedData.review_mode)">Prev page</button>
+            <div class="pagination-status">${pagedData.group_id ? `Viewing group ${pagedData.group_id}` : `Page <strong>${pagedData.current_page}</strong> of ${pagedData.total_pages} with ${pagedData.total_groups} ${isTrashReviewMode() ? 'trash-review' : 'pending'} groups`}</div>
+            <button class="page-btn" ${pagedData.page_index + 1 >= pagedData.total_pages ? 'disabled' : ''} onclick="fetchGroups(${pagedData.page_index + 1}, ${pagedData.page_size}, pagedData.group_id, pagedData.review_mode)">Next page</button>
           </div>
           <div class="toolbar-block pagination-meta">
             <label class="page-size-label">page_index <input class="page-input" id="${container.id}-page-index" type="number" min="0" max="${Math.max(pagedData.total_pages - 1, 0)}" value="${pagedData.page_index}" onchange="changePageIndex(this.value)"></label>
             <label class="page-size-label">page_size <input class="page-input" id="${container.id}-page-size" type="number" min="1" max="1000" value="${pagedData.page_size}" onchange="changePageSize(this.value)"></label>
+            <label class="page-size-label">group_id <input class="page-input" id="${container.id}-group-id" type="number" min="1" value="${pagedData.group_id ?? ''}" onchange="changeGroupId(this.value)"></label>
           </div>
-          <button class="btn-bulk" onclick="confirmAllOnPage()">Confirm all on this page</button>
+          <div class="toolbar-block">
+            <button class="page-btn" onclick="setReviewMode('pending')" ${!isTrashReviewMode() ? 'disabled' : ''}>Pending review</button>
+            <button class="page-btn" onclick="setReviewMode('trash')" ${isTrashReviewMode() ? 'disabled' : ''}>Trash review</button>
+            ${isTrashReviewMode()
+              ? `<button class="btn-bulk" onclick="deleteTrashOnPage()" ${canBulkDeleteTrash ? '' : 'disabled'}>Delete trash on this page</button>`
+              : `<button class="btn-bulk" onclick="confirmAllOnPage()" ${pagedData.group_id !== null && pagedData.groups.some(group => group.status !== 'pending') ? 'disabled' : ''}>Confirm all on this page</button>`}
+          </div>
         </div>
       `;
     }
@@ -451,7 +522,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         return;
       }
       const maxIndex = Math.max(pagedData.total_pages - 1, 0);
-      fetchGroups(Math.min(nextIndex, maxIndex), pagedData.page_size);
+      fetchGroups(Math.min(nextIndex, maxIndex), pagedData.page_size, pagedData.group_id, pagedData.review_mode);
     }
 
     function changePageSize(value) {
@@ -460,11 +531,31 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         renderUI();
         return;
       }
-      fetchGroups(0, nextSize);
+      fetchGroups(0, nextSize, pagedData.group_id, pagedData.review_mode);
+    }
+
+    function changeGroupId(value) {
+      const trimmed = String(value).trim();
+      if (trimmed === '') {
+        fetchGroups(0, pagedData.page_size, null, pagedData.review_mode);
+        return;
+      }
+      const nextGroupId = Number.parseInt(trimmed, 10);
+      if (!Number.isFinite(nextGroupId) || nextGroupId <= 0) {
+        renderUI();
+        return;
+      }
+      fetchGroups(0, pagedData.page_size, nextGroupId, pagedData.review_mode);
+    }
+
+    function setReviewMode(mode) {
+      if (mode !== 'pending' && mode !== 'trash') return;
+      fetchGroups(0, pagedData.page_size, pagedData.group_id, mode);
     }
 
     function setKeepState(groupId, memberId, keep) {
       const group = pagedData.groups.find(g => g.group_id === groupId);
+      if (group.status !== 'pending') return;
       const member = group.members.find(m => m.id === memberId);
       if (!keep && member.ui_primary) return;
       member.ui_keep = keep;
@@ -473,6 +564,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
 
     function toggleKeepState(groupId, memberId) {
       const group = pagedData.groups.find(g => g.group_id === groupId);
+      if (group.status !== 'pending') return;
       const member = group.members.find(m => m.id === memberId);
       if (member.ui_primary && member.ui_keep) return;
       member.ui_keep = !member.ui_keep;
@@ -481,6 +573,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
 
     function setPrimary(groupId, memberId) {
       const group = pagedData.groups.find(g => g.group_id === groupId);
+      if (group.status !== 'pending') return;
       group.members.forEach(member => {
         member.ui_primary = member.id === memberId;
         if (member.ui_primary) member.ui_keep = true;
@@ -514,7 +607,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         });
 
         if (resp.ok) {
-          fetchGroups(pagedData.page_index, pagedData.page_size);
+          fetchGroups(pagedData.page_index, pagedData.page_size, pagedData.group_id, pagedData.review_mode);
         } else {
           alert('Failed to delete trash file: ' + await resp.text());
         }
@@ -523,9 +616,61 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
       }
     }
 
+    async function deleteTrashGroup(groupId) {
+      if (!confirm(`Permanently delete all trash files in group ${groupId}?`)) return;
+
+      try {
+        const resp = await fetch(`/api/groups/${groupId}/delete_trash`, {
+          method: 'POST'
+        });
+
+        if (resp.ok) {
+          fetchGroups(pagedData.page_index, pagedData.page_size, pagedData.group_id, pagedData.review_mode);
+        } else {
+          alert('Failed to delete group trash files: ' + await resp.text());
+        }
+      } catch (err) {
+        alert('Error: ' + err.message);
+      }
+    }
+
+    async function deleteTrashOnPage() {
+      const memberIds = pagedData.groups
+        .flatMap(group => group.members.filter(isTrashMember).map(member => member.id));
+
+      if (memberIds.length === 0) {
+        alert('No trash files on this page.');
+        return;
+      }
+      if (!confirm(`Permanently delete ${memberIds.length} trash files on this page?`)) return;
+
+      try {
+        const resp = await fetch('/api/groups/delete_trash_bulk', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ member_ids: memberIds })
+        });
+
+        if (resp.ok) {
+          fetchGroups(pagedData.page_index, pagedData.page_size, pagedData.group_id, pagedData.review_mode);
+        } else {
+          alert('Failed to delete page trash files: ' + await resp.text());
+        }
+      } catch (err) {
+        alert('Error: ' + err.message);
+      }
+    }
+
     function renderGroups() {
       if (pagedData.groups.length === 0) {
-        groupsContainer.innerHTML = emptyMarkup('All clear!', 'No pending duplicate groups found.');
+        groupsContainer.innerHTML = emptyMarkup(
+          pagedData.group_id ? `Group ${pagedData.group_id} not found` : 'All clear!',
+          pagedData.group_id
+            ? 'No duplicate group matched that id.'
+            : (isTrashReviewMode()
+              ? 'No groups with trash files found. Use the header button to switch back to pending review.'
+              : 'No pending duplicate groups found. Use the header button to open trash review.')
+        );
         return;
       }
 
@@ -539,7 +684,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         header.innerHTML = `
           <div class="group-heading">
             <div class="group-id">Group ${group.group_id}</div>
-            <span class="status-badge">Pending</span>
+            <span class="status-badge">${group.status}</span>
           </div>
           <div class="group-summary">${group.members.length} versions to compare</div>
         `;
@@ -560,6 +705,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
           const deleteButton = isTrashMember(member)
             ? `<button class="member-action reject" onclick="deleteTrashMember(${group.group_id}, ${member.id}, ${JSON.stringify(fileName)})">Delete trash file</button>`
             : '';
+          const decisionButtonsDisabled = group.status !== 'pending' || isTrashReviewMode() ? 'disabled' : '';
           const statusClass = member.ui_primary ? 'primary' : (member.ui_keep ? 'kept' : 'rejected');
           const statusLabel = member.ui_primary ? 'Primary' : (member.ui_keep ? 'Keep' : 'Reject');
 
@@ -577,9 +723,9 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
                 <span>${member.mime_type}</span>
               </div>
               <div class="member-actions">
-                <button class="member-action keep ${member.ui_keep ? 'active' : ''}" onclick="setKeepState(${group.group_id}, ${member.id}, true)">Keep</button>
-                <button class="member-action reject ${!member.ui_keep ? 'active' : ''}" onclick="setKeepState(${group.group_id}, ${member.id}, false)" ${member.ui_primary ? 'disabled' : ''}>Reject</button>
-                <button class="member-action primary ${member.ui_primary ? 'active' : ''}" onclick="setPrimary(${group.group_id}, ${member.id})">Primary</button>
+                <button class="member-action keep ${member.ui_keep ? 'active' : ''}" onclick="setKeepState(${group.group_id}, ${member.id}, true)" ${decisionButtonsDisabled}>Keep</button>
+                <button class="member-action reject ${!member.ui_keep ? 'active' : ''}" onclick="setKeepState(${group.group_id}, ${member.id}, false)" ${member.ui_primary || group.status !== 'pending' ? 'disabled' : ''}>Reject</button>
+                <button class="member-action primary ${member.ui_primary ? 'active' : ''}" onclick="setPrimary(${group.group_id}, ${member.id})" ${decisionButtonsDisabled}>Primary</button>
                 <button class="member-action" onclick="showOverlay('${fullSrc}')">Preview</button>
                 ${deleteButton}
               </div>
@@ -594,16 +740,30 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
 
         const footer = document.createElement('div');
         footer.className = 'group-footer';
+        const trashCount = group.members.filter(isTrashMember).length;
         footer.innerHTML = `
           <div class="group-stats">
-            Keeping <strong>${keptCount}</strong>, discarding <strong>${rejectedCount}</strong>
+            ${isTrashReviewMode()
+              ? `Trash review: <strong>${trashCount}</strong> file(s) ready for permanent deletion`
+              : group.status === 'pending'
+              ? `Keeping <strong>${keptCount}</strong>, discarding <strong>${rejectedCount}</strong>`
+              : `Archived group with <strong>${keptCount}</strong> kept and <strong>${rejectedCount}</strong> rejected members`}
           </div>
         `;
-        const resolveBtn = document.createElement('button');
-        resolveBtn.className = 'btn-resolve';
-        resolveBtn.innerText = 'Confirm decisions';
-        resolveBtn.onclick = () => resolveGroup(group.group_id);
-        footer.appendChild(resolveBtn);
+        if (isTrashReviewMode()) {
+          const deleteGroupBtn = document.createElement('button');
+          deleteGroupBtn.className = 'btn-resolve';
+          deleteGroupBtn.innerText = `Delete ${trashCount} trash file(s)`;
+          deleteGroupBtn.disabled = trashCount === 0;
+          deleteGroupBtn.onclick = () => deleteTrashGroup(group.group_id);
+          footer.appendChild(deleteGroupBtn);
+        } else if (group.status === 'pending') {
+          const resolveBtn = document.createElement('button');
+          resolveBtn.className = 'btn-resolve';
+          resolveBtn.innerText = 'Confirm decisions';
+          resolveBtn.onclick = () => resolveGroup(group.group_id);
+          footer.appendChild(resolveBtn);
+        }
         groupEl.appendChild(footer);
 
         groupsContainer.appendChild(groupEl);
@@ -626,7 +786,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         if (resp.ok) {
           pagedData.groups = pagedData.groups.filter(g => g.group_id !== groupId);
           if (pagedData.groups.length === 0) {
-            fetchGroups(pagedData.page_index, pagedData.page_size);
+            fetchGroups(pagedData.page_index, pagedData.page_size, pagedData.group_id);
           } else {
             renderUI();
           }
@@ -656,7 +816,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         });
         
         if (resp.ok) {
-          fetchGroups(pagedData.page_index, pagedData.page_size);
+          fetchGroups(pagedData.page_index, pagedData.page_size, pagedData.group_id, pagedData.review_mode);
         } else {
           alert('Bulk resolve failed: ' + await resp.text());
         }
@@ -668,9 +828,11 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
     const initialPaging = __INITIAL_PAGING__;
     pagedData.page_index = initialPaging.page_index;
     pagedData.page_size = initialPaging.page_size;
+    pagedData.group_id = initialPaging.group_id ?? null;
+    pagedData.review_mode = initialPaging.review_mode ?? 'pending';
     pagedData.current_page = initialPaging.page_index + 1;
     pagedData.limit = initialPaging.page_size;
-    fetchGroups(initialPaging.page_index, initialPaging.page_size);
+    fetchGroups(initialPaging.page_index, initialPaging.page_size, pagedData.group_id, pagedData.review_mode);
   </script>
 </body>
 </html>"#;
@@ -685,17 +847,78 @@ async fn list_groups(
     let paging = normalize_group_params(&params);
     let page_size = paging.page_size;
     let requested_page_index = paging.page_index;
+    let review_mode = paging.review_mode.as_str();
+    let review_groups_with_trash = review_mode == "trash";
+
+    if let Some(group_id) = paging.group_id {
+        let members = load_group_members(&conn, group_id).map_err(internal_error)?;
+        let matches_mode = if review_groups_with_trash {
+            !trash_member_ids(&members).is_empty()
+        } else {
+            members.iter().any(|member| member.keep_state == "undecided")
+        };
+        if members.is_empty() || !matches_mode {
+            return Ok(Json(PagedGroups {
+                groups: Vec::new(),
+                total_groups: 0,
+                total_pages: 0,
+                page_index: 0,
+                page_size,
+                review_mode: review_mode.to_string(),
+                current_page: 0,
+                limit: page_size,
+            }));
+        }
+
+        return Ok(Json(PagedGroups {
+            groups: vec![GroupSummary {
+                group_id,
+                status: group_status_for_mode(&members, review_mode),
+                members: members
+                    .into_iter()
+                    .map(|m| GroupMember {
+                        id: m.id,
+                        target_path: m.target_path,
+                        mime_type: m.mime_type,
+                        keep_state: m.keep_state,
+                        is_group_primary: m.is_group_primary,
+                        exact_hash: m.exact_hash,
+                        phash: m.phash,
+                        width: m.width,
+                        height: m.height,
+                        size_bytes: m.size_bytes,
+                    })
+                    .collect(),
+            }],
+            total_groups: 1,
+            total_pages: 1,
+            page_index: 0,
+            page_size,
+            review_mode: review_mode.to_string(),
+            current_page: 1,
+            limit: page_size,
+        }));
+    }
 
     let total_groups: i64 = conn
         .query_row(
-            r#"
+            if review_groups_with_trash {
+                r#"
+        SELECT COUNT(DISTINCT group_id)
+        FROM target_items
+        WHERE group_id IS NOT NULL
+        AND instr(target_path, '/.photo-org/trash/') > 0
+        "#
+            } else {
+                r#"
         SELECT COUNT(DISTINCT group_id)
         FROM target_items
         WHERE group_id IS NOT NULL
         AND group_id IN (
             SELECT group_id FROM target_items WHERE keep_state = 'undecided'
         )
-        "#,
+        "#
+            },
             [],
             |row| row.get(0),
         )
@@ -712,7 +935,18 @@ async fn list_groups(
 
     let mut stmt = conn
         .prepare(
-            r#"
+            if review_groups_with_trash {
+                r#"
+        SELECT group_id
+        FROM target_items
+        WHERE group_id IS NOT NULL
+        AND instr(target_path, '/.photo-org/trash/') > 0
+        GROUP BY group_id
+        ORDER BY CASE WHEN MIN(created_at) != '' THEN MIN(created_at) ELSE '9999' END ASC
+        LIMIT ?1 OFFSET ?2
+        "#
+            } else {
+                r#"
         SELECT group_id
         FROM target_items
         WHERE group_id IS NOT NULL
@@ -720,7 +954,8 @@ async fn list_groups(
         HAVING SUM(CASE WHEN keep_state = 'undecided' THEN 1 ELSE 0 END) > 0
         ORDER BY CASE WHEN MIN(created_at) != '' THEN MIN(created_at) ELSE '9999' END ASC
         LIMIT ?1 OFFSET ?2
-        "#,
+        "#
+            },
         )
         .map_err(internal_error)?;
 
@@ -737,7 +972,7 @@ async fn list_groups(
         let members = load_group_members(&conn, id).map_err(internal_error)?;
         groups.push(GroupSummary {
             group_id: id,
-            status: "pending".to_string(),
+            status: group_status_for_mode(&members, review_mode),
             members: members
                 .into_iter()
                 .map(|m| GroupMember {
@@ -762,6 +997,7 @@ async fn list_groups(
         total_pages,
         page_index,
         page_size,
+        review_mode: review_mode.to_string(),
         current_page: page_index + 1,
         limit: page_size,
     }))
@@ -825,6 +1061,23 @@ fn find_in_trash(dest: &PathBuf, target_path: &str, group_id: i64) -> Option<Pat
         idx += 1;
     }
     None
+}
+
+fn group_status_for_mode(members: &[MemberRow], review_mode: &str) -> String {
+    if review_mode == "trash" {
+        "trash-review".to_string()
+    } else if members.iter().any(|member| member.keep_state == "undecided") {
+        "pending".to_string()
+    } else {
+        "archived".to_string()
+    }
+}
+
+fn trash_member_ids(group: &[MemberRow]) -> Vec<i64> {
+    group.iter()
+        .filter(|member| is_logical_trash_path(StdPath::new(&member.target_path)))
+        .map(|member| member.id)
+        .collect()
 }
 
 async fn resolve_bulk(
@@ -1003,6 +1256,183 @@ async fn archive_group(
     Ok(Json(json!({ "group_id": id, "members": group })))
 }
 
+fn delete_trash_members_by_ids(
+    conn: &mut rusqlite::Connection,
+    dest: &PathBuf,
+    member_ids: &[i64],
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    if member_ids.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "no member ids provided".into()));
+    }
+
+    let mut seen = HashSet::new();
+    let unique_member_ids = member_ids
+        .iter()
+        .copied()
+        .filter(|member_id| seen.insert(*member_id))
+        .collect::<Vec<_>>();
+
+    let mut members = Vec::new();
+    for member_id in &unique_member_ids {
+        let member = conn
+            .query_row(
+                r#"
+                SELECT id, target_path, mime_type, keep_state, is_group_primary, exact_hash, phash, width, height, size_bytes, group_id
+                FROM target_items
+                WHERE id = ?1
+                "#,
+                rusqlite::params![member_id],
+                |row| {
+                    Ok((
+                        GroupMember {
+                            id: row.get(0)?,
+                            target_path: row.get(1)?,
+                            mime_type: row.get(2)?,
+                            keep_state: row.get(3)?,
+                            is_group_primary: row.get::<_, i64>(4)? != 0,
+                            exact_hash: row.get(5)?,
+                            phash: row.get(6)?,
+                            width: row.get(7)?,
+                            height: row.get(8)?,
+                            size_bytes: row.get(9)?,
+                        },
+                        row.get::<_, Option<i64>>(10)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(internal_error)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("group member {} not found", member_id)))?;
+        let member_path = PathBuf::from(&member.0.target_path);
+        if !is_logical_trash_path(&member_path) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("member {} is not under .photo-org/trash", member_id),
+            ));
+        }
+        members.push(member);
+    }
+
+    let mut deleted = Vec::new();
+    for (member, group_id) in &members {
+        let member_path = PathBuf::from(&member.target_path);
+        let file_deleted = if member_path.exists() {
+            ensure_under_root(dest, &member_path).map_err(internal_error)?;
+            if member_path.is_dir() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "trash member path must be a file".into(),
+                ));
+            }
+            fs::remove_file(&member_path).map_err(internal_error)?;
+            true
+        } else {
+            false
+        };
+        deleted.push(json!({
+            "member_id": member.id,
+            "group_id": group_id,
+            "target_path": member.target_path,
+            "file_deleted": file_deleted
+        }));
+    }
+
+    let tx = conn.transaction().map_err(internal_error)?;
+    for (member, _) in &members {
+        tx.execute(
+            "DELETE FROM target_items WHERE id = ?1",
+            rusqlite::params![member.id],
+        )
+        .map_err(internal_error)?;
+    }
+
+    let mut touched_groups = HashSet::new();
+    for (_, group_id) in &members {
+        if let Some(group_id) = group_id {
+            touched_groups.insert(*group_id);
+        }
+    }
+
+    let mut group_results = Vec::new();
+    for group_id in touched_groups {
+        let remaining = load_group_members(&tx, group_id).map_err(internal_error)?;
+        let group_cleared = remaining.len() <= 1;
+        if group_cleared {
+            for survivor in &remaining {
+                tx.execute(
+                    "UPDATE target_items SET group_id = NULL, keep_state = 'undecided', is_group_primary = 0 WHERE id = ?1",
+                    rusqlite::params![survivor.id],
+                )
+                .map_err(internal_error)?;
+            }
+        } else if remaining.iter().all(|member| !member.is_group_primary) {
+            if let Some(primary_id) = choose_best_primary_member(&remaining) {
+                tx.execute(
+                    "UPDATE target_items SET is_group_primary = CASE WHEN id = ?1 THEN 1 ELSE 0 END WHERE group_id = ?2",
+                    rusqlite::params![primary_id, group_id],
+                )
+                .map_err(internal_error)?;
+            }
+        }
+        group_results.push(json!({
+            "group_id": group_id,
+            "group_cleared": group_cleared,
+            "remaining_members": remaining.len()
+        }));
+    }
+
+    insert_operation(
+        &tx,
+        "delete_trash_member",
+        &json!({
+            "deleted": deleted,
+            "groups": group_results
+        })
+        .to_string(),
+    )
+    .map_err(internal_error)?;
+    tx.commit().map_err(internal_error)?;
+
+    Ok(json!({
+        "status": "ok",
+        "deleted": deleted,
+        "groups": group_results
+    }))
+}
+
+async fn delete_trash_group(
+    Path(group_id): Path<i64>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
+    let group = load_group_members(&conn, group_id).map_err(internal_error)?;
+    if group.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "group not found".into()));
+    }
+    let member_ids = trash_member_ids(&group);
+    if member_ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "group has no members under .photo-org/trash".into(),
+        ));
+    }
+    let payload = delete_trash_members_by_ids(&mut conn, &state.dest, &member_ids)?;
+    Ok(Json(json!({
+        "group_id": group_id,
+        "deleted_members": member_ids.len(),
+        "result": payload
+    })))
+}
+
+async fn delete_trash_bulk(
+    State(state): State<AppState>,
+    Json(request): Json<DeleteTrashMembersRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
+    let payload = delete_trash_members_by_ids(&mut conn, &state.dest, &request.member_ids)?;
+    Ok(Json(payload))
+}
+
 async fn delete_trash_member(
     Path((group_id, member_id)): Path<(i64, i64)>,
     State(state): State<AppState>,
@@ -1014,73 +1444,11 @@ async fn delete_trash_member(
         .find(|member| member.id == member_id)
         .cloned()
         .ok_or_else(|| (StatusCode::NOT_FOUND, "group member not found".to_string()))?;
-    let member_path = PathBuf::from(&member.target_path);
-    if !is_logical_trash_path(&member_path) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "member is not under .photo-org/trash".into(),
-        ));
-    }
-
-    let file_deleted = if member_path.exists() {
-        ensure_under_root(&state.dest, &member_path).map_err(internal_error)?;
-        if member_path.is_dir() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "trash member path must be a file".into(),
-            ));
-        }
-        fs::remove_file(&member_path).map_err(internal_error)?;
-        true
-    } else {
-        false
-    };
-
-    let tx = conn.transaction().map_err(internal_error)?;
-    tx.execute("DELETE FROM target_items WHERE id = ?1", rusqlite::params![member_id])
-        .map_err(internal_error)?;
-
-    let remaining = load_group_members(&tx, group_id).map_err(internal_error)?;
-    let group_cleared = remaining.len() <= 1;
-    if group_cleared {
-        for survivor in &remaining {
-            tx.execute(
-                "UPDATE target_items SET group_id = NULL, keep_state = 'undecided', is_group_primary = 0 WHERE id = ?1",
-                rusqlite::params![survivor.id],
-            )
-            .map_err(internal_error)?;
-        }
-    } else if remaining.iter().all(|member| !member.is_group_primary) {
-        if let Some(primary_id) = choose_best_primary_member(&remaining) {
-            tx.execute(
-                "UPDATE target_items SET is_group_primary = CASE WHEN id = ?1 THEN 1 ELSE 0 END WHERE group_id = ?2",
-                rusqlite::params![primary_id, group_id],
-            )
-            .map_err(internal_error)?;
-        }
-    }
-
-    insert_operation(
-        &tx,
-        "delete_trash_member",
-        &json!({
-            "group_id": group_id,
-            "member_id": member_id,
-            "target_path": member.target_path,
-            "file_deleted": file_deleted,
-            "group_cleared": group_cleared
-        })
-        .to_string(),
-    )
-    .map_err(internal_error)?;
-    tx.commit().map_err(internal_error)?;
-
+    let payload = delete_trash_members_by_ids(&mut conn, &state.dest, &[member.id])?;
     Ok(Json(json!({
         "group_id": group_id,
         "member_id": member_id,
-        "status": "ok",
-        "file_deleted": file_deleted,
-        "group_cleared": group_cleared
+        "result": payload
     })))
 }
 
@@ -1370,6 +1738,26 @@ mod tests {
         .unwrap();
     }
 
+    fn insert_trash_review_group(
+        conn: &rusqlite::Connection,
+        group_id: i64,
+        keep_path: &str,
+        trash_path: &str,
+    ) {
+        conn.execute(
+            r#"
+            INSERT INTO target_items (
+                target_path, size_bytes, mime_type, created_at, exact_hash, phash, phash_bits,
+                width, height, group_id, keep_state, is_group_primary, origin_source_id, meta_json
+            ) VALUES
+                (?1, 1, 'image/png', '2024-06-09T00:00:00Z', 'a', 'p', 64, 32, 32, ?3, 'kept', 1, NULL, '{}'),
+                (?2, 1, 'image/png', '2024-06-09T00:00:00Z', 'b', 'p', 64, 32, 32, ?3, 'rejected', 0, NULL, '{}')
+            "#,
+            rusqlite::params![keep_path, trash_path, group_id],
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn list_groups_supports_page_index_and_page_size() {
         let tmp = tempdir().unwrap();
@@ -1398,6 +1786,49 @@ mod tests {
         assert_eq!(paged["total_pages"], 3);
         assert_eq!(paged["groups"].as_array().unwrap().len(), 1);
         assert_eq!(paged["groups"][0]["group_id"], 2);
+        assert_eq!(paged["review_mode"], "pending");
+    }
+
+    #[tokio::test]
+    async fn list_groups_supports_trash_review_mode() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let trash_dir_1 = dest.join(".photo-org/trash/group-1");
+        let trash_dir_2 = dest.join(".photo-org/trash/group-2");
+        let keep_dir = dest.join("2024/06/09");
+        fs::create_dir_all(&trash_dir_1).unwrap();
+        fs::create_dir_all(&trash_dir_2).unwrap();
+        fs::create_dir_all(&keep_dir).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        insert_trash_review_group(
+            &conn,
+            1,
+            &keep_dir.join("keep-1.png").to_string_lossy(),
+            &trash_dir_1.join("reject-1.png").to_string_lossy(),
+        );
+        insert_trash_review_group(
+            &conn,
+            2,
+            &keep_dir.join("keep-2.png").to_string_lossy(),
+            &trash_dir_2.join("reject-2.png").to_string_lossy(),
+        );
+
+        let app = router(AppState { db_path, dest });
+        let request = axum::http::Request::builder()
+            .uri("/api/groups?view=trash&page_index=0&page_size=1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let paged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paged["review_mode"], "trash");
+        assert_eq!(paged["total_groups"], 2);
+        assert_eq!(paged["groups"][0]["status"], "trash-review");
     }
 
     #[tokio::test]
@@ -1473,7 +1904,103 @@ mod tests {
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains(r#"const initialPaging = {"page_index":2,"page_size":1};"#));
+        assert!(html.contains(
+            r#"const initialPaging = {"page_index":2,"page_size":1,"group_id":null,"review_mode":"pending"};"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn index_html_embeds_group_id_filter_from_query() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        open_catalog_db(&db_path).unwrap();
+
+        let app = router(AppState { db_path, dest });
+        let request = axum::http::Request::builder()
+            .uri("/?group_id=42&page_size=5")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains(r#""group_id":42"#));
+        assert!(html.contains(r#""review_mode":"pending""#));
+    }
+
+    #[tokio::test]
+    async fn index_html_embeds_trash_review_mode_from_query() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        open_catalog_db(&db_path).unwrap();
+
+        let app = router(AppState { db_path, dest });
+        let request = axum::http::Request::builder()
+            .uri("/?view=trash&page_size=5")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains(r#""review_mode":"trash""#));
+    }
+
+    #[tokio::test]
+    async fn list_groups_can_load_trash_review_group_by_group_id() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let trash_dir = dest.join(".photo-org/trash/group-8");
+        fs::create_dir_all(&trash_dir).unwrap();
+        let keep_path = dest.join("2024/06/09/keep.png");
+        let reject_path = trash_dir.join("reject.png");
+        fs::create_dir_all(keep_path.parent().unwrap()).unwrap();
+        make_png(&keep_path, [255, 0, 0]);
+        make_png(&reject_path, [0, 255, 0]);
+
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO target_items (
+                target_path, size_bytes, mime_type, created_at, exact_hash, phash, phash_bits,
+                width, height, group_id, keep_state, is_group_primary, origin_source_id, meta_json
+            ) VALUES
+                (?1, 1, 'image/png', '2024-06-09T00:00:00Z', 'a', 'p', 64, 32, 32, 8, 'kept', 1, NULL, '{}'),
+                (?2, 1, 'image/png', '2024-06-09T00:00:00Z', 'b', 'p', 64, 32, 32, 8, 'rejected', 0, NULL, '{}')
+            "#,
+            rusqlite::params![
+                keep_path.to_string_lossy().to_string(),
+                reject_path.to_string_lossy().to_string(),
+            ],
+        )
+        .unwrap();
+
+        let app = router(AppState { db_path, dest });
+        let request = axum::http::Request::builder()
+            .uri("/api/groups?group_id=8&view=trash")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let paged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paged["total_groups"], 1);
+        assert_eq!(paged["groups"][0]["group_id"], 8);
+        assert_eq!(paged["groups"][0]["status"], "trash-review");
+        assert_eq!(paged["review_mode"], "trash");
+        assert_eq!(paged["groups"][0]["members"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1699,6 +2226,120 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(reject_path.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_trash_group_removes_all_trash_members_in_group() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let keep_path = dest.join("2024/06/09/keep.png");
+        let trash_path_a = dest.join(".photo-org/trash/group-7/reject-a.png");
+        let trash_path_b = dest.join(".photo-org/trash/group-7/reject-b.png");
+        fs::create_dir_all(keep_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(trash_path_a.parent().unwrap()).unwrap();
+        make_png(&keep_path, [255, 0, 0]);
+        make_png(&trash_path_a, [0, 255, 0]);
+        make_png(&trash_path_b, [0, 0, 255]);
+
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO target_items (
+                target_path, size_bytes, mime_type, created_at, exact_hash, phash, phash_bits,
+                width, height, group_id, keep_state, is_group_primary, origin_source_id, meta_json
+            ) VALUES
+                (?1, 1, 'image/png', '2024-06-09T00:00:00Z', 'a', 'p', 64, 32, 32, 7, 'kept', 1, NULL, '{}'),
+                (?2, 1, 'image/png', '2024-06-09T00:00:00Z', 'b', 'p', 64, 32, 32, 7, 'rejected', 0, NULL, '{}'),
+                (?3, 1, 'image/png', '2024-06-09T00:00:00Z', 'c', 'p', 64, 32, 32, 7, 'rejected', 0, NULL, '{}')
+            "#,
+            rusqlite::params![
+                keep_path.to_string_lossy().to_string(),
+                trash_path_a.to_string_lossy().to_string(),
+                trash_path_b.to_string_lossy().to_string(),
+            ],
+        )
+        .unwrap();
+
+        let app = router(AppState {
+            db_path: db_path.clone(),
+            dest: dest.clone(),
+        });
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/groups/7/delete_trash")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!trash_path_a.exists());
+        assert!(!trash_path_b.exists());
+
+        let conn = open_catalog_db(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM target_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_trash_bulk_removes_members_across_multiple_groups() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let keep_dir = dest.join("2024/06/09");
+        let trash_dir_1 = dest.join(".photo-org/trash/group-11");
+        let trash_dir_2 = dest.join(".photo-org/trash/group-12");
+        fs::create_dir_all(&keep_dir).unwrap();
+        fs::create_dir_all(&trash_dir_1).unwrap();
+        fs::create_dir_all(&trash_dir_2).unwrap();
+        make_png(&keep_dir.join("keep-1.png"), [255, 0, 0]);
+        make_png(&keep_dir.join("keep-2.png"), [255, 255, 0]);
+        let trash_path_1 = trash_dir_1.join("reject-1.png");
+        let trash_path_2 = trash_dir_2.join("reject-2.png");
+        make_png(&trash_path_1, [0, 255, 0]);
+        make_png(&trash_path_2, [0, 0, 255]);
+
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        insert_trash_review_group(
+            &conn,
+            11,
+            &keep_dir.join("keep-1.png").to_string_lossy(),
+            &trash_path_1.to_string_lossy(),
+        );
+        insert_trash_review_group(
+            &conn,
+            12,
+            &keep_dir.join("keep-2.png").to_string_lossy(),
+            &trash_path_2.to_string_lossy(),
+        );
+
+        let app = router(AppState {
+            db_path: db_path.clone(),
+            dest: dest.clone(),
+        });
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/groups/delete_trash_bulk")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({"member_ids":[2, 4]}).to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!trash_path_1.exists());
+        assert!(!trash_path_2.exists());
+
+        let conn = open_catalog_db(&db_path).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM target_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 2);
     }
 
     #[tokio::test]

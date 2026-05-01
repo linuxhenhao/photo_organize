@@ -38,13 +38,17 @@ The server is intentionally local-first and self-contained: there is no separate
 Current routes:
 
 - `GET /`
-  Returns the embedded review page. The page accepts `page_index` and `page_size` query params and embeds the normalized initial paging values into the frontend bootstrap script.
+  Returns the embedded review page. The page accepts `page_index`, `page_size`, optional `group_id`, and optional `view=trash` query params and embeds the normalized initial paging values into the frontend bootstrap script.
 - `GET /api/groups`
-  Returns paged unresolved groups as JSON.
+  Returns paged groups as JSON for the requested review mode. Default mode is unresolved duplicate review; `view=trash` returns groups that currently have at least one member under `.photo-org/trash/`.
 - `POST /api/groups/{id}/resolve`
   Resolves one group.
 - `POST /api/groups/resolve_bulk`
   Resolves every group on the current page in one transaction.
+- `POST /api/groups/{id}/delete_trash`
+  Permanently deletes every trash member in one group and updates `target_items`.
+- `POST /api/groups/delete_trash_bulk`
+  Permanently deletes an explicit list of trash members, intended for page-level bulk cleanup in trash review mode.
 - `GET /api/groups/{id}/archive`
   Returns the raw member list for one group. Today this is a read-only JSON view, not a write path.
 - `POST /api/groups/{group_id}/members/{member_id}/delete_trash`
@@ -54,7 +58,7 @@ Current routes:
 
 ## Group Listing Behavior
 
-`/api/groups` only returns groups that still need operator review.
+`/api/groups` normally returns groups that still need operator review.
 
 That means:
 
@@ -63,6 +67,18 @@ That means:
 - groups are ordered by `group_id`
 - pagination uses `page_index` and `page_size`
 - legacy `page` and `limit` query params are still normalized for compatibility
+
+When `view=trash` is supplied:
+
+- the listing contains groups with at least one member already moved under `.photo-org/trash/`
+- the response marks those groups with status `trash-review`
+- this is the review surface for confirming permanent deletion of trash files
+
+When `group_id` is supplied:
+
+- the response contains only that group
+- in normal mode the group must still have at least one undecided member
+- in trash review mode the group must still have at least one trash member
 
 Returned member fields are intentionally lightweight:
 
@@ -85,10 +101,16 @@ The page at `/` is a single embedded document.
 Frontend behavior:
 
 - fetches groups from `/api/groups`
+- supports switching between pending review and trash review
+- exposes that mode switch directly on the root page header so operators do not need to know query params
+- supports opening one specific group by `group_id` inside the active review mode
 - keeps transient `ui_keep` and `ui_primary` flags in browser memory
 - lets the operator change `page_index` and `page_size`
+- lets the operator jump directly to one `group_id`
 - supports explicit `Keep`, `Reject`, `Primary`, and `Preview` actions per member
-- supports single-group confirm and bulk confirm for all visible groups
+- shows `Delete trash file` for members already under `.photo-org/trash/`
+- supports single-group confirm and bulk confirm for all visible groups in pending mode
+- supports single-group trash deletion and page-level trash deletion in trash review mode
 
 Current UX expectations:
 
@@ -137,6 +159,22 @@ Trash-member deletion is intentionally narrower than resolve:
 - if that leaves only one member in the group, the survivor is de-grouped by clearing `group_id` and `is_group_primary`
 
 This path is for manual cleanup of already-rejected trash files, not for normal duplicate resolution.
+
+### `POST /api/groups/{id}/delete_trash`
+
+Group trash deletion deletes every member in the group whose stored `target_path` already points under `.photo-org/trash/`.
+
+- non-trash members are retained
+- if only one survivor remains, the survivor is de-grouped
+- if multiple survivors remain and no primary is left, the best remaining member is promoted to primary
+
+### `POST /api/groups/delete_trash_bulk`
+
+Bulk trash deletion accepts a JSON body with explicit `member_ids`.
+
+- every referenced row must already point under `.photo-org/trash/`
+- the endpoint validates the full request before mutating files
+- this powers the "delete trash on this page" action in trash review mode
 
 ## Filesystem Safety Rules
 
