@@ -99,6 +99,8 @@ Set `PHOTO_ORG_PROFILE_INITCACHE=1` to emit per-stage timing breakdowns for `ini
 ## Testing
 Add focused Rust tests next to the implementation or under `tests/` when behavior changes.
 Run `cargo test` for every code change in this crate.
+Keep `docs/e2e-test-plan.md` in sync with the expected end-to-end regression coverage and use it as the baseline for behavior-sensitive changes.
+Any code change that can affect CLI workflows, `serve`, path handling, duplicate grouping, file moves/deletes/restores, or catalog state must preserve this end-to-end suite and leave the `e2e-test-plan` scenarios passing.
 
 For Bookworm-targeted release builds inside Docker, use `./container_build.sh`. It uses the `photo-org-build:bookworm` image (building it automatically if missing) and mounts the host Cargo registry and git caches into the container so repeated builds do not re-download Rust dependencies.
 

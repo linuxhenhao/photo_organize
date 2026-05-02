@@ -37,9 +37,10 @@ fn is_hidden_metadata_path(path: &Path) -> bool {
 }
 
 fn managed_files(root: &Path) -> BTreeSet<String> {
-    let root_name = PathBuf::from(root
-        .file_name()
-        .expect("managed root should have a final path component"));
+    let root_name = PathBuf::from(
+        root.file_name()
+            .expect("managed root should have a final path component"),
+    );
     WalkDir::new(root)
         .into_iter()
         .filter_map(|entry| entry.ok())

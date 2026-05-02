@@ -1,8 +1,9 @@
 use crate::db::FEATURE_VERSION;
 use crate::features::{
-    AkazeStatus, VisualFeatures, compute_visual_features_for_mime_from_bytes,
-    deserialize_akaze_descriptors, deserialize_akaze_points, phash_to_u64,
-    serialize_akaze_descriptors, serialize_akaze_points, supports_visual_features,
+    AkazeStatus, MIN_AKAZE_DESCRIPTORS_FOR_MATCH, VisualFeatures,
+    compute_visual_features_for_mime_from_bytes, deserialize_akaze_descriptors,
+    deserialize_akaze_points, phash_to_u64, serialize_akaze_descriptors,
+    serialize_akaze_points, supports_visual_features,
 };
 use anyhow::{Context, Result};
 use lru::LruCache;
@@ -213,6 +214,7 @@ fn load_cached_feature(
     if status.is_retryable() {
         return Ok(None);
     }
+    let keypoints = keypoints.and_then(|value| usize::try_from(value).ok());
     let descriptors = descriptors_blob
         .as_deref()
         .map(deserialize_akaze_descriptors)
@@ -221,7 +223,15 @@ fn load_cached_feature(
         .as_deref()
         .map(deserialize_akaze_points)
         .transpose()?;
-    if status == AkazeStatus::Ready && (descriptors.is_none() || points.is_none()) {
+    if status == AkazeStatus::Ready
+        && (descriptors.is_none()
+            || points.is_none()
+            || !ready_feature_is_reusable(
+                keypoints,
+                descriptors.as_deref(),
+                points.as_deref(),
+            ))
+    {
         return Ok(None);
     }
     Ok(Some(VisualFeatures {
@@ -233,10 +243,25 @@ fn load_cached_feature(
         height: request.height,
         size_bytes_hint: request.size_bytes,
         akaze_status: status,
-        akaze_keypoints: keypoints.and_then(|value| usize::try_from(value).ok()),
+        akaze_keypoints: keypoints,
         akaze_points: points,
         akaze_descriptors: descriptors,
     }))
+}
+
+fn ready_feature_is_reusable(
+    keypoints: Option<usize>,
+    descriptors: Option<&[Vec<u8>]>,
+    points: Option<&[crate::features::AkazePoint]>,
+) -> bool {
+    let descriptor_count = descriptors.map_or(0, <[Vec<u8>]>::len);
+    let point_count = points.map_or(0, <[crate::features::AkazePoint]>::len);
+    if descriptor_count == 0 || point_count == 0 || descriptor_count != point_count {
+        return false;
+    }
+
+    let effective_count = keypoints.unwrap_or(descriptor_count).min(descriptor_count);
+    effective_count >= MIN_AKAZE_DESCRIPTORS_FOR_MATCH
 }
 
 pub fn has_reusable_feature_cache(
@@ -244,23 +269,34 @@ pub fn has_reusable_feature_cache(
     exact_hash: &str,
     size_bytes: i64,
 ) -> Result<bool> {
-    let status = conn
+    let row = conn
         .query_row(
             r#"
-            SELECT akaze_status
+            SELECT akaze_status, akaze_keypoints
             FROM feature_cache
             WHERE exact_hash = ?1 AND size_bytes = ?2 AND feature_version = ?3
             "#,
             params![exact_hash, size_bytes, FEATURE_VERSION],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
         )
         .optional()?;
-    let Some(status_text) = status else {
+    let Some((status_text, keypoints)) = row else {
         return Ok(false);
     };
     let status = AkazeStatus::from_db_str(&status_text)
         .with_context(|| format!("unknown akaze status {status_text}"))?;
-    Ok(!status.is_retryable())
+    if status.is_retryable() {
+        return Ok(false);
+    }
+    if status == AkazeStatus::Ready
+        && keypoints
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0)
+            < MIN_AKAZE_DESCRIPTORS_FOR_MATCH
+    {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 pub fn save_feature_cache(
@@ -399,12 +435,9 @@ mod tests {
             height: 480,
             size_bytes_hint: size_bytes,
             akaze_status: AkazeStatus::Ready,
-            akaze_keypoints: Some(2),
-            akaze_points: Some(vec![
-                crate::features::AkazePoint { x: 1.0, y: 2.0 },
-                crate::features::AkazePoint { x: 3.0, y: 4.0 },
-            ]),
-            akaze_descriptors: Some(vec![vec![1, 2, 3], vec![4, 5, 6]]),
+            akaze_keypoints: Some(31),
+            akaze_points: Some(vec![crate::features::AkazePoint { x: 1.0, y: 2.0 }; 31]),
+            akaze_descriptors: Some(vec![vec![1, 2, 3]; 31]),
         };
         save_feature_cache(&catalog, size_bytes, &expected).unwrap();
 
@@ -450,9 +483,9 @@ mod tests {
                 height: 480,
                 size_bytes_hint: size_bytes,
                 akaze_status: AkazeStatus::Ready,
-                akaze_keypoints: Some(1),
-                akaze_points: Some(vec![crate::features::AkazePoint { x: 1.0, y: 2.0 }]),
-                akaze_descriptors: Some(vec![vec![1, 2, 3]]),
+                akaze_keypoints: Some(31),
+                akaze_points: Some(vec![crate::features::AkazePoint { x: 1.0, y: 2.0 }; 31]),
+                akaze_descriptors: Some(vec![vec![1, 2, 3]; 31]),
             };
             save_feature_cache(&catalog, size_bytes, &expected).unwrap();
 
@@ -693,6 +726,81 @@ mod tests {
             .unwrap();
         assert_eq!(stored_row.1, FEATURE_VERSION);
         assert!(has_reusable_feature_cache(&catalog, &exact_hash, size_bytes).unwrap());
+    }
+
+    #[test]
+    fn loader_recomputes_low_keypoint_ready_cache_rows() {
+        let tmp = tempdir().unwrap();
+        let image_path = tmp
+            .path()
+            .join("2013-02-05-14.59.19-anon-default.jpg");
+        fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("docs")
+                .join("group_bad_cases")
+                .join("sparse-default-retry")
+                .join("assets")
+                .join("2013-02-05-14.59.19-anon-default.jpg"),
+            &image_path,
+        )
+        .unwrap();
+        let bytes = fs::read(&image_path).unwrap();
+        let exact_hash = exact_hash(&bytes);
+        let size_bytes = i64::try_from(bytes.len()).unwrap();
+
+        let catalog = open_catalog_db(tmp.path().join("catalog.db")).unwrap();
+        catalog
+            .execute(
+                "INSERT INTO feature_cache (exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, akaze_points, feature_version, updated_at)
+                 VALUES (?1, ?2, 'ready', ?3, ?4, ?5, ?6, datetime('now'))",
+                params![
+                    exact_hash,
+                    size_bytes,
+                    2_i64,
+                    serialize_akaze_descriptors(&vec![vec![0u8; 64]; 2]).unwrap(),
+                    serialize_akaze_points(&vec![crate::features::AkazePoint { x: 1.0, y: 2.0 }; 2]).unwrap(),
+                    FEATURE_VERSION
+                ],
+            )
+            .unwrap();
+
+        assert!(!has_reusable_feature_cache(&catalog, &exact_hash, size_bytes).unwrap());
+
+        let mut loader = FeatureLoader::default();
+        let features = loader
+            .load(
+                &catalog,
+                FeatureRequest {
+                    path: &image_path,
+                    mime_type: "image/jpeg",
+                    exact_hash: &exact_hash,
+                    size_bytes,
+                    phash_hint: "",
+                    phash_bits: 0,
+                    width: 0,
+                    height: 0,
+                },
+            )
+            .unwrap();
+        assert!(
+            features.akaze_status == AkazeStatus::NoKeypoints
+                || (features.akaze_status == AkazeStatus::Ready
+                    && features.akaze_keypoints.unwrap_or(0)
+                        >= MIN_AKAZE_DESCRIPTORS_FOR_MATCH)
+        );
+
+        let stored_row: (String, Option<i64>) = catalog
+            .query_row(
+                "SELECT akaze_status, akaze_keypoints FROM feature_cache WHERE exact_hash = ?1 AND size_bytes = ?2",
+                params![exact_hash, size_bytes],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            stored_row.0 == "no_keypoints"
+                || (stored_row.0 == "ready"
+                    && stored_row.1.unwrap_or(0) >= MIN_AKAZE_DESCRIPTORS_FOR_MATCH as i64)
+        );
     }
 
     #[test]

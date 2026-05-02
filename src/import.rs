@@ -421,7 +421,10 @@ fn prune_orphaned_feature_cache_rows(
     Ok(removed)
 }
 
-fn repair_groups_after_target_cleanup(conn: &mut Connection, group_ids: &HashSet<i64>) -> Result<()> {
+fn repair_groups_after_target_cleanup(
+    conn: &mut Connection,
+    group_ids: &HashSet<i64>,
+) -> Result<()> {
     if group_ids.is_empty() {
         return Ok(());
     }
@@ -1321,7 +1324,9 @@ fn load_existing_target_facts(conn: &Connection) -> Result<HashMap<String, Exist
 fn normalize_catalog_target_paths(conn: &Connection, dest: &Path) -> Result<usize> {
     let mut stmt = conn.prepare("SELECT id, target_path FROM target_items ORDER BY id")?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut updates = Vec::new();
     for (id, target_path) in rows {
@@ -1344,7 +1349,10 @@ fn normalize_catalog_target_paths(conn: &Connection, dest: &Path) -> Result<usiz
         }
     }
     tx.commit()?;
-    tracing::info!(normalized_target_paths = updates.len(), "normalized catalog target paths");
+    tracing::info!(
+        normalized_target_paths = updates.len(),
+        "normalized catalog target paths"
+    );
     Ok(updates.len())
 }
 
@@ -1535,10 +1543,7 @@ mod tests {
         let imported_paths: i64 = catalog
             .query_row(
                 "SELECT COUNT(*) FROM target_items WHERE target_path LIKE ?1",
-                [format!(
-                    "{}%",
-                    dest.file_name().unwrap().to_string_lossy()
-                )],
+                [format!("{}%", dest.file_name().unwrap().to_string_lossy())],
                 |row| row.get(0),
             )
             .unwrap();

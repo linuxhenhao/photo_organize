@@ -11,6 +11,7 @@ use std::path::Path;
 const PHASH_MAX_DIMENSION: u32 = 256;
 const AKAZE_MAX_DIMENSION: u32 = 640;
 const AKAZE_MIN_DIMENSION: u32 = 40;
+pub(crate) const MIN_AKAZE_DESCRIPTORS_FOR_MATCH: usize = 25;
 const MAX_KEYPOINTS_FOR_MATCH: usize = 500;
 const LOWE_RATIO_THRESHOLD: f32 = 0.75;
 const MATCH_DISTANCE_THRESHOLD: u32 = 96;
@@ -191,10 +192,62 @@ fn extract_akaze_features(
     }
 
     let sparse = extract_akaze_features_with(image, Akaze::sparse());
-    if sparse.0 == AkazeStatus::NoKeypoints {
-        return extract_akaze_features_with(image, Akaze::default());
+    if !should_retry_default_akaze(&sparse) {
+        return sparse;
     }
-    sparse
+
+    let default = extract_akaze_features_with(image, Akaze::default());
+    prefer_default_akaze_result(sparse, default)
+}
+
+fn should_retry_default_akaze(
+    sparse: &(
+        AkazeStatus,
+        Option<usize>,
+        Option<Vec<AkazePoint>>,
+        Option<Vec<Vec<u8>>>,
+    ),
+) -> bool {
+    match sparse.0 {
+        AkazeStatus::NoKeypoints => true,
+        AkazeStatus::Ready => sparse.1.unwrap_or(0) < MIN_AKAZE_DESCRIPTORS_FOR_MATCH,
+        _ => false,
+    }
+}
+
+fn prefer_default_akaze_result(
+    sparse: (
+        AkazeStatus,
+        Option<usize>,
+        Option<Vec<AkazePoint>>,
+        Option<Vec<Vec<u8>>>,
+    ),
+    default: (
+        AkazeStatus,
+        Option<usize>,
+        Option<Vec<AkazePoint>>,
+        Option<Vec<Vec<u8>>>,
+    ),
+) -> (
+    AkazeStatus,
+    Option<usize>,
+    Option<Vec<AkazePoint>>,
+    Option<Vec<Vec<u8>>>,
+) {
+    let sparse_keypoints = sparse.1.unwrap_or(0);
+    let default_keypoints = default.1.unwrap_or(0);
+    if default.0 == AkazeStatus::Ready && default_keypoints > sparse_keypoints {
+        default
+    } else if sparse.0 == AkazeStatus::Ready
+        && sparse_keypoints > 0
+        && sparse_keypoints < MIN_AKAZE_DESCRIPTORS_FOR_MATCH
+    {
+        (AkazeStatus::NoKeypoints, None, None, None)
+    } else if sparse.0 == AkazeStatus::NoKeypoints {
+        default
+    } else {
+        sparse
+    }
 }
 
 fn extract_akaze_features_with(
@@ -618,7 +671,9 @@ pub fn akaze_confirm(
     }
 
     // 2. Minimum keypoint count protection
-    if a_descs.len() < 25 || b_descs.len() < 25 {
+    if a_descs.len() < MIN_AKAZE_DESCRIPTORS_FOR_MATCH
+        || b_descs.len() < MIN_AKAZE_DESCRIPTORS_FOR_MATCH
+    {
         return false;
     }
 
@@ -804,7 +859,10 @@ where
     Ok(convert_direct_image(image))
 }
 
-pub fn select_best_thumbnail(thumbs: &[ThumbnailImage], min_dimension: u32) -> Option<&ThumbnailImage> {
+pub fn select_best_thumbnail(
+    thumbs: &[ThumbnailImage],
+    min_dimension: u32,
+) -> Option<&ThumbnailImage> {
     let supported: Vec<_> = thumbs
         .iter()
         .filter(|thumb| {
@@ -977,6 +1035,15 @@ mod tests {
             .join("docs")
             .join("group_bad_cases")
             .join("group-71-investigation")
+            .join("assets")
+            .join(name)
+    }
+
+    fn sparse_default_retry_fixture_path(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("docs")
+            .join("group_bad_cases")
+            .join("sparse-default-retry")
             .join("assets")
             .join(name)
     }
@@ -1177,11 +1244,62 @@ mod tests {
     }
 
     #[test]
+    fn anonymized_fixture_still_hits_sparse_ready_low_keypoint_case() {
+        let path = sparse_default_retry_fixture_path("2013-02-05-14.59.19-anon-default.jpg");
+        let bytes = fs::read(&path).unwrap();
+        let image = decode_image(&bytes, &path).unwrap();
+        let scaled = resize_for_feature(&image, AKAZE_MAX_DIMENSION);
+
+        let sparse = extract_akaze_features_with(&scaled, Akaze::sparse());
+        assert_eq!(sparse.0, AkazeStatus::Ready);
+        assert!(sparse.1.unwrap_or(0) > 0);
+        assert!(sparse.1.unwrap_or(0) < MIN_AKAZE_DESCRIPTORS_FOR_MATCH);
+    }
+
+    #[test]
+    fn sparse_ready_low_keypoint_results_retry_default_akaze() {
+        let sparse = (
+            AkazeStatus::Ready,
+            Some(2),
+            Some(vec![AkazePoint { x: 1.0, y: 2.0 }; 2]),
+            Some(vec![vec![0u8; 64]; 2]),
+        );
+        let default = (
+            AkazeStatus::Ready,
+            Some(31),
+            Some(vec![AkazePoint { x: 3.0, y: 4.0 }; 31]),
+            Some(vec![vec![1u8; 64]; 31]),
+        );
+
+        assert!(should_retry_default_akaze(&sparse));
+        let selected = prefer_default_akaze_result(sparse, default);
+        assert_eq!(selected.0, AkazeStatus::Ready);
+        assert_eq!(selected.1, Some(31));
+    }
+
+    #[test]
+    fn sparse_ready_low_keypoint_results_downgrade_to_no_keypoints_when_default_fails() {
+        let sparse = (
+            AkazeStatus::Ready,
+            Some(2),
+            Some(vec![AkazePoint { x: 1.0, y: 2.0 }; 2]),
+            Some(vec![vec![0u8; 64]; 2]),
+        );
+        let default = (AkazeStatus::NoKeypoints, None, None, None);
+
+        assert!(should_retry_default_akaze(&sparse));
+        let selected = prefer_default_akaze_result(sparse, default);
+        assert_eq!(selected.0, AkazeStatus::NoKeypoints);
+        assert!(selected.1.is_none());
+        assert!(selected.2.is_none());
+        assert!(selected.3.is_none());
+    }
+
+    #[test]
     fn akaze_point_blob_roundtrips() {
         let points = vec![AkazePoint { x: 1.5, y: 2.5 }, AkazePoint { x: 3.0, y: 4.0 }];
         let blob = serialize_akaze_points(&points).unwrap();
         let decoded = deserialize_akaze_points(&blob).unwrap();
         assert_eq!(decoded, points);
     }
-
 }

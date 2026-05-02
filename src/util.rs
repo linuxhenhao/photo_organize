@@ -15,7 +15,12 @@ pub fn canonicalize_for_check(path: impl AsRef<Path>) -> Result<PathBuf> {
 pub fn target_root_name(dest: &Path) -> Result<&std::ffi::OsStr> {
     dest.file_name()
         .filter(|name| !name.is_empty())
-        .with_context(|| format!("destination root {} has no final path component", dest.display()))
+        .with_context(|| {
+            format!(
+                "destination root {} has no final path component",
+                dest.display()
+            )
+        })
 }
 
 pub fn ensure_under_root(root: &Path, candidate: &Path) -> Result<()> {
@@ -61,10 +66,7 @@ pub fn logical_target_path(dest: &Path, physical_path: &Path) -> Result<String> 
             dest.display()
         )
     })?;
-    Ok(PathBuf::from(root_name)
-        .join(relative)
-        .to_string_lossy()
-        .to_string())
+    Ok(PathBuf::from(root_name).join(relative).to_string_lossy().to_string())
 }
 
 /// Resolves a logical target_path from the database to a physical path on disk.
@@ -76,7 +78,12 @@ pub fn resolve_physical_path(dest: &Path, target_path: &str) -> PathBuf {
 
     let root_name = dest.file_name().filter(|name| !name.is_empty());
     let starts_with_root = root_name
-        .and_then(|root| target.components().next().map(|component| (root, component)))
+        .and_then(|root| {
+            target
+                .components()
+                .next()
+                .map(|component| (root, component))
+        })
         .map(|(root, component)| matches!(component, Component::Normal(part) if part == root))
         .unwrap_or(false);
 
@@ -90,6 +97,43 @@ pub fn resolve_physical_path(dest: &Path, target_path: &str) -> PathBuf {
 /// A centralized check for ensuring a path is safely under the target root.
 pub fn ensure_under_target_root(dest: &Path, candidate: &Path) -> Result<()> {
     ensure_under_root(&target_base_path(dest), candidate)
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+pub fn remove_empty_parent_dirs(start_dir: &Path, stop_at: &Path) -> Result<()> {
+    let stop_at_normalized = normalize_lexical_path(stop_at);
+    let mut current = start_dir.to_path_buf();
+    while normalize_lexical_path(&current) != stop_at_normalized {
+        let current_normalized = normalize_lexical_path(&current);
+        if !current_normalized.starts_with(&stop_at_normalized) {
+            anyhow::bail!(
+                "directory {} escapes cleanup root {}",
+                current.display(),
+                stop_at.display()
+            );
+        }
+        match fs::remove_dir(&current) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+            Err(err) => return Err(err.into()),
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
+    }
+    Ok(())
 }
 
 pub fn is_excluded_dir(path: &Path) -> bool {
@@ -137,11 +181,7 @@ pub fn parse_video_container_datetime<R: Read + Seek>(
 ) -> Option<String> {
     let mime = mime_type.trim().to_ascii_lowercase();
     match mime.as_str() {
-        "video/mp4"
-        | "video/quicktime"
-        | "application/mp4"
-        | "video/x-m4v"
-        | "video/3gpp"
+        "video/mp4" | "video/quicktime" | "application/mp4" | "video/x-m4v" | "video/3gpp"
         | "video/3gpp2" => {
             let end = reader.seek(SeekFrom::End(0)).ok()?;
             reader.seek(SeekFrom::Start(0)).ok()?;
@@ -372,9 +412,12 @@ fn parse_isobmff_meta_datetime<R: Read + Seek>(
     for child in &children {
         match child.kind.as_slice() {
             b"ilst" => {
-                if let Some(ts) =
-                    parse_isobmff_ilst_datetime(reader, child.payload_start, child.box_end, keys.as_deref())
-                {
+                if let Some(ts) = parse_isobmff_ilst_datetime(
+                    reader,
+                    child.payload_start,
+                    child.box_end,
+                    keys.as_deref(),
+                ) {
                     return Some(ts);
                 }
             }
@@ -636,11 +679,7 @@ fn read_exact_range<R: Read + Seek>(reader: &mut R, start: u64, end: u64) -> Opt
     Some(buf)
 }
 
-fn parse_matroska_date_utc<R: Read + Seek>(
-    reader: &mut R,
-    start: u64,
-    end: u64,
-) -> Option<String> {
+fn parse_matroska_date_utc<R: Read + Seek>(reader: &mut R, start: u64, end: u64) -> Option<String> {
     let mut offset = start;
     while offset < end {
         let (id, id_len, _) = read_ebml_vint(reader, offset, true)?;
@@ -736,6 +775,7 @@ fn read_ebml_vint<R: Read + Seek>(
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use tempfile::tempdir;
 
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -783,7 +823,9 @@ mod tests {
 
     #[test]
     fn parse_video_container_datetime_prefers_quicktime_day_metadata() {
-        let mut cursor = Cursor::new(build_quicktime_day_metadata_mp4("2024-09-10T11:12:13+08:00"));
+        let mut cursor = Cursor::new(build_quicktime_day_metadata_mp4(
+            "2024-09-10T11:12:13+08:00",
+        ));
 
         let actual = parse_video_container_datetime(&mut cursor, "video/quicktime");
 
@@ -792,7 +834,9 @@ mod tests {
 
     #[test]
     fn parse_video_container_datetime_reads_matroska_date_utc() {
-        let mut cursor = Cursor::new(build_minimal_matroska_with_date_utc("2024-04-05T06:07:08+00:00"));
+        let mut cursor = Cursor::new(build_minimal_matroska_with_date_utc(
+            "2024-04-05T06:07:08+00:00",
+        ));
 
         let actual = parse_video_container_datetime(&mut cursor, "video/x-matroska");
 
@@ -804,6 +848,26 @@ mod tests {
         let mime = best_effort_mime(Path::new("clip.mts"), &[]);
 
         assert_eq!(mime, "video/mp2t");
+    }
+
+    #[test]
+    fn remove_empty_parent_dirs_accepts_curdir_prefixed_paths() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let group_dir = repo.join(".photo-org/trash/group-10361");
+        fs::create_dir_all(&group_dir).unwrap();
+
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let result =
+            remove_empty_parent_dirs(Path::new("./repo/.photo-org/trash/group-10361"), Path::new("repo/.photo-org"));
+
+        std::env::set_current_dir(cwd).unwrap();
+
+        assert!(result.is_ok());
+        assert!(!group_dir.exists());
+        assert!(repo.join(".photo-org").exists());
     }
 
     fn build_minimal_mp4_with_mvhd_v0(seconds: u64) -> Vec<u8> {
@@ -948,10 +1012,7 @@ mod tests {
         let target_path = "repo/2023/05/01/img.jpg";
         let physical = resolve_physical_path(&dest, target_path);
         assert_eq!(physical, tmp.path().join(target_path));
-        assert_eq!(
-            logical_target_path(&dest, &physical).unwrap(),
-            target_path
-        );
+        assert_eq!(logical_target_path(&dest, &physical).unwrap(), target_path);
 
         // 3. ensure_under_target_root safety check
         let safe_file = tmp.path().join("repo/safe.jpg");
@@ -970,7 +1031,10 @@ mod tests {
         let dest = Path::new("repo");
         // target_base_path("repo") -> "."
         assert_eq!(target_base_path(dest), Path::new("."));
-        assert_eq!(resolve_physical_path(dest, "repo/a.jpg"), Path::new("./repo/a.jpg"));
+        assert_eq!(
+            resolve_physical_path(dest, "repo/a.jpg"),
+            Path::new("./repo/a.jpg")
+        );
         assert_eq!(
             logical_target_path(dest, Path::new("repo/a.jpg")).unwrap(),
             "repo/a.jpg"

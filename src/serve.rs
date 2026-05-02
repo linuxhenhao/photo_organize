@@ -2,7 +2,7 @@ use crate::db::{insert_operation, open_catalog_db};
 use crate::interrupt;
 use crate::util::{
     best_effort_mime, date_for_target, ensure_under_root, ensure_under_target_root,
-    logical_target_path, resolve_physical_path, safe_file_name,
+    logical_target_path, remove_empty_parent_dirs, resolve_physical_path, safe_file_name,
 };
 use anyhow::Result;
 use axum::extract::{Path, Query, State};
@@ -927,7 +927,9 @@ async fn list_groups(
         let matches_mode = if review_groups_with_trash {
             !trash_member_ids(&members).is_empty()
         } else {
-            members.iter().any(|member| member.keep_state == "undecided")
+            members
+                .iter()
+                .any(|member| member.keep_state == "undecided")
         };
         if members.is_empty() || !matches_mode {
             return Ok(Json(PagedGroups {
@@ -1006,9 +1008,8 @@ async fn list_groups(
     let offset = page_index * page_size;
 
     let mut stmt = conn
-        .prepare(
-            if review_groups_with_trash {
-                r#"
+        .prepare(if review_groups_with_trash {
+            r#"
         SELECT group_id
         FROM target_items
         WHERE group_id IS NOT NULL
@@ -1017,8 +1018,8 @@ async fn list_groups(
         ORDER BY CASE WHEN MIN(created_at) != '' THEN MIN(created_at) ELSE '9999' END ASC
         LIMIT ?1 OFFSET ?2
         "#
-            } else {
-                r#"
+        } else {
+            r#"
         SELECT group_id
         FROM target_items
         WHERE group_id IS NOT NULL
@@ -1027,8 +1028,7 @@ async fn list_groups(
         ORDER BY CASE WHEN MIN(created_at) != '' THEN MIN(created_at) ELSE '9999' END ASC
         LIMIT ?1 OFFSET ?2
         "#
-            },
-        )
+        })
         .map_err(internal_error)?;
 
     let ids = stmt
@@ -1138,7 +1138,10 @@ fn find_in_trash(dest: &PathBuf, target_path: &str, group_id: i64) -> Option<Pat
 fn group_status_for_mode(members: &[MemberRow], review_mode: &str) -> String {
     if review_mode == "trash" {
         "trash-review".to_string()
-    } else if members.iter().any(|member| member.keep_state == "undecided") {
+    } else if members
+        .iter()
+        .any(|member| member.keep_state == "undecided")
+    {
         "pending".to_string()
     } else {
         "archived".to_string()
@@ -1146,13 +1149,18 @@ fn group_status_for_mode(members: &[MemberRow], review_mode: &str) -> String {
 }
 
 fn trash_member_ids(group: &[MemberRow]) -> Vec<i64> {
-    group.iter()
+    group
+        .iter()
         .filter(|member| is_logical_trash_path(StdPath::new(&member.target_path)))
         .map(|member| member.id)
         .collect()
 }
 
-fn reserve_restore_path(dest: &StdPath, created_at: &str, current_path: &StdPath) -> Result<PathBuf> {
+fn reserve_restore_path(
+    dest: &StdPath,
+    created_at: &str,
+    current_path: &StdPath,
+) -> Result<PathBuf> {
     let (year, month, day) = date_for_target(created_at);
     let folder = dest.join(year).join(month).join(day);
     fs::create_dir_all(&folder)?;
@@ -1192,10 +1200,7 @@ async fn resolve_bulk(
         if !kept_set.is_disjoint(&rejected_set) {
             return Err((
                 StatusCode::BAD_REQUEST,
-                format!(
-                    "kept and rejected sets overlap in group {}",
-                    res.group_id
-                ),
+                format!("kept and rejected sets overlap in group {}", res.group_id),
             ));
         }
         for path in kept_set.iter().chain(rejected_set.iter()) {
@@ -1242,7 +1247,10 @@ async fn resolve_bulk(
         for (id, _, moved_to) in &moved_paths {
             tx.execute(
                 "UPDATE target_items SET target_path = ?1 WHERE id = ?2",
-                rusqlite::params![logical_target_path(&state.dest, moved_to).map_err(internal_error)?, id],
+                rusqlite::params![
+                    logical_target_path(&state.dest, moved_to).map_err(internal_error)?,
+                    id
+                ],
             )
             .map_err(internal_error)?;
         }
@@ -1327,7 +1335,10 @@ async fn resolve_group(
     for (id, _, moved_to) in &moved_paths {
         tx.execute(
             "UPDATE target_items SET target_path = ?1 WHERE id = ?2",
-            rusqlite::params![logical_target_path(&state.dest, moved_to).map_err(internal_error)?, id],
+            rusqlite::params![
+                logical_target_path(&state.dest, moved_to).map_err(internal_error)?,
+                id
+            ],
         )
         .map_err(internal_error)?;
     }
@@ -1414,6 +1425,7 @@ fn delete_trash_members_by_ids(
     }
 
     let mut deleted = Vec::new();
+    let photo_org_root = dest.join(".photo-org");
     for (member, group_id) in &members {
         let member_path = resolve_physical_path(dest, &member.target_path);
         let file_deleted = if member_path.exists() {
@@ -1425,6 +1437,9 @@ fn delete_trash_members_by_ids(
                 ));
             }
             fs::remove_file(&member_path).map_err(internal_error)?;
+            if let Some(parent) = member_path.parent() {
+                remove_empty_parent_dirs(parent, &photo_org_root).map_err(internal_error)?;
+            }
             true
         } else {
             false
@@ -1575,12 +1590,18 @@ async fn restore_trash_member(
         return Err((StatusCode::BAD_REQUEST, "trash file is missing".into()));
     }
     if current_path.is_dir() {
-        return Err((StatusCode::BAD_REQUEST, "trash member path must be a file".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "trash member path must be a file".into(),
+        ));
     }
 
-    let restored_path =
-        reserve_restore_path(&state.dest, &member.created_at, &current_path).map_err(internal_error)?;
+    let restored_path = reserve_restore_path(&state.dest, &member.created_at, &current_path)
+        .map_err(internal_error)?;
     fs::rename(&current_path, &restored_path).map_err(internal_error)?;
+    if let Some(parent) = current_path.parent() {
+        remove_empty_parent_dirs(parent, &state.dest.join(".photo-org")).map_err(internal_error)?;
+    }
 
     let tx = conn.transaction().map_err(internal_error)?;
     tx.execute(
@@ -1777,19 +1798,24 @@ fn move_to_trash(dest: &PathBuf, target_path: &str, group_id: i64) -> Result<Pat
             } else {
                 trash_dir.join(format!("{}-{}", idx, expected_name))
             };
-            
+
             if candidate.exists() {
                 // Found it already in trash!
                 return Ok(candidate);
             }
-            
-            if idx > 100 { break; } // Safety break
+
+            if idx > 100 {
+                break;
+            } // Safety break
             idx += 1;
         }
     }
 
     // If we reach here, the file is missing from both source and trash.
-    Err(anyhow::anyhow!("File not found at source or in trash: {}", target_path))
+    Err(anyhow::anyhow!(
+        "File not found at source or in trash: {}",
+        target_path
+    ))
 }
 
 fn is_logical_trash_path(path: &StdPath) -> bool {
@@ -2276,7 +2302,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(keep_state, "kept");
-        assert_eq!(moved_target_path, logical_target_path(&dest, &moved_path).unwrap());
+        assert_eq!(
+            moved_target_path,
+            logical_target_path(&dest, &moved_path).unwrap()
+        );
         let resolved_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM operations_log", [], |row| row.get(0))
             .unwrap();
@@ -2332,6 +2361,8 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
         let keep_path = dest.join("2024/06/09/keep.png");
         let trash_path = dest.join(".photo-org/trash/group-1/reject.png");
+        let trash_group_dir = trash_path.parent().unwrap().to_path_buf();
+        let trash_root = dest.join(".photo-org/trash");
         fs::create_dir_all(keep_path.parent().unwrap()).unwrap();
         fs::create_dir_all(trash_path.parent().unwrap()).unwrap();
         make_png(&keep_path, [255, 0, 0]);
@@ -2368,6 +2399,8 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!trash_path.exists());
+        assert!(!trash_group_dir.exists());
+        assert!(!trash_root.exists());
 
         let conn = open_catalog_db(&db_path).unwrap();
         let count: i64 = conn
@@ -2437,6 +2470,8 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
         let keep_path = dest.join("2024/06/09/keep.png");
         let trash_path = dest.join(".photo-org/trash/group-5/reject.png");
+        let trash_group_dir = trash_path.parent().unwrap().to_path_buf();
+        let trash_root = dest.join(".photo-org/trash");
         fs::create_dir_all(keep_path.parent().unwrap()).unwrap();
         fs::create_dir_all(trash_path.parent().unwrap()).unwrap();
         make_png(&keep_path, [255, 0, 0]);
@@ -2473,6 +2508,8 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!trash_path.exists());
+        assert!(!trash_group_dir.exists());
+        assert!(!trash_root.exists());
         let restored_path = dest.join("2024/06/09/reject.png");
         assert!(restored_path.exists());
 
@@ -2484,7 +2521,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(restored_row.0, logical_target_path(&dest, &restored_path).unwrap());
+        assert_eq!(
+            restored_row.0,
+            logical_target_path(&dest, &restored_path).unwrap()
+        );
         assert_eq!(restored_row.1, "kept");
     }
 
@@ -2496,6 +2536,8 @@ mod tests {
         let keep_path = dest.join("2024/06/09/keep.png");
         let trash_path_a = dest.join(".photo-org/trash/group-7/reject-a.png");
         let trash_path_b = dest.join(".photo-org/trash/group-7/reject-b.png");
+        let trash_group_dir = trash_path_a.parent().unwrap().to_path_buf();
+        let trash_root = dest.join(".photo-org/trash");
         fs::create_dir_all(keep_path.parent().unwrap()).unwrap();
         fs::create_dir_all(trash_path_a.parent().unwrap()).unwrap();
         make_png(&keep_path, [255, 0, 0]);
@@ -2536,6 +2578,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!trash_path_a.exists());
         assert!(!trash_path_b.exists());
+        assert!(!trash_group_dir.exists());
+        assert!(!trash_root.exists());
 
         let conn = open_catalog_db(&db_path).unwrap();
         let count: i64 = conn
@@ -2552,6 +2596,7 @@ mod tests {
         let keep_dir = dest.join("2024/06/09");
         let trash_dir_1 = dest.join(".photo-org/trash/group-11");
         let trash_dir_2 = dest.join(".photo-org/trash/group-12");
+        let trash_root = dest.join(".photo-org/trash");
         fs::create_dir_all(&keep_dir).unwrap();
         fs::create_dir_all(&trash_dir_1).unwrap();
         fs::create_dir_all(&trash_dir_2).unwrap();
@@ -2594,6 +2639,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!trash_path_1.exists());
         assert!(!trash_path_2.exists());
+        assert!(!trash_dir_1.exists());
+        assert!(!trash_dir_2.exists());
+        assert!(!trash_root.exists());
 
         let conn = open_catalog_db(&db_path).unwrap();
         let remaining: i64 = conn

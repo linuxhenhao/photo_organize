@@ -1,0 +1,21 @@
+category	pair_count	group_count	sample_group_id	sample_primary_name	sample_other_name
+default_camera:same_core	6131	5392	4973	img_5793.cr2	defaultimg_5793-2.cr2
+default_other:same_core	1442	1314	1328	dpp_0195.jpg	defaultdpp_0195-2.jpg
+timestamp_rendition:same_id	1079	772	9634	img_20200305_144300.jpg	20200305-144300-2.jpg
+timestamp_rendition:same_core	444	275	8879	20240827-185647747.jpg	20240827-185647-2.jpg
+timestamp_rendition	426	304	7725	img_5526.cr2	20130828-180646-2.jpg
+default_embedded:same_core	379	326	4981	img_5808.cr2	defaultimg_5808_cr2_embedded.jpg
+default_shotwell:same_core	268	254	2042	img_1823.cr2	1-defaultimg_1823_cr2_shotwell.jpg
+default_camera:other	240	120	8939	20240330-190001441.arw	defaultdsc00984.jpg
+default_timestamp:same_core	172	172	1471	2013-01-12 13.22.49.jpg	default2013-01-12_13.22.49.jpg
+default_camera:adjacent_id	53	34	8082	dsc00758.arw	defaultdsc00759.arw
+default_other:other	51	47	6881	img_5712.jpg	defaultnwub8621.jpeg
+default_embedded:adjacent_id	21	15	2182	img_2015_cr2_shotwell.jpg	defaultimg_2014_cr2_embedded.jpg
+default_shotwell:adjacent_id	19	13	2182	img_2015_cr2_shotwell.jpg	defaultimg_2014_cr2_shotwell.jpg
+default_camera:same_id	17	17	647	img_20180512_205810_0496.jpg	defaultimg_0496-3.jpg
+default_timestamp	16	12	345	2013-02-15 15.08.53.jpg	default2013-02-15_15.09.18.jpg
+default_hash:other	7	7	9152	img_0595.jpg	defaultf2616d111110c1aa212ce1f0b57e5996.jpg
+timestamp_rendition:adjacent_id	4	2	7767	img_20230415_212123.jpg	20230415-212118.jpg
+default_embedded:other	2	2	5735	img_7460_cr2_embedded.jpg	defaultimg_7457_cr2_embedded.jpg
+default_shotwell:other	2	2	5735	img_7460_cr2_embedded.jpg	defaultimg_7457_cr2_shotwell.jpg
+default_shotwell:same_id	1	1	4791	img_5568_cr2_embedded.jpg	defaultimg_5568_dng_shotwell_2_1.jpg
