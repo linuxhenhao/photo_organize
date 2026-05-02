@@ -46,6 +46,14 @@ pub fn target_base_path(dest: &Path) -> PathBuf {
 /// representation stored in SQLite.
 pub fn logical_target_path(dest: &Path, physical_path: &Path) -> Result<String> {
     let root_name = target_root_name(dest)?;
+    let base = target_base_path(dest);
+    if let Ok(rooted) = physical_path.strip_prefix(&base) {
+        let mut components = rooted.components();
+        if matches!(components.next(), Some(Component::Normal(part)) if part == root_name) {
+            return Ok(rooted.to_string_lossy().to_string());
+        }
+    }
+
     let relative = physical_path.strip_prefix(dest).with_context(|| {
         format!(
             "path {} is not under destination root {}",
@@ -965,6 +973,10 @@ mod tests {
         assert_eq!(resolve_physical_path(dest, "repo/a.jpg"), Path::new("./repo/a.jpg"));
         assert_eq!(
             logical_target_path(dest, Path::new("repo/a.jpg")).unwrap(),
+            "repo/a.jpg"
+        );
+        assert_eq!(
+            logical_target_path(dest, Path::new("./repo/a.jpg")).unwrap(),
             "repo/a.jpg"
         );
     }
