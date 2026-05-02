@@ -1,7 +1,7 @@
+use image::{ImageBuffer, Rgb};
 use reqwest::{Client, StatusCode};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
-use image::{ImageBuffer, Rgb};
 use std::fs;
 use std::fs::File;
 use std::io::Read;
@@ -50,13 +50,13 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
 }
 
 fn make_png(path: &Path, color: [u8; 3]) {
-    let image = ImageBuffer::from_fn(32, 32, |x, y| {
-        if x == y {
-            Rgb([0, 0, 0])
-        } else {
-            Rgb(color)
-        }
-    });
+    let image = ImageBuffer::from_fn(
+        32,
+        32,
+        |x, y| {
+            if x == y { Rgb([0, 0, 0]) } else { Rgb(color) }
+        },
+    );
     image.save(path).unwrap();
 }
 
@@ -307,7 +307,15 @@ fn make_seeded_workspace(dest_arg: &str) -> (TempDir, PathBuf, PathBuf) {
                 32, 32, ?5, ?6, ?7, 'completed', NULL, '{}'
             )
             "#,
-            params![id, path, created_at, format!("hash-{id}"), group_id, keep_state, is_group_primary],
+            params![
+                id,
+                path,
+                created_at,
+                format!("hash-{id}"),
+                group_id,
+                keep_state,
+                is_group_primary
+            ],
         )
         .unwrap();
     }
@@ -415,13 +423,21 @@ async fn e2e_cli_scan_import_initcache_and_serve() {
     serve.wait_ready();
 
     let groups_resp = client
-        .get(format!("{}/api/groups?page_index=0&page_size=5", serve.base_url()))
+        .get(format!(
+            "{}/api/groups?page_index=0&page_size=5",
+            serve.base_url()
+        ))
         .send()
         .await
         .unwrap();
     let groups_status = groups_resp.status();
     let groups_body = groups_resp.text().await.unwrap();
-    assert_status(groups_status, StatusCode::OK, &groups_body, "GET /api/groups");
+    assert_status(
+        groups_status,
+        StatusCode::OK,
+        &groups_body,
+        "GET /api/groups",
+    );
     let groups_json: Value = serde_json::from_str(&groups_body).unwrap();
     assert!(groups_json["groups"].is_array());
     assert!(groups_json["total_groups"].is_number());
@@ -594,10 +610,7 @@ async fn e2e_serve_http_api_and_dest_path_equivalence() {
         assert!(repo.join(".photo-org/trash/group-43/keep-c.png").exists());
 
         let bulk_delete_resp = client
-            .post(format!(
-                "{}/api/groups/delete_trash_bulk",
-                serve.base_url()
-            ))
+            .post(format!("{}/api/groups/delete_trash_bulk", serve.base_url()))
             .json(&json!({ "member_ids": [4] }))
             .send()
             .await
@@ -632,7 +645,10 @@ async fn e2e_serve_http_api_and_dest_path_equivalence() {
         assert!(!repo.join(".photo-org/trash/group-43/reject-c.png").exists());
 
         fs::create_dir_all(repo.join(".photo-org/trash/group-43")).unwrap();
-        make_png(&repo.join(".photo-org/trash/group-43/reject-d.png"), [120, 120, 120]);
+        make_png(
+            &repo.join(".photo-org/trash/group-43/reject-d.png"),
+            [120, 120, 120],
+        );
         let conn = open_catalog_db(&db);
         conn.execute(
             r#"
@@ -725,6 +741,12 @@ fn e2e_initcache_on_existing_fixture_dest() {
         )
         .unwrap();
     assert!(item_count > 0, "fixture initcache adopted no files");
-    assert_eq!(completed_count, item_count, "fixture initcache left pending rows");
-    assert_eq!(copied_paths, item_count, "fixture target_path escaped repo/ root");
+    assert_eq!(
+        completed_count, item_count,
+        "fixture initcache left pending rows"
+    );
+    assert_eq!(
+        copied_paths, item_count,
+        "fixture target_path escaped repo/ root"
+    );
 }

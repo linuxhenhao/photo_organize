@@ -2,8 +2,8 @@ use crate::db::FEATURE_VERSION;
 use crate::features::{
     AkazeStatus, MIN_AKAZE_DESCRIPTORS_FOR_MATCH, VisualFeatures,
     compute_visual_features_for_mime_from_bytes, deserialize_akaze_descriptors,
-    deserialize_akaze_points, phash_to_u64, serialize_akaze_descriptors,
-    serialize_akaze_points, supports_visual_features,
+    deserialize_akaze_points, phash_to_u64, serialize_akaze_descriptors, serialize_akaze_points,
+    supports_visual_features,
 };
 use anyhow::{Context, Result};
 use lru::LruCache;
@@ -226,11 +226,7 @@ fn load_cached_feature(
     if status == AkazeStatus::Ready
         && (descriptors.is_none()
             || points.is_none()
-            || !ready_feature_is_reusable(
-                keypoints,
-                descriptors.as_deref(),
-                points.as_deref(),
-            ))
+            || !ready_feature_is_reusable(keypoints, descriptors.as_deref(), points.as_deref()))
     {
         return Ok(None);
     }
@@ -731,9 +727,7 @@ mod tests {
     #[test]
     fn loader_recomputes_low_keypoint_ready_cache_rows() {
         let tmp = tempdir().unwrap();
-        let image_path = tmp
-            .path()
-            .join("2013-02-05-14.59.19-anon-default.jpg");
+        let image_path = tmp.path().join("2013-02-05-14.59.19-anon-default.jpg");
         fs::copy(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("docs")
@@ -785,8 +779,7 @@ mod tests {
         assert!(
             features.akaze_status == AkazeStatus::NoKeypoints
                 || (features.akaze_status == AkazeStatus::Ready
-                    && features.akaze_keypoints.unwrap_or(0)
-                        >= MIN_AKAZE_DESCRIPTORS_FOR_MATCH)
+                    && features.akaze_keypoints.unwrap_or(0) >= MIN_AKAZE_DESCRIPTORS_FOR_MATCH)
         );
 
         let stored_row: (String, Option<i64>) = catalog

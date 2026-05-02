@@ -66,7 +66,10 @@ pub fn logical_target_path(dest: &Path, physical_path: &Path) -> Result<String> 
             dest.display()
         )
     })?;
-    Ok(PathBuf::from(root_name).join(relative).to_string_lossy().to_string())
+    Ok(PathBuf::from(root_name)
+        .join(relative)
+        .to_string_lossy()
+        .to_string())
 }
 
 /// Resolves a logical target_path from the database to a physical path on disk.
@@ -860,8 +863,10 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
 
-        let result =
-            remove_empty_parent_dirs(Path::new("./repo/.photo-org/trash/group-10361"), Path::new("repo/.photo-org"));
+        let result = remove_empty_parent_dirs(
+            Path::new("./repo/.photo-org/trash/group-10361"),
+            Path::new("repo/.photo-org"),
+        );
 
         std::env::set_current_dir(cwd).unwrap();
 
