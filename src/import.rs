@@ -243,13 +243,16 @@ pub fn initcache(
 
     // Stage 3: Serial Grouping Pass
     let adopt_started = Instant::now();
-    let result = grouping_pass_initcache(catalog_db, dest, phash_threshold, akaze_min_matches);
+    grouping_pass_initcache(catalog_db, dest, phash_threshold, akaze_min_matches)?;
+
+    // Stage 4: Serial Group Consistency Repair
+    repair_pass_initcache(catalog_db)?;
     let adopt_elapsed = adopt_started.elapsed();
 
     if initcache_profiling_enabled() {
         log_initcache_profile(scan_elapsed, adopt_elapsed, total_started.elapsed());
     }
-    result
+    Ok(())
 }
 
 fn ingest_pass_initcache(catalog_db: &Path, dest: &Path) -> Result<()> {
@@ -649,7 +652,6 @@ fn grouping_pass_initcache(
     progress.log_start();
 
     let mut batch = Vec::new();
-    let mut touched_group_ids = HashSet::new();
     for row in pending {
         if interrupt::requested() {
             if !batch.is_empty() {
@@ -667,15 +669,7 @@ fn grouping_pass_initcache(
             phash_threshold,
             akaze_min_matches,
             "completed",
-        )
-        .map(|updated| {
-            if let Some(group_id) = row.group_id {
-                touched_group_ids.insert(group_id);
-            }
-            if let Some(group_id) = updated.group_id {
-                touched_group_ids.insert(group_id);
-            }
-        })?;
+        )?;
 
         batch.push(row.id);
         if batch.len() >= 100 {
@@ -688,9 +682,6 @@ fn grouping_pass_initcache(
     if !batch.is_empty() {
         mark_completed_batch(&mut conn, &batch)?;
     }
-
-    repair_touched_group_primaries(&mut conn, &touched_group_ids)?;
-
     Ok(())
 }
 
@@ -717,22 +708,60 @@ fn repair_touched_group_primaries(conn: &mut Connection, group_ids: &HashSet<i64
 
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare(
-            "UPDATE target_items SET is_group_primary = CASE WHEN id = ?1 THEN 1 ELSE 0 END WHERE group_id = ?2",
+        let mut clear_singleton = tx.prepare(
+            "UPDATE target_items
+             SET group_id = NULL, keep_state = 'undecided', is_group_primary = 0
+             WHERE id = ?1",
+        )?;
+        let mut set_primary = tx.prepare(
+            "UPDATE target_items
+             SET is_group_primary = CASE WHEN id = ?1 THEN 1 ELSE 0 END
+             WHERE group_id = ?2",
         )?;
         for group_id in group_ids {
             interrupt::check()?;
             let members = load_group_members(&tx, *group_id)?;
-            let primary_count = members.iter().filter(|m| m.is_group_primary).count();
-            if primary_count != 1 {
-                let primary_id = choose_primary_member(&members)?;
-                stmt.execute(params![primary_id, group_id])?;
+            match members.len() {
+                0 => {}
+                1 => {
+                    clear_singleton.execute(params![members[0].id])?;
+                }
+                _ => {
+                    let primary_count = members.iter().filter(|m| m.is_group_primary).count();
+                    if primary_count != 1 {
+                        let primary_id = choose_primary_member(&members)?;
+                        set_primary.execute(params![primary_id, group_id])?;
+                    }
+                }
             }
             progress.item_done();
         }
     }
     tx.commit()?;
     Ok(())
+}
+
+fn repair_pass_initcache(catalog_db: &Path) -> Result<()> {
+    let mut conn = open_catalog_db(catalog_db)?;
+    let group_ids = load_inconsistent_group_ids(&conn)?;
+    repair_touched_group_primaries(&mut conn, &group_ids)
+}
+
+fn load_inconsistent_group_ids(conn: &Connection) -> Result<HashSet<i64>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT group_id
+        FROM target_items
+        WHERE group_id IS NOT NULL
+        GROUP BY group_id
+        HAVING COUNT(*) = 1
+           OR SUM(CASE WHEN is_group_primary != 0 THEN 1 ELSE 0 END) != 1
+        "#,
+    )?;
+    let group_ids = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+    Ok(group_ids)
 }
 
 fn catalog_input_from_target_row(dest: &Path, row: &TargetRow) -> CatalogInput {
@@ -1826,6 +1855,104 @@ mod tests {
 
         assert_eq!(primary_count, 1);
         assert_eq!(completed_count, 2);
+    }
+
+    #[test]
+    fn initcache_repairs_missing_primary_without_pending_rows() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+
+        let a = dest.join("2024-06-09_a.jpg");
+        let b = dest.join("2024-06-09_b.jpg");
+        copy_source_fixture("DSC00903.thumb.jpg", &a);
+        fs::copy(&a, &b).unwrap();
+        append_trailing_byte(&b);
+
+        let catalog_db = tmp.path().join("catalog.db");
+        initcache(&catalog_db, &dest, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let group_id: i64 = catalog
+            .query_row(
+                "SELECT group_id FROM target_items WHERE target_path = ?1",
+                params![logical_target_path(&dest, &a).unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        catalog
+            .execute(
+                "UPDATE target_items SET is_group_primary = 0 WHERE group_id = ?1",
+                params![group_id],
+            )
+            .unwrap();
+        drop(catalog);
+
+        initcache(&catalog_db, &dest, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let primary_count: i64 = catalog
+            .query_row(
+                "SELECT COUNT(*) FROM target_items WHERE group_id = ?1 AND is_group_primary != 0",
+                params![group_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(primary_count, 1);
+    }
+
+    #[test]
+    fn initcache_ignores_group_ids_that_become_empty_during_regroup() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+
+        let a = dest.join("2024-06-09_a.jpg");
+        let b = dest.join("2024-06-09_b.jpg");
+        copy_source_fixture("DSC00903.thumb.jpg", &a);
+        fs::copy(&a, &b).unwrap();
+        append_trailing_byte(&b);
+
+        let catalog_db = tmp.path().join("catalog.db");
+        initcache(&catalog_db, &dest, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let logical_a = logical_target_path(&dest, &a).unwrap();
+        let logical_b = logical_target_path(&dest, &b).unwrap();
+        catalog
+            .execute(
+                "UPDATE target_items
+                 SET group_id = CASE
+                     WHEN target_path = ?1 THEN 999
+                     WHEN target_path = ?2 THEN NULL
+                     ELSE group_id
+                 END,
+                 is_group_primary = 0,
+                 group_status = CASE WHEN target_path = ?1 THEN 'pending' ELSE group_status END",
+                params![logical_a, logical_b],
+            )
+            .unwrap();
+        drop(catalog);
+
+        initcache(&catalog_db, &dest, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let stale_group_count: i64 = catalog
+            .query_row(
+                "SELECT COUNT(*) FROM target_items WHERE group_id = 999",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let grouped_count: i64 = catalog
+            .query_row(
+                "SELECT COUNT(*) FROM target_items WHERE group_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_group_count, 0);
+        assert_eq!(grouped_count, 2);
     }
 
     #[test]
