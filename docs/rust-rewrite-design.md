@@ -240,6 +240,7 @@ In `catalog.db`:
 `target_items`
 - `id INTEGER PRIMARY KEY`
 - `target_path TEXT UNIQUE NOT NULL`
+  stored as a logical `DEST_BASENAME/...` path such as `repo/2025/01/02/file.jpg`, not as an absolute filesystem path
 - `size_bytes INTEGER NOT NULL`
 - `mime_type TEXT NOT NULL DEFAULT ''`
 - `created_at TEXT NOT NULL`

@@ -49,6 +49,8 @@ Current routes:
   Permanently deletes every trash member in one group and updates `target_items`.
 - `POST /api/groups/delete_trash_bulk`
   Permanently deletes an explicit list of trash members, intended for page-level bulk cleanup in trash review mode.
+- `POST /api/groups/{group_id}/members/{member_id}/restore_trash`
+  Restores one trash member back into the managed library tree and flips it back to `kept`.
 - `GET /api/groups/{id}/archive`
   Returns the raw member list for one group. Today this is a read-only JSON view, not a write path.
 - `POST /api/groups/{group_id}/members/{member_id}/delete_trash`
@@ -84,6 +86,7 @@ Returned member fields are intentionally lightweight:
 
 - row id
 - `target_path`
+  Stored as a logical path rooted at the final `--dest` directory name, such as `repo/2025/01/02/file.jpg`, not as an absolute path.
 - MIME type
 - keep state
 - primary flag
@@ -109,6 +112,7 @@ Frontend behavior:
 - lets the operator jump directly to one `group_id`
 - supports explicit `Keep`, `Reject`, `Primary`, and `Preview` actions per member
 - shows `Delete trash file` for members already under `.photo-org/trash/`
+- shows `Restore` for trash members so operators can undo a prior reject decision
 - supports single-group confirm and bulk confirm for all visible groups in pending mode
 - supports single-group trash deletion and page-level trash deletion in trash review mode
 
@@ -175,6 +179,15 @@ Bulk trash deletion accepts a JSON body with explicit `member_ids`.
 - every referenced row must already point under `.photo-org/trash/`
 - the endpoint validates the full request before mutating files
 - this powers the "delete trash on this page" action in trash review mode
+
+### `POST /api/groups/{group_id}/members/{member_id}/restore_trash`
+
+Trash restore is the undo path for a prior reject decision.
+
+- the row must already point under `.photo-org/trash/`
+- the file is renamed back into the managed destination tree using the standard `created_at -> YYYY/MM/DD/` layout
+- `keep_state` is changed from `rejected` to `kept`
+- if the group no longer has a primary, the best remaining member is promoted
 
 ## Filesystem Safety Rules
 

@@ -6,7 +6,10 @@ use crate::features::{
 use crate::interrupt;
 use crate::phash_index::PhashIndex;
 use crate::scan::{DiscoveredFile, collect_file_paths, discover_file, run as scan_run};
-use crate::util::{ProgressReporter, date_for_target, safe_file_name, system_time_to_rfc3339};
+use crate::util::{
+    ProgressReporter, date_for_target, logical_target_path, resolve_physical_path, safe_file_name,
+    system_time_to_rfc3339,
+};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -74,6 +77,28 @@ struct ExistingTargetFact {
     created_at: String,
     exact_hash: String,
     modified_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FeatureCacheRef {
+    exact_hash: String,
+    size_bytes: i64,
+}
+
+#[derive(Debug, Clone)]
+struct MissingTargetRow {
+    id: i64,
+    target_path: String,
+    exact_hash: String,
+    size_bytes: i64,
+    group_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct InitcacheCleanupStats {
+    removed_target_rows: usize,
+    removed_feature_cache_rows: usize,
+    affected_groups: usize,
 }
 
 const TARGET_ROW_SELECT_COLUMNS: &str = r#"
@@ -214,11 +239,11 @@ pub fn initcache(
 
     // Stage 2: Targeted Parallel Feature Pre-warm
     let _prewarm_started = Instant::now();
-    prewarm_pass_initcache(catalog_db, phash_threshold)?;
+    prewarm_pass_initcache(catalog_db, dest, phash_threshold)?;
 
     // Stage 3: Serial Grouping Pass
     let adopt_started = Instant::now();
-    let result = grouping_pass_initcache(catalog_db, phash_threshold, akaze_min_matches);
+    let result = grouping_pass_initcache(catalog_db, dest, phash_threshold, akaze_min_matches);
     let adopt_elapsed = adopt_started.elapsed();
 
     if initcache_profiling_enabled() {
@@ -230,10 +255,15 @@ pub fn initcache(
 fn ingest_pass_initcache(catalog_db: &Path, dest: &Path) -> Result<()> {
     let existing = {
         let catalog_conn = open_catalog_db(catalog_db)?;
+        normalize_catalog_target_paths(&catalog_conn, dest)?;
         load_existing_target_facts(&catalog_conn)?
     };
 
     let files = collect_file_paths(&[dest.to_path_buf()])?;
+    let seen_paths = files
+        .iter()
+        .map(|path| logical_target_path(dest, path))
+        .collect::<Result<HashSet<_>>>()?;
     let total = files.len();
     let progress = ProgressReporter::new("initcache ingest", total);
     progress.log_start();
@@ -242,6 +272,7 @@ fn ingest_pass_initcache(catalog_db: &Path, dest: &Path) -> Result<()> {
 
     // Consumer thread for batch writing
     let db_path = catalog_db.to_path_buf();
+    let dest_path = dest.to_path_buf();
     let consumer = std::thread::spawn(move || -> Result<usize> {
         let mut conn = open_catalog_db(&db_path)?;
         let mut buffer = Vec::with_capacity(100);
@@ -250,13 +281,13 @@ fn ingest_pass_initcache(catalog_db: &Path, dest: &Path) -> Result<()> {
         while let Ok(item) = rx_chan.recv() {
             buffer.push(item);
             if buffer.len() >= 100 {
-                write_ingest_batch(&mut conn, &buffer)?;
+                write_ingest_batch(&mut conn, &dest_path, &buffer)?;
                 count += buffer.len();
                 buffer.clear();
             }
         }
         if !buffer.is_empty() {
-            write_ingest_batch(&mut conn, &buffer)?;
+            write_ingest_batch(&mut conn, &dest_path, &buffer)?;
             count += buffer.len();
         }
         Ok(count)
@@ -267,7 +298,7 @@ fn ingest_pass_initcache(catalog_db: &Path, dest: &Path) -> Result<()> {
         if interrupt::requested() {
             return;
         }
-        if let Ok(Some(item)) = discover_or_reuse_target_file(path, &existing) {
+        if let Ok(Some(item)) = discover_or_reuse_target_file(dest, path, &existing) {
             let _ = tx_chan.send(item);
         } else {
             // Even if skipped, we notify progress
@@ -278,11 +309,155 @@ fn ingest_pass_initcache(catalog_db: &Path, dest: &Path) -> Result<()> {
     drop(tx_chan); // Signal end
     let written = consumer.join().expect("consumer thread panicked")?;
     interrupt::check()?;
+    let cleanup = {
+        let mut conn = open_catalog_db(catalog_db)?;
+        prune_missing_target_rows(&mut conn, dest, &seen_paths)?
+    };
+    if cleanup.removed_target_rows > 0 || cleanup.removed_feature_cache_rows > 0 {
+        tracing::info!(
+            removed_target_rows = cleanup.removed_target_rows,
+            removed_feature_cache_rows = cleanup.removed_feature_cache_rows,
+            affected_groups = cleanup.affected_groups,
+            "initcache cleanup removed missing rows"
+        );
+    }
     tracing::info!(written, "ingest pass complete");
     Ok(())
 }
 
-fn write_ingest_batch(conn: &mut Connection, batch: &[DiscoveredFile]) -> Result<()> {
+fn prune_missing_target_rows(
+    conn: &mut Connection,
+    dest: &Path,
+    seen_paths: &HashSet<String>,
+) -> Result<InitcacheCleanupStats> {
+    let missing_rows = {
+        let mut stmt = conn.prepare(
+            "SELECT id, target_path, exact_hash, size_bytes, group_id FROM target_items",
+        )?;
+        stmt.query_map([], |row| {
+            Ok(MissingTargetRow {
+                id: row.get(0)?,
+                target_path: row.get(1)?,
+                exact_hash: row.get(2)?,
+                size_bytes: row.get(3)?,
+                group_id: row.get(4)?,
+            })
+        })?
+        .filter_map(|row| match row {
+            Ok(row)
+                if !seen_paths.contains(&row.target_path)
+                    && !resolve_physical_path(dest, &row.target_path).exists() =>
+            {
+                Some(Ok(row))
+            }
+            Ok(_) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    if missing_rows.is_empty() {
+        return Ok(InitcacheCleanupStats::default());
+    }
+
+    let affected_groups = missing_rows
+        .iter()
+        .filter_map(|row| row.group_id)
+        .collect::<HashSet<_>>();
+    let cache_refs = missing_rows
+        .iter()
+        .map(|row| FeatureCacheRef {
+            exact_hash: row.exact_hash.clone(),
+            size_bytes: row.size_bytes,
+        })
+        .collect::<HashSet<_>>();
+
+    let tx = conn.transaction()?;
+    {
+        let mut delete_target = tx.prepare("DELETE FROM target_items WHERE id = ?1")?;
+        for row in &missing_rows {
+            delete_target.execute(params![row.id])?;
+        }
+    }
+    let removed_cache_rows = prune_orphaned_feature_cache_rows(&tx, &cache_refs)?;
+    tx.commit()?;
+
+    repair_groups_after_target_cleanup(conn, &affected_groups)?;
+
+    tracing::info!(
+        removed_target_rows = missing_rows.len(),
+        removed_feature_cache_rows = removed_cache_rows,
+        affected_groups = affected_groups.len(),
+        "cleaned missing initcache rows"
+    );
+    Ok(InitcacheCleanupStats {
+        removed_target_rows: missing_rows.len(),
+        removed_feature_cache_rows: removed_cache_rows,
+        affected_groups: affected_groups.len(),
+    })
+}
+
+fn prune_orphaned_feature_cache_rows(
+    conn: &Connection,
+    cache_refs: &HashSet<FeatureCacheRef>,
+) -> Result<usize> {
+    let mut removed = 0;
+    let mut stmt = conn.prepare(
+        r#"
+        DELETE FROM feature_cache
+        WHERE exact_hash = ?1
+          AND size_bytes = ?2
+          AND NOT EXISTS (
+              SELECT 1
+              FROM target_items
+              WHERE exact_hash = ?1 AND size_bytes = ?2
+              LIMIT 1
+          )
+        "#,
+    )?;
+    for cache_ref in cache_refs {
+        removed += stmt.execute(params![cache_ref.exact_hash, cache_ref.size_bytes])?;
+    }
+    Ok(removed)
+}
+
+fn repair_groups_after_target_cleanup(conn: &mut Connection, group_ids: &HashSet<i64>) -> Result<()> {
+    if group_ids.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    {
+        let mut clear_singleton = tx.prepare(
+            "UPDATE target_items
+             SET group_id = NULL, keep_state = 'undecided', is_group_primary = 0
+             WHERE id = ?1",
+        )?;
+        let mut set_primary = tx.prepare(
+            "UPDATE target_items
+             SET is_group_primary = CASE WHEN id = ?1 THEN 1 ELSE 0 END
+             WHERE group_id = ?2",
+        )?;
+
+        for group_id in group_ids {
+            let members = load_group_members(&tx, *group_id)?;
+            match members.len() {
+                0 => {}
+                1 => {
+                    clear_singleton.execute(params![members[0].id])?;
+                }
+                _ => {
+                    let primary_id = choose_primary_member(&members)?;
+                    set_primary.execute(params![primary_id, group_id])?;
+                }
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn write_ingest_batch(conn: &mut Connection, dest: &Path, batch: &[DiscoveredFile]) -> Result<()> {
     let tx = conn.transaction()?;
     {
         let mut stmt = tx.prepare(
@@ -305,7 +480,7 @@ fn write_ingest_batch(conn: &mut Connection, batch: &[DiscoveredFile]) -> Result
         )?;
         for item in batch {
             stmt.execute(params![
-                item.path.to_string_lossy(),
+                logical_target_path(dest, &item.path)?,
                 item.size_bytes,
                 item.mime_type,
                 item.created_at,
@@ -322,7 +497,7 @@ fn write_ingest_batch(conn: &mut Connection, batch: &[DiscoveredFile]) -> Result
     Ok(())
 }
 
-fn prewarm_pass_initcache(catalog_db: &Path, phash_threshold: u32) -> Result<()> {
+fn prewarm_pass_initcache(catalog_db: &Path, dest: &Path, phash_threshold: u32) -> Result<()> {
     let conn = open_catalog_db(catalog_db)?;
 
     // 1. Identify items needing pre-warm
@@ -340,8 +515,9 @@ fn prewarm_pass_initcache(catalog_db: &Path, phash_threshold: u32) -> Result<()>
     let pending_items = stmt
         .query_map([], |row| {
             let id = row.get(0)?;
+            let target_path = row.get::<_, String>(1)?;
             let file = DiscoveredFile {
-                path: PathBuf::from(row.get::<_, String>(1)?),
+                path: resolve_physical_path(dest, &target_path),
                 mime_type: row.get(2)?,
                 exact_hash: row.get(3)?,
                 size_bytes: row.get(4)?,
@@ -447,6 +623,7 @@ fn write_feature_batch(conn: &mut Connection, batch: &[VisualFeatures]) -> Resul
 
 fn grouping_pass_initcache(
     catalog_db: &Path,
+    dest: &Path,
     phash_threshold: u32,
     akaze_min_matches: usize,
 ) -> Result<()> {
@@ -480,9 +657,10 @@ fn grouping_pass_initcache(
 
         adopt_single(
             &mut conn,
+            dest,
             &mut feature_loader,
             &mut phash_index,
-            catalog_input_from_target_row(&row),
+            catalog_input_from_target_row(dest, &row),
             phash_threshold,
             akaze_min_matches,
             "completed",
@@ -554,9 +732,9 @@ fn repair_touched_group_primaries(conn: &mut Connection, group_ids: &HashSet<i64
     Ok(())
 }
 
-fn catalog_input_from_target_row(row: &TargetRow) -> CatalogInput {
+fn catalog_input_from_target_row(dest: &Path, row: &TargetRow) -> CatalogInput {
     CatalogInput {
-        target_path: PathBuf::from(&row.target_path),
+        target_path: resolve_physical_path(dest, &row.target_path),
         size_bytes: row.size_bytes,
         mime_type: row.mime_type.clone(),
         created_at: String::new(), // Not needed for grouping
@@ -571,11 +749,12 @@ fn catalog_input_from_target_row(row: &TargetRow) -> CatalogInput {
 }
 
 fn discover_or_reuse_target_file(
+    dest: &Path,
     path: &Path,
     existing: &HashMap<String, ExistingTargetFact>,
 ) -> Result<Option<DiscoveredFile>> {
     let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    let path_key = path.to_string_lossy().to_string();
+    let path_key = logical_target_path(dest, path)?;
     let size_bytes = i64::try_from(meta.len()).unwrap_or(i64::MAX);
     let modified_at = meta.modified().ok().map(system_time_to_rfc3339);
 
@@ -604,6 +783,7 @@ fn import_from_scan_db(
     fs::create_dir_all(dest)?;
     let scan_conn = open_scan_db(scan_db)?;
     let mut catalog_conn = open_catalog_db(catalog_db)?;
+    normalize_catalog_target_paths(&catalog_conn, dest)?;
     let mut feature_loader = FeatureLoader::default();
     let mut phash_index = PhashIndex::from_catalog(&catalog_conn)?;
     let rows = load_scan_rows(&scan_conn)?;
@@ -802,6 +982,7 @@ fn import_single(
     let input = catalog_input_from_scan_row(row, target_path);
     process_catalog_input(
         conn,
+        dest,
         feature_loader,
         phash_index,
         input,
@@ -813,6 +994,7 @@ fn import_single(
 
 fn adopt_single(
     conn: &mut Connection,
+    dest: &Path,
     feature_loader: &mut FeatureLoader,
     phash_index: &mut PhashIndex,
     input: CatalogInput,
@@ -822,6 +1004,7 @@ fn adopt_single(
 ) -> Result<TargetRow> {
     process_catalog_input(
         conn,
+        dest,
         feature_loader,
         phash_index,
         input,
@@ -833,6 +1016,7 @@ fn adopt_single(
 
 fn process_catalog_input(
     conn: &mut Connection,
+    dest: &Path,
     feature_loader: &mut FeatureLoader,
     phash_index: &mut PhashIndex,
     input: CatalogInput,
@@ -891,7 +1075,7 @@ fn process_catalog_input(
     let mut candidate_confirm_calls = 0usize;
     let mut candidate_confirm_elapsed = Duration::default();
     let mut candidate_matches = 0usize;
-    let input_target_path = input.target_path.to_string_lossy().to_string();
+    let input_target_path = logical_target_path(dest, &input.target_path)?;
     for candidate_id in candidate_ids {
         let candidate = load_target_by_id(conn, candidate_id)?;
         if candidate.target_path == input_target_path
@@ -905,7 +1089,7 @@ fn process_catalog_input(
         let candidate_features = feature_loader.load(
             conn,
             FeatureRequest {
-                path: Path::new(&candidate.target_path),
+                path: &resolve_physical_path(dest, &candidate.target_path),
                 mime_type: &candidate.mime_type,
                 exact_hash: &candidate.exact_hash,
                 size_bytes: candidate.size_bytes,
@@ -948,8 +1132,8 @@ fn process_catalog_input(
 
     let db_tx_started = Instant::now();
     let tx = conn.transaction()?;
-    upsert_catalog_item(&tx, &input, &visual, group_status)?;
-    let inserted = load_target_by_path(&tx, input.target_path.as_path())?;
+    upsert_catalog_item(&tx, dest, &input, &visual, group_status)?;
+    let inserted = load_target_by_path(&tx, dest, input.target_path.as_path())?;
     let target_row = if matches.is_empty() {
         tx.execute(
             "UPDATE target_items SET is_group_primary = 1 WHERE id = ?1",
@@ -1065,6 +1249,7 @@ fn copy_to_target(source: &Path, target: &Path) -> Result<()> {
 
 fn upsert_catalog_item(
     tx: &Connection,
+    dest: &Path,
     input: &CatalogInput,
     visual: &VisualFeatures,
     group_status: &str,
@@ -1091,7 +1276,7 @@ fn upsert_catalog_item(
             END
         "#,
         params![
-            input.target_path.to_string_lossy(),
+            logical_target_path(dest, &input.target_path)?,
             input.size_bytes,
             input.mime_type,
             input.created_at,
@@ -1133,6 +1318,36 @@ fn load_existing_target_facts(conn: &Connection) -> Result<HashMap<String, Exist
     Ok(rows)
 }
 
+fn normalize_catalog_target_paths(conn: &Connection, dest: &Path) -> Result<usize> {
+    let mut stmt = conn.prepare("SELECT id, target_path FROM target_items ORDER BY id")?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut updates = Vec::new();
+    for (id, target_path) in rows {
+        let physical = resolve_physical_path(dest, &target_path);
+        let logical = logical_target_path(dest, &physical)?;
+        if logical != target_path {
+            updates.push((id, logical));
+        }
+    }
+
+    if updates.is_empty() {
+        return Ok(0);
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut update = tx.prepare("UPDATE target_items SET target_path = ?1 WHERE id = ?2")?;
+        for (id, logical) in &updates {
+            update.execute(params![logical, id])?;
+        }
+    }
+    tx.commit()?;
+    tracing::info!(normalized_target_paths = updates.len(), "normalized catalog target paths");
+    Ok(updates.len())
+}
+
 fn extract_modified_at(meta_json: &str) -> Option<String> {
     let value: Value = serde_json::from_str(meta_json).ok()?;
     value
@@ -1160,10 +1375,10 @@ fn map_target_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TargetRow> {
     })
 }
 
-fn load_target_by_path(conn: &Connection, target_path: &Path) -> Result<TargetRow> {
+fn load_target_by_path(conn: &Connection, dest: &Path, target_path: &Path) -> Result<TargetRow> {
     conn.query_row(
         &format!("SELECT {TARGET_ROW_SELECT_COLUMNS} FROM target_items WHERE target_path = ?1"),
-        params![target_path.to_string_lossy()],
+        params![logical_target_path(dest, target_path)?],
         map_target_row,
     )
     .context("load target row by path")
@@ -1244,6 +1459,7 @@ fn choose_primary_member(rows: &[TargetRow]) -> Result<i64> {
 mod tests {
     use super::*;
     use crate::db::open_catalog_db;
+    use crate::util::logical_target_path;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -1319,7 +1535,10 @@ mod tests {
         let imported_paths: i64 = catalog
             .query_row(
                 "SELECT COUNT(*) FROM target_items WHERE target_path LIKE ?1",
-                [format!("{}%", dest.display())],
+                [format!(
+                    "{}%",
+                    dest.file_name().unwrap().to_string_lossy()
+                )],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1426,15 +1645,15 @@ mod tests {
         assert_eq!(
             paths,
             vec![
-                a.to_string_lossy().to_string(),
-                b.to_string_lossy().to_string(),
-                g.to_string_lossy().to_string(),
-                h.to_string_lossy().to_string(),
-                e.to_string_lossy().to_string(),
-                f.to_string_lossy().to_string(),
-                c.to_string_lossy().to_string(),
-                d.to_string_lossy().to_string(),
-                i.to_string_lossy().to_string()
+                logical_target_path(&dest, &a).unwrap(),
+                logical_target_path(&dest, &b).unwrap(),
+                logical_target_path(&dest, &g).unwrap(),
+                logical_target_path(&dest, &h).unwrap(),
+                logical_target_path(&dest, &e).unwrap(),
+                logical_target_path(&dest, &f).unwrap(),
+                logical_target_path(&dest, &c).unwrap(),
+                logical_target_path(&dest, &d).unwrap(),
+                logical_target_path(&dest, &i).unwrap()
             ]
         );
     }
@@ -1451,10 +1670,11 @@ mod tests {
         initcache(&catalog_db, &dest, 14, 6).unwrap();
 
         let catalog = open_catalog_db(&catalog_db).unwrap();
+        let image_path = logical_target_path(&dest, &image).unwrap();
         let meta_json: String = catalog
             .query_row(
                 "SELECT meta_json FROM target_items WHERE target_path = ?1",
-                params![image.to_string_lossy().to_string()],
+                params![image_path],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1478,7 +1698,7 @@ mod tests {
         initcache(&catalog_db, &dest, 14, 6).unwrap();
 
         let catalog = open_catalog_db(&catalog_db).unwrap();
-        let path = image.to_string_lossy().to_string();
+        let path = logical_target_path(&dest, &image).unwrap();
         catalog
             .execute(
                 "UPDATE target_items SET created_at = '' WHERE target_path = ?1",
@@ -1501,6 +1721,55 @@ mod tests {
     }
 
     #[test]
+    fn initcache_normalizes_legacy_absolute_target_paths() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let image = dest.join("img.jpg");
+        copy_mock_fixture("img_2023_05_01.jpg", &image);
+
+        let discovered = discover_file(&image).unwrap();
+        let catalog_db = tmp.path().join("catalog.db");
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        catalog
+            .execute(
+                r#"
+                INSERT INTO target_items (
+                    target_path, size_bytes, mime_type, created_at, exact_hash, phash, phash_bits, width, height,
+                    group_id, keep_state, is_group_primary, group_status, origin_source_id, meta_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 'undecided', 0, 'completed', NULL, ?10)
+                "#,
+                params![
+                    image.to_string_lossy().to_string(),
+                    discovered.size_bytes,
+                    discovered.mime_type,
+                    discovered.created_at,
+                    discovered.exact_hash,
+                    discovered.phash,
+                    discovered.phash_bits,
+                    discovered.width,
+                    discovered.height,
+                    discovered.meta_json,
+                ],
+            )
+            .unwrap();
+        drop(catalog);
+
+        initcache(&catalog_db, &dest, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let rows: Vec<String> = catalog
+            .prepare("SELECT target_path FROM target_items")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], logical_target_path(&dest, &image).unwrap());
+    }
+
+    #[test]
     fn initcache_repairs_missing_primary_for_touched_pending_group() {
         let tmp = tempdir().unwrap();
         let dest = tmp.path().join("dest");
@@ -1516,10 +1785,11 @@ mod tests {
         initcache(&catalog_db, &dest, 14, 6).unwrap();
 
         let catalog = open_catalog_db(&catalog_db).unwrap();
+        let logical_a = logical_target_path(&dest, &a).unwrap();
         let group_id: i64 = catalog
             .query_row(
                 "SELECT group_id FROM target_items WHERE target_path = ?1",
-                params![a.to_string_lossy().to_string()],
+                params![logical_a],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1551,6 +1821,84 @@ mod tests {
 
         assert_eq!(primary_count, 1);
         assert_eq!(completed_count, 2);
+    }
+
+    #[test]
+    fn initcache_removes_missing_rows_and_orphaned_feature_cache() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+
+        let a = dest.join("2024-06-09_a.jpg");
+        let b = dest.join("2024-06-09_b.jpg");
+        copy_source_fixture("DSC00903.thumb.jpg", &a);
+        fs::copy(&a, &b).unwrap();
+        append_trailing_byte(&b);
+
+        let catalog_db = tmp.path().join("catalog.db");
+        initcache(&catalog_db, &dest, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let logical_b = logical_target_path(&dest, &b).unwrap();
+        let logical_a = logical_target_path(&dest, &a).unwrap();
+        let deleted_key: (String, i64) = catalog
+            .query_row(
+                "SELECT exact_hash, size_bytes FROM target_items WHERE target_path = ?1",
+                params![logical_b],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let remaining_key: (String, i64) = catalog
+            .query_row(
+                "SELECT exact_hash, size_bytes FROM target_items WHERE target_path = ?1",
+                params![logical_a],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let cached_before: i64 = catalog
+            .query_row("SELECT COUNT(*) FROM feature_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cached_before, 2);
+        drop(catalog);
+
+        fs::remove_file(&b).unwrap();
+
+        initcache(&catalog_db, &dest, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let count: i64 = catalog
+            .query_row("SELECT COUNT(*) FROM target_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let remaining_group: (Option<i64>, String, i64) = catalog
+            .query_row(
+                "SELECT group_id, keep_state, is_group_primary FROM target_items WHERE target_path = ?1",
+                params![logical_a],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(remaining_group.0, None);
+        assert_eq!(remaining_group.1, "undecided");
+        assert_eq!(remaining_group.2, 0);
+
+        let deleted_cache_count: i64 = catalog
+            .query_row(
+                "SELECT COUNT(*) FROM feature_cache WHERE exact_hash = ?1 AND size_bytes = ?2",
+                params![deleted_key.0, deleted_key.1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted_cache_count, 0);
+
+        let remaining_cache_count: i64 = catalog
+            .query_row(
+                "SELECT COUNT(*) FROM feature_cache WHERE exact_hash = ?1 AND size_bytes = ?2",
+                params![remaining_key.0, remaining_key.1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_cache_count, 1);
     }
 
     #[cfg(unix)]

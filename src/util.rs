@@ -12,6 +12,12 @@ pub fn canonicalize_for_check(path: impl AsRef<Path>) -> Result<PathBuf> {
         .with_context(|| format!("canonicalize {}", path.as_ref().display()))
 }
 
+pub fn target_root_name(dest: &Path) -> Result<&std::ffi::OsStr> {
+    dest.file_name()
+        .filter(|name| !name.is_empty())
+        .with_context(|| format!("destination root {} has no final path component", dest.display()))
+}
+
 pub fn ensure_under_root(root: &Path, candidate: &Path) -> Result<()> {
     let root = canonicalize_for_check(root)?;
     let candidate = canonicalize_for_check(candidate)?;
@@ -26,9 +32,9 @@ pub fn ensure_under_root(root: &Path, candidate: &Path) -> Result<()> {
     }
 }
 
-/// The "logical root" for target_path storage is the parent of the --dest directory.
-/// For example, if --dest is "repo", the target_path in DB is "repo/2023/xxx.jpg".
-/// To find it physically, we join the parent of --dest with "repo/2023/xxx.jpg".
+/// The "logical root" for target_path storage is the final path component of `--dest`.
+/// For example, both `--dest repo` and `--dest /root/a/b/repo` store `target_path`
+/// as `repo/2023/xxx.jpg`.
 pub fn target_base_path(dest: &Path) -> PathBuf {
     match dest.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -36,9 +42,41 @@ pub fn target_base_path(dest: &Path) -> PathBuf {
     }
 }
 
+/// Converts a physical path under `--dest` into the logical `target_items.target_path`
+/// representation stored in SQLite.
+pub fn logical_target_path(dest: &Path, physical_path: &Path) -> Result<String> {
+    let root_name = target_root_name(dest)?;
+    let relative = physical_path.strip_prefix(dest).with_context(|| {
+        format!(
+            "path {} is not under destination root {}",
+            physical_path.display(),
+            dest.display()
+        )
+    })?;
+    Ok(PathBuf::from(root_name)
+        .join(relative)
+        .to_string_lossy()
+        .to_string())
+}
+
 /// Resolves a logical target_path from the database to a physical path on disk.
 pub fn resolve_physical_path(dest: &Path, target_path: &str) -> PathBuf {
-    target_base_path(dest).join(target_path)
+    let target = Path::new(target_path);
+    if target.is_absolute() {
+        return target.to_path_buf();
+    }
+
+    let root_name = dest.file_name().filter(|name| !name.is_empty());
+    let starts_with_root = root_name
+        .and_then(|root| target.components().next().map(|component| (root, component)))
+        .map(|(root, component)| matches!(component, Component::Normal(part) if part == root))
+        .unwrap_or(false);
+
+    if starts_with_root {
+        target_base_path(dest).join(target)
+    } else {
+        dest.join(target)
+    }
 }
 
 /// A centralized check for ensuring a path is safely under the target root.
@@ -902,6 +940,10 @@ mod tests {
         let target_path = "repo/2023/05/01/img.jpg";
         let physical = resolve_physical_path(&dest, target_path);
         assert_eq!(physical, tmp.path().join(target_path));
+        assert_eq!(
+            logical_target_path(&dest, &physical).unwrap(),
+            target_path
+        );
 
         // 3. ensure_under_target_root safety check
         let safe_file = tmp.path().join("repo/safe.jpg");
@@ -921,5 +963,9 @@ mod tests {
         // target_base_path("repo") -> "."
         assert_eq!(target_base_path(dest), Path::new("."));
         assert_eq!(resolve_physical_path(dest, "repo/a.jpg"), Path::new("./repo/a.jpg"));
+        assert_eq!(
+            logical_target_path(dest, Path::new("repo/a.jpg")).unwrap(),
+            "repo/a.jpg"
+        );
     }
 }

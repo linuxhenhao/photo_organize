@@ -149,6 +149,8 @@ cargo run -- initcache \
 Important behavior:
 
 - it scans target-file facts directly into `catalog.db.target_items`
+- `target_items.target_path` is always stored as a logical path rooted at the final `--dest` directory name
+  for example, both `--dest repo` and `--dest /root/a/b/repo` store paths like `repo/2025/01/02/file.jpg`
 - it does not depend on a persistent target-side `source_items` database
 - repeated runs reuse prior facts when file size and stored mtime are unchanged
 
@@ -185,6 +187,7 @@ The UI serves group pages from `catalog.db`, supports page navigation with `page
 Main target-side database. Important tables include:
 
 - `target_items`: current files in the target library plus group and keep state
+  `target_path` uses a logical `DEST_BASENAME/...` form instead of an absolute filesystem path
 - `feature_cache`: persisted AKAZE cache keyed by content hash and size
 - `operations_log`: audit log for review actions
 

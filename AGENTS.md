@@ -40,6 +40,8 @@ Current internal structure also includes:
 
 - **`catalog.db`**: The central repository for the organized collection.
     - `target_items`: Current state of all files in the target directory, including `group_id`, `keep_state`, and `group_status`.
+      - `target_path`: Store logical paths rooted at the final `--dest` directory name, not absolute filesystem paths.
+        For example, both `--dest repo` and `--dest /root/a/b/repo` should persist `repo/2025/01/02/file.jpg`.
       - `group_status`: Flow-control column used by `initcache`. Starts as `'pending'` on ingest, then serially flipped to `'completed'` after grouping. The pre-warm and grouping passes only process rows where `group_status = 'pending'`.
       - `keep_state`: One of `'undecided'`, `'kept'`, or `'rejected'`. Set by `serve` resolution and used to filter unresolved groups.
       - `is_group_primary`: Marks the preferred representative in a duplicate group.
