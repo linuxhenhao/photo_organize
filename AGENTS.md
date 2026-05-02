@@ -60,6 +60,7 @@ When touching duplicate matching:
 - Treat `exact_hash`, `pHash`, `phash_bits`, and image dimensions as base item attributes stored on `source_items` or `target_items`, not as second-stage feature-cache payload.
 - Do not make callers care whether second-stage AKAZE data came from memory, SQLite, or a fresh decode; `feature_loader` owns that decision.
 - Cache keys for persisted AKAZE data must be content-based, not path-based. Use file content hash plus size so renamed or re-adopted files can reuse the expensive second-stage work safely.
+- Before editing any `target_items` upsert or regroup/adoption write path, read `docs/target-field-overwrite-risks.md`. `created_at` and `meta_json.fingerprint.modified_at` must be preserved unless the code is explicitly recomputing them; empty incoming values should not silently overwrite the stored value.
 
 ## Dup Improvements
 When investigating or fixing duplicate-grouping mistakes, first capture a stable local snapshot of the remote group before changing matcher logic.

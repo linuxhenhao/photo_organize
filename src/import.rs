@@ -475,7 +475,10 @@ fn write_ingest_batch(conn: &mut Connection, dest: &Path, batch: &[DiscoveredFil
             ON CONFLICT(target_path) DO UPDATE SET
                 size_bytes = excluded.size_bytes,
                 mime_type = excluded.mime_type,
-                created_at = excluded.created_at,
+                created_at = CASE
+                    WHEN excluded.created_at != '' THEN excluded.created_at
+                    ELSE target_items.created_at
+                END,
                 exact_hash = excluded.exact_hash,
                 phash = excluded.phash,
                 phash_bits = excluded.phash_bits,
@@ -1295,7 +1298,10 @@ fn upsert_catalog_item(
         ON CONFLICT(target_path) DO UPDATE SET
             size_bytes = excluded.size_bytes,
             mime_type = excluded.mime_type,
-            created_at = excluded.created_at,
+            created_at = CASE
+                WHEN excluded.created_at != '' THEN excluded.created_at
+                ELSE target_items.created_at
+            END,
             exact_hash = excluded.exact_hash,
             phash = excluded.phash,
             phash_bits = excluded.phash_bits,
@@ -1693,30 +1699,52 @@ mod tests {
     }
 
     #[test]
-    fn initcache_preserves_fingerprint_meta_json() {
+    fn initcache_preserves_created_at_and_fingerprint_meta_json() {
         let tmp = tempdir().unwrap();
         let dest = tmp.path().join("dest");
         fs::create_dir_all(&dest).unwrap();
         let image = dest.join("img.jpg");
         copy_mock_fixture("img_2023_05_01.jpg", &image);
+        let expected_created_at = discover_file(&image).unwrap().created_at;
 
         let catalog_db = tmp.path().join("catalog.db");
         initcache(&catalog_db, &dest, 14, 6).unwrap();
 
         let catalog = open_catalog_db(&catalog_db).unwrap();
         let image_path = logical_target_path(&dest, &image).unwrap();
+        let created_at: String = catalog
+            .query_row(
+                "SELECT created_at FROM target_items WHERE target_path = ?1",
+                params![image_path.clone()],
+                |row| row.get(0),
+            )
+            .unwrap();
         let meta_json: String = catalog
             .query_row(
                 "SELECT meta_json FROM target_items WHERE target_path = ?1",
-                params![image_path],
+                params![image_path.clone()],
                 |row| row.get(0),
             )
             .unwrap();
 
+        assert_eq!(created_at, expected_created_at);
         assert!(
             extract_modified_at(&meta_json).is_some(),
             "expected initcache regrouping to preserve fingerprint.modified_at, got {meta_json}"
         );
+
+        drop(catalog);
+        initcache(&catalog_db, &dest, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let created_at_after: String = catalog
+            .query_row(
+                "SELECT created_at FROM target_items WHERE target_path = ?1",
+                params![image_path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(created_at_after, expected_created_at);
     }
 
     #[test]
