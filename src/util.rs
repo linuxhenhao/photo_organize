@@ -7,6 +7,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
+pub const PROFILE_ENV: &str = "PHOTO_ORG_PROFILE";
+
 pub fn canonicalize_for_check(path: impl AsRef<Path>) -> Result<PathBuf> {
     fs::canonicalize(path.as_ref())
         .with_context(|| format!("canonicalize {}", path.as_ref().display()))

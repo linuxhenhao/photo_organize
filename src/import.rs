@@ -7,8 +7,8 @@ use crate::interrupt;
 use crate::phash_index::PhashIndex;
 use crate::scan::{DiscoveredFile, collect_file_paths, discover_file, run as scan_run};
 use crate::util::{
-    ProgressReporter, date_for_target, logical_target_path, resolve_physical_path, safe_file_name,
-    system_time_to_rfc3339,
+    PROFILE_ENV, ProgressReporter, date_for_target, logical_target_path, resolve_physical_path,
+    safe_file_name, system_time_to_rfc3339,
 };
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -106,8 +106,6 @@ const TARGET_ROW_SELECT_COLUMNS: &str = r#"
     group_id, keep_state, is_group_primary, group_status
 "#;
 
-const INITCACHE_PROFILE_ENV: &str = "PHOTO_ORG_PROFILE_INITCACHE";
-
 #[derive(Debug, Clone, Default)]
 struct InitcacheProfileStats {
     input_feature_calls: usize,
@@ -127,7 +125,7 @@ struct InitcacheProfileStats {
 
 fn initcache_profiling_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os(INITCACHE_PROFILE_ENV).is_some())
+    *ENABLED.get_or_init(|| std::env::var_os(PROFILE_ENV).is_some())
 }
 
 fn initcache_profile_stats() -> Option<&'static Mutex<InitcacheProfileStats>> {
@@ -183,7 +181,7 @@ fn log_initcache_profile(scan_elapsed: Duration, adopt_elapsed: Duration, total_
         candidate_matches = stats.candidate_matches,
         db_tx_calls = stats.db_tx_calls,
         db_tx_elapsed_ms = stats.db_tx_elapsed.as_millis(),
-        profile_env = INITCACHE_PROFILE_ENV,
+        profile_env = PROFILE_ENV,
         "initcache profile summary"
     );
 }

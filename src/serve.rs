@@ -1,7 +1,7 @@
-use crate::db::{insert_operation, open_catalog_db};
+use crate::db::{insert_operation, open_catalog_db, open_catalog_db_readonly};
 use crate::interrupt;
 use crate::util::{
-    best_effort_mime, date_for_target, ensure_under_root, ensure_under_target_root,
+    PROFILE_ENV, best_effort_mime, date_for_target, ensure_under_root, ensure_under_target_root,
     logical_target_path, remove_empty_parent_dirs, resolve_physical_path, safe_file_name,
 };
 use anyhow::Result;
@@ -20,6 +20,8 @@ use std::fs;
 use std::future::Future;
 use std::io::Cursor;
 use std::path::{Component, Path as StdPath, PathBuf};
+use std::time::Instant;
+use std::sync::OnceLock;
 use tokio::net::TcpListener;
 
 static UGOS_MODE: Lazy<bool> = Lazy::new(detect_ugos_system);
@@ -27,6 +29,11 @@ static UGOS_MODE: Lazy<bool> = Lazy::new(detect_ugos_system);
 fn detect_ugos_system() -> bool {
     let sentinels = ["/usr/ugreen", "/ugreen", "/etc/sysconfig/thumb_core.sh"];
     sentinels.iter().any(|p| StdPath::new(p).exists())
+}
+
+fn serve_profiling_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os(PROFILE_ENV).is_some())
 }
 
 #[derive(Clone)]
@@ -121,6 +128,7 @@ struct ImageQuery {
 }
 
 pub async fn run(db: PathBuf, dest: PathBuf, host: String, port: u16) -> Result<()> {
+    open_catalog_db(&db)?;
     let state = AppState { db_path: db, dest };
     let app = router(state);
     let listener = TcpListener::bind((host.as_str(), port)).await?;
@@ -915,7 +923,7 @@ async fn list_groups(
     State(state): State<AppState>,
     Query(params): Query<GroupParams>,
 ) -> Result<Json<PagedGroups>, (StatusCode, String)> {
-    let conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
+    let conn = open_catalog_db_readonly(&state.db_path).map_err(internal_error)?;
     let paging = normalize_group_params(&params);
     let page_size = paging.page_size;
     let requested_page_index = paging.page_index;
@@ -1362,7 +1370,7 @@ async fn archive_group(
     Path(id): Path<i64>,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
+    let conn = open_catalog_db_readonly(&state.db_path).map_err(internal_error)?;
     let group = load_group_members(&conn, id).map_err(internal_error)?;
     Ok(Json(json!({ "group_id": id, "members": group })))
 }
@@ -1372,6 +1380,7 @@ fn delete_trash_members_by_ids(
     dest: &PathBuf,
     member_ids: &[i64],
 ) -> Result<serde_json::Value, (StatusCode, String)> {
+    let started = Instant::now();
     if member_ids.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "no member ids provided".into()));
     }
@@ -1382,8 +1391,10 @@ fn delete_trash_members_by_ids(
         .copied()
         .filter(|member_id| seen.insert(*member_id))
         .collect::<Vec<_>>();
+    let dedupe_elapsed = started.elapsed();
 
     let mut members = Vec::new();
+    let member_load_started = Instant::now();
     for member_id in &unique_member_ids {
         let member = conn
             .query_row(
@@ -1423,9 +1434,11 @@ fn delete_trash_members_by_ids(
         }
         members.push(member);
     }
+    let member_load_elapsed = member_load_started.elapsed();
 
     let mut deleted = Vec::new();
     let photo_org_root = dest.join(".photo-org");
+    let fs_delete_started = Instant::now();
     for (member, group_id) in &members {
         let member_path = resolve_physical_path(dest, &member.target_path);
         let file_deleted = if member_path.exists() {
@@ -1451,7 +1464,9 @@ fn delete_trash_members_by_ids(
             "file_deleted": file_deleted
         }));
     }
+    let fs_delete_elapsed = fs_delete_started.elapsed();
 
+    let tx_started = Instant::now();
     let tx = conn.transaction().map_err(internal_error)?;
     for (member, _) in &members {
         tx.execute(
@@ -1460,6 +1475,7 @@ fn delete_trash_members_by_ids(
         )
         .map_err(internal_error)?;
     }
+    let row_delete_elapsed = tx_started.elapsed();
 
     let mut touched_groups = HashSet::new();
     for (_, group_id) in &members {
@@ -1469,6 +1485,7 @@ fn delete_trash_members_by_ids(
     }
 
     let mut group_results = Vec::new();
+    let group_repair_started = Instant::now();
     for group_id in touched_groups {
         let remaining = load_group_members(&tx, group_id).map_err(internal_error)?;
         let group_cleared = remaining.len() <= 1;
@@ -1495,7 +1512,9 @@ fn delete_trash_members_by_ids(
             "remaining_members": remaining.len()
         }));
     }
+    let group_repair_elapsed = group_repair_started.elapsed();
 
+    let op_log_started = Instant::now();
     insert_operation(
         &tx,
         "delete_trash_member",
@@ -1506,7 +1525,28 @@ fn delete_trash_members_by_ids(
         .to_string(),
     )
     .map_err(internal_error)?;
+    let op_log_elapsed = op_log_started.elapsed();
+    let commit_started = Instant::now();
     tx.commit().map_err(internal_error)?;
+    let commit_elapsed = commit_started.elapsed();
+
+    if serve_profiling_enabled() {
+        tracing::info!(
+            member_count = unique_member_ids.len(),
+            deleted_count = deleted.len(),
+            touched_groups = group_results.len(),
+            dedupe_ms = dedupe_elapsed.as_millis(),
+            member_load_ms = member_load_elapsed.as_millis(),
+            fs_delete_ms = fs_delete_elapsed.as_millis(),
+            row_delete_ms = row_delete_elapsed.as_millis(),
+            group_repair_ms = group_repair_elapsed.as_millis(),
+            op_log_ms = op_log_elapsed.as_millis(),
+            commit_ms = commit_elapsed.as_millis(),
+            total_ms = started.elapsed().as_millis(),
+            profile_env = PROFILE_ENV,
+            "serve delete_trash profile"
+        );
+    }
 
     Ok(json!({
         "status": "ok",

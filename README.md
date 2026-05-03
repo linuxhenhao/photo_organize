@@ -157,7 +157,7 @@ Important behavior:
 Optional profiling summary:
 
 ```bash
-PHOTO_ORG_PROFILE_INITCACHE=1 cargo run -- initcache --db /path/to/catalog.db --dest /path/to/library
+PHOTO_ORG_PROFILE=1 cargo run -- initcache --db /path/to/catalog.db --dest /path/to/library
 ```
 
 ### 4. Serve

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::path::Path;
 
 pub const FEATURE_VERSION: i64 = 7;
@@ -7,7 +7,7 @@ pub const FEATURE_VERSION: i64 = 7;
 pub fn open_scan_db(path: impl AsRef<Path>) -> Result<Connection> {
     let conn = Connection::open(path.as_ref())
         .with_context(|| format!("open scan db {}", path.as_ref().display()))?;
-    configure(&conn)?;
+    configure_writable(&conn)?;
     init_scan_schema(&conn)?;
     Ok(conn)
 }
@@ -15,15 +15,36 @@ pub fn open_scan_db(path: impl AsRef<Path>) -> Result<Connection> {
 pub fn open_catalog_db(path: impl AsRef<Path>) -> Result<Connection> {
     let conn = Connection::open(path.as_ref())
         .with_context(|| format!("open catalog db {}", path.as_ref().display()))?;
-    configure(&conn)?;
+    configure_writable(&conn)?;
     init_catalog_schema(&conn)?;
     Ok(conn)
 }
 
-fn configure(conn: &Connection) -> Result<()> {
+pub fn open_catalog_db_readonly(path: impl AsRef<Path>) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path.as_ref(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open readonly catalog db {}", path.as_ref().display()))?;
+    configure_readonly(&conn)?;
+    Ok(conn)
+}
+
+fn configure_writable(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "busy_timeout", 5000_i64)?;
+    configure_common(conn)?;
+    Ok(())
+}
+
+fn configure_readonly(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    configure_common(conn)?;
+    Ok(())
+}
+
+fn configure_common(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
 }
 
