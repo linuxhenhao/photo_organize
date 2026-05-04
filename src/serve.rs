@@ -12,10 +12,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use image::ImageFormat;
 use once_cell::sync::Lazy;
+use regex::Regex;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::io::Cursor;
@@ -74,6 +75,42 @@ struct GroupMember {
     height: i64,
     size_bytes: i64,
 }
+
+#[derive(Clone, Debug)]
+struct FilenameReviewGroup {
+    review_group_id: i64,
+    default_member_id: i64,
+    members: Vec<MemberRow>,
+}
+
+#[derive(Clone, Debug)]
+struct FilenameReviewCandidate {
+    member: MemberRow,
+    keys: Vec<String>,
+    derived: bool,
+}
+
+static TIMESTAMP_TOKEN_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)(\d{8})[-_](\d{6})").expect("valid timestamp token regex"));
+static TIMESTAMP_DERIVED_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^(\d{8})-(\d{6})(?:-\d+)?$").expect("valid timestamp derived regex")
+});
+static TIMESTAMP_MILLIS_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^(\d{8})-(\d{6})\d{3,}$").expect("valid timestamp millis regex")
+});
+static DEFAULT_NUMERIC_SUFFIX_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)-\d+$").expect("valid default numeric suffix regex"));
+static DEFAULT_LEADING_INDEX_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)^\d+-").expect("valid default leading index regex"));
+static DEFAULT_TRAILING_FAMILY_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)_(shotwell|embedded(?:_\d+)*)$").expect("valid default trailing family regex")
+});
+static DEFAULT_RAW_HINT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)_(arw|cr2|jpg|jpeg|png)$").expect("valid default raw hint regex")
+});
+static IMG_SAME_ID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^img_\d{8}_\d{6}_(\d{3,5})$").expect("valid img same id regex")
+});
 
 #[derive(Debug, Deserialize)]
 struct GroupParams {
@@ -162,6 +199,14 @@ fn normalize_group_params(params: &GroupParams) -> PagingRequest {
         group_id: params.group_id,
         review_mode: params.view.clone().unwrap_or_else(|| "pending".to_string()),
     }
+}
+
+fn is_trash_review_mode(review_mode: &str) -> bool {
+    review_mode == "trash"
+}
+
+fn is_filename_default_review_mode(review_mode: &str) -> bool {
+    review_mode == "filename"
 }
 
 fn router(state: AppState) -> Router {
@@ -399,12 +444,26 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
       return pagedData.review_mode === 'trash';
     }
 
+    function isFilenameReviewMode() {
+      return pagedData.review_mode === 'filename';
+    }
+
+    function isPendingLikeReviewMode() {
+      return !isTrashReviewMode();
+    }
+
+    function reviewModeLabel() {
+      if (isTrashReviewMode()) return 'trash-review';
+      if (isFilenameReviewMode()) return 'filename-review';
+      return 'pending';
+    }
+
     function syncBrowserUrl() {
       const url = new URL(window.location.href);
       url.searchParams.set('page_index', String(pagedData.page_index));
       url.searchParams.set('page_size', String(pagedData.page_size));
-      if (isTrashReviewMode()) {
-        url.searchParams.set('view', 'trash');
+      if (pagedData.review_mode !== 'pending') {
+        url.searchParams.set('view', pagedData.review_mode);
       } else {
         url.searchParams.delete('view');
       }
@@ -421,14 +480,15 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
     function renderHeaderStats() {
       const modeActions = `
         <div class="header-mode-actions">
-          <button class="header-mode-btn" onclick="setReviewMode('pending')" ${!isTrashReviewMode() ? 'disabled' : ''}>Pending review</button>
+          <button class="header-mode-btn" onclick="setReviewMode('pending')" ${pagedData.review_mode === 'pending' ? 'disabled' : ''}>Pending review</button>
+          <button class="header-mode-btn" onclick="setReviewMode('filename')" ${isFilenameReviewMode() ? 'disabled' : ''}>Filename review</button>
           <button class="header-mode-btn" onclick="setReviewMode('trash')" ${isTrashReviewMode() ? 'disabled' : ''}>Trash review</button>
         </div>
       `;
       if (pagedData.total_groups === 0) {
         const emptyLabel = pagedData.group_id
           ? `Group ${pagedData.group_id} not found`
-          : (isTrashReviewMode() ? 'No trash-review groups' : 'No pending groups');
+          : (isTrashReviewMode() ? 'No trash-review groups' : (isFilenameReviewMode() ? 'No filename-review groups' : 'No pending groups'));
         statsHeader.innerHTML = `<div class="header-stats">${modeActions}<div class="header-pill">${emptyLabel}</div></div>`;
         return;
       }
@@ -436,7 +496,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
       const trashMembers = pagedData.groups.reduce((sum, group) => sum + group.members.filter(isTrashMember).length, 0);
       const scopePill = pagedData.group_id
         ? `<div class="header-pill">Group filter ${pagedData.group_id}</div>`
-        : `<div class="header-pill">${pagedData.total_groups} ${isTrashReviewMode() ? 'trash-review' : 'pending'} groups</div>`;
+        : `<div class="header-pill">${pagedData.total_groups} ${reviewModeLabel()} groups</div>`;
       statsHeader.innerHTML = `
         <div class="header-stats">
           ${modeActions}
@@ -465,8 +525,8 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         if (groupId !== null && groupId !== undefined && groupId !== '') {
           params.set('group_id', String(groupId));
         }
-        if (reviewMode === 'trash') {
-          params.set('view', 'trash');
+        if (reviewMode !== 'pending') {
+          params.set('view', reviewMode);
         }
         const resp = await fetch(`/api/groups?${params.toString()}`);
         pagedData = await resp.json();
@@ -508,16 +568,17 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         <div class="toolbar">
           <div class="toolbar-block pagination">
             <button class="page-btn" ${pagedData.page_index <= 0 ? 'disabled' : ''} onclick="fetchGroups(${pagedData.page_index - 1}, ${pagedData.page_size}, pagedData.group_id, pagedData.review_mode)">Prev page</button>
-            <div class="pagination-status">${pagedData.group_id ? `Viewing group ${pagedData.group_id}` : `Page <strong>${pagedData.current_page}</strong> of ${pagedData.total_pages} with ${pagedData.total_groups} ${isTrashReviewMode() ? 'trash-review' : 'pending'} groups`}</div>
+            <div class="pagination-status">${pagedData.group_id ? `Viewing group ${pagedData.group_id}` : `Page <strong>${pagedData.current_page}</strong> of ${pagedData.total_pages} with ${pagedData.total_groups} ${reviewModeLabel()} groups`}</div>
             <button class="page-btn" ${pagedData.page_index + 1 >= pagedData.total_pages ? 'disabled' : ''} onclick="fetchGroups(${pagedData.page_index + 1}, ${pagedData.page_size}, pagedData.group_id, pagedData.review_mode)">Next page</button>
           </div>
           <div class="toolbar-block pagination-meta">
             <label class="page-size-label">page_index <input class="page-input" id="${container.id}-page-index" type="number" min="0" max="${Math.max(pagedData.total_pages - 1, 0)}" value="${pagedData.page_index}" onchange="changePageIndex(this.value)"></label>
             <label class="page-size-label">page_size <input class="page-input" id="${container.id}-page-size" type="number" min="1" max="1000" value="${pagedData.page_size}" onchange="changePageSize(this.value)"></label>
-            <label class="page-size-label">group_id <input class="page-input" id="${container.id}-group-id" type="number" min="1" value="${pagedData.group_id ?? ''}" onchange="changeGroupId(this.value)"></label>
+            <label class="page-size-label">group_id <input class="page-input" id="${container.id}-group-id" type="number" value="${pagedData.group_id ?? ''}" onchange="changeGroupId(this.value)"></label>
           </div>
           <div class="toolbar-block">
-            <button class="page-btn" onclick="setReviewMode('pending')" ${!isTrashReviewMode() ? 'disabled' : ''}>Pending review</button>
+            <button class="page-btn" onclick="setReviewMode('pending')" ${pagedData.review_mode === 'pending' ? 'disabled' : ''}>Pending review</button>
+            <button class="page-btn" onclick="setReviewMode('filename')" ${isFilenameReviewMode() ? 'disabled' : ''}>Filename review</button>
             <button class="page-btn" onclick="setReviewMode('trash')" ${isTrashReviewMode() ? 'disabled' : ''}>Trash review</button>
             ${isTrashReviewMode()
               ? `<button class="btn-bulk" onclick="deleteTrashOnPage()" ${canBulkDeleteTrash ? '' : 'disabled'}>Delete trash on this page</button>`
@@ -553,7 +614,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         return;
       }
       const nextGroupId = Number.parseInt(trimmed, 10);
-      if (!Number.isFinite(nextGroupId) || nextGroupId <= 0) {
+      if (!Number.isFinite(nextGroupId) || nextGroupId === 0) {
         renderUI();
         return;
       }
@@ -561,8 +622,8 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
     }
 
     function setReviewMode(mode) {
-      if (mode !== 'pending' && mode !== 'trash') return;
-      fetchGroups(0, pagedData.page_size, pagedData.group_id, mode);
+      if (mode !== 'pending' && mode !== 'trash' && mode !== 'filename') return;
+      fetchGroups(0, pagedData.page_size, null, mode);
     }
 
     function setKeepState(groupId, memberId, keep) {
@@ -608,6 +669,13 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
 
     function isTrashMember(member) {
       return member.target_path.includes('/.photo-org/trash/');
+    }
+
+    function groupHeading(group) {
+      if (!isFilenameReviewMode()) return `Group ${group.group_id}`;
+      const defaultMember = group.members.find(member => member.target_path.split('/').pop().toLowerCase().startsWith('default'));
+      if (!defaultMember) return `Filename group ${Math.abs(group.group_id)}`;
+      return `Filename group: ${defaultMember.target_path.split('/').pop()}`;
     }
 
     groupsContainer.addEventListener('click', (event) => {
@@ -736,10 +804,12 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         groupsContainer.innerHTML = emptyMarkup(
           pagedData.group_id ? `Group ${pagedData.group_id} not found` : 'All clear!',
           pagedData.group_id
-            ? 'No duplicate group matched that id.'
+            ? 'No review group matched that id.'
             : (isTrashReviewMode()
               ? 'No groups with trash files found. Use the header button to switch back to pending review.'
-              : 'No pending duplicate groups found. Use the header button to open trash review.')
+              : (isFilenameReviewMode()
+                ? 'No default-prefix filename review groups found. Use the header button to switch back to pending review.'
+                : 'No pending duplicate groups found. Use the header button to open filename or trash review.'))
         );
         return;
       }
@@ -753,10 +823,10 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         header.className = 'group-header';
         header.innerHTML = `
           <div class="group-heading">
-            <div class="group-id">Group ${group.group_id}</div>
+            <div class="group-id">${groupHeading(group)}</div>
             <span class="status-badge">${group.status}</span>
           </div>
-          <div class="group-summary">${group.members.length} versions to compare</div>
+          <div class="group-summary">${group.members.length} candidate file(s) to compare</div>
         `;
         groupEl.appendChild(header);
 
@@ -866,7 +936,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         if (resp.ok) {
           pagedData.groups = pagedData.groups.filter(g => g.group_id !== groupId);
           if (pagedData.groups.length === 0) {
-            fetchGroups(pagedData.page_index, pagedData.page_size, pagedData.group_id);
+            fetchGroups(pagedData.page_index, pagedData.page_size, pagedData.group_id, pagedData.review_mode);
           } else {
             renderUI();
           }
@@ -928,7 +998,18 @@ async fn list_groups(
     let page_size = paging.page_size;
     let requested_page_index = paging.page_index;
     let review_mode = paging.review_mode.as_str();
-    let review_groups_with_trash = review_mode == "trash";
+    let review_groups_with_trash = is_trash_review_mode(review_mode);
+
+    if is_filename_default_review_mode(review_mode) {
+        let all_groups = load_filename_default_review_groups(&conn).map_err(internal_error)?;
+        return Ok(Json(page_filename_review_groups(
+            all_groups,
+            page_size,
+            requested_page_index,
+            paging.group_id,
+            review_mode,
+        )));
+    }
 
     if let Some(group_id) = paging.group_id {
         let members = load_group_members(&conn, group_id).map_err(internal_error)?;
@@ -1083,6 +1164,113 @@ async fn list_groups(
     }))
 }
 
+fn page_filename_review_groups(
+    all_groups: Vec<FilenameReviewGroup>,
+    page_size: usize,
+    requested_page_index: usize,
+    requested_group_id: Option<i64>,
+    review_mode: &str,
+) -> PagedGroups {
+    if let Some(group_id) = requested_group_id {
+        let groups = all_groups
+            .into_iter()
+            .filter(|group| group.review_group_id == group_id)
+            .collect::<Vec<_>>();
+        if groups.is_empty() {
+            return PagedGroups {
+                groups: Vec::new(),
+                total_groups: 0,
+                total_pages: 0,
+                page_index: 0,
+                page_size,
+                review_mode: review_mode.to_string(),
+                current_page: 0,
+                limit: page_size,
+            };
+        }
+        return PagedGroups {
+            groups: groups
+                .into_iter()
+                .map(filename_review_group_summary)
+                .collect(),
+            total_groups: 1,
+            total_pages: 1,
+            page_index: 0,
+            page_size,
+            review_mode: review_mode.to_string(),
+            current_page: 1,
+            limit: page_size,
+        };
+    }
+
+    let total_groups = all_groups.len();
+    let total_pages = total_groups.div_ceil(page_size);
+    let page_index = if total_pages == 0 {
+        0
+    } else {
+        requested_page_index.min(total_pages - 1)
+    };
+    let offset = page_index * page_size;
+    let groups = all_groups
+        .into_iter()
+        .skip(offset)
+        .take(page_size)
+        .map(filename_review_group_summary)
+        .collect::<Vec<_>>();
+    PagedGroups {
+        groups,
+        total_groups,
+        total_pages,
+        page_index,
+        page_size,
+        review_mode: review_mode.to_string(),
+        current_page: if total_pages == 0 { 0 } else { page_index + 1 },
+        limit: page_size,
+    }
+}
+
+fn filename_review_group_summary(group: FilenameReviewGroup) -> GroupSummary {
+    GroupSummary {
+        group_id: group.review_group_id,
+        status: "pending".to_string(),
+        members: group
+            .members
+            .into_iter()
+            .map(|m| GroupMember {
+                id: m.id,
+                target_path: m.target_path,
+                mime_type: m.mime_type,
+                keep_state: m.keep_state,
+                is_group_primary: m.is_group_primary,
+                exact_hash: m.exact_hash,
+                phash: m.phash,
+                width: m.width,
+                height: m.height,
+                size_bytes: m.size_bytes,
+            })
+            .collect(),
+    }
+}
+
+fn resolve_operation_name(group_id: i64) -> &'static str {
+    if group_id < 0 {
+        "resolve_filename_group"
+    } else {
+        "resolve_group"
+    }
+}
+
+fn trash_group_dir_name(group_id: i64) -> String {
+    if group_id < 0 {
+        format!(
+            "filename-group-{}",
+            group_id.checked_neg().unwrap_or_default()
+        )
+    } else {
+        format!("group-{}", group_id)
+    }
+}
+
 fn validate_path_idempotent(
     dest: &PathBuf,
     target_path: &str,
@@ -1115,7 +1303,7 @@ fn find_in_trash(dest: &PathBuf, target_path: &str, group_id: i64) -> Option<Pat
     let trash_dir = dest
         .join(".photo-org")
         .join("trash")
-        .join(format!("group-{}", group_id));
+        .join(trash_group_dir_name(group_id));
     if !trash_dir.exists() {
         return None;
     }
@@ -1162,6 +1350,248 @@ fn trash_member_ids(group: &[MemberRow]) -> Vec<i64> {
         .filter(|member| is_logical_trash_path(StdPath::new(&member.target_path)))
         .map(|member| member.id)
         .collect()
+}
+
+fn load_filename_default_review_groups(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<FilenameReviewGroup>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, target_path, mime_type, keep_state, is_group_primary, exact_hash, phash, width, height, size_bytes, created_at
+        FROM target_items
+        WHERE keep_state = 'undecided'
+          AND group_id IS NULL
+          AND instr(target_path, '/.photo-org/trash/') = 0
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(MemberRow {
+                id: row.get(0)?,
+                target_path: row.get(1)?,
+                mime_type: row.get(2)?,
+                keep_state: row.get(3)?,
+                is_group_primary: row.get::<_, i64>(4)? != 0,
+                exact_hash: row.get(5)?,
+                phash: row.get(6)?,
+                width: row.get(7)?,
+                height: row.get(8)?,
+                size_bytes: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let candidates = rows
+        .into_iter()
+        .filter_map(filename_review_candidate)
+        .collect::<Vec<_>>();
+    let mut by_id = HashMap::new();
+    let mut key_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
+    for candidate in candidates {
+        for key in &candidate.keys {
+            key_to_ids
+                .entry(key.clone())
+                .or_default()
+                .push(candidate.member.id);
+        }
+        by_id.insert(candidate.member.id, candidate);
+    }
+
+    let mut groups = Vec::new();
+    let mut seen = HashSet::new();
+    for start_id in by_id.keys().copied().collect::<Vec<_>>() {
+        if seen.contains(&start_id) {
+            continue;
+        }
+        let mut stack = vec![start_id];
+        let mut component_ids = Vec::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            component_ids.push(id);
+            let candidate = &by_id[&id];
+            for key in &candidate.keys {
+                if let Some(neighbors) = key_to_ids.get(key) {
+                    for neighbor_id in neighbors {
+                        if !seen.contains(neighbor_id) {
+                            stack.push(*neighbor_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        if component_ids.len() < 2 {
+            continue;
+        }
+
+        let component = component_ids
+            .into_iter()
+            .filter_map(|id| by_id.get(&id).cloned())
+            .collect::<Vec<_>>();
+        if !component.iter().any(|candidate| candidate.derived) {
+            continue;
+        }
+
+        let default_member_id = component
+            .iter()
+            .filter(|candidate| is_default_prefixed_target_path(&candidate.member.target_path))
+            .map(|candidate| candidate.member.id)
+            .min()
+            .or_else(|| component.iter().filter(|candidate| candidate.derived).map(|candidate| candidate.member.id).min())
+            .unwrap_or(component[0].member.id);
+
+        let mut members = component
+            .iter()
+            .map(|candidate| {
+                let mut member = candidate.member.clone();
+                member.is_group_primary = false;
+                member
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(primary_id) = choose_best_primary_member(
+            &members
+                .iter()
+                .filter(|member| member.id != default_member_id)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .or_else(|| choose_best_primary_member(&members))
+        {
+            for member in &mut members {
+                member.is_group_primary = member.id == primary_id;
+            }
+        }
+
+        members.sort_by_key(|member| {
+            (
+                !member.is_group_primary,
+                !is_default_prefixed_target_path(&member.target_path),
+                member.created_at.clone(),
+                member.id,
+            )
+        });
+
+        groups.push(FilenameReviewGroup {
+            review_group_id: filename_review_group_id(default_member_id),
+            default_member_id,
+            members,
+        });
+    }
+
+    groups.sort_by_key(|group| {
+        let first_created = group
+            .members
+            .iter()
+            .map(|member| member.created_at.as_str())
+            .min()
+            .unwrap_or("");
+        (first_created.to_string(), group.default_member_id)
+    });
+    Ok(groups)
+}
+
+fn split_filename_stem_and_ext(target_path: &str) -> Option<(String, String)> {
+    let file_name = StdPath::new(target_path).file_name()?.to_str()?.to_lowercase();
+    let dot = file_name.rfind('.')?;
+    if dot == 0 || dot + 1 >= file_name.len() {
+        return None;
+    }
+    let stem = file_name[..dot].to_string();
+    let ext = file_name[dot + 1..].to_string();
+    Some((stem, ext))
+}
+
+fn default_prefix_base_stem(stem: &str) -> Option<String> {
+    let stem = DEFAULT_LEADING_INDEX_RE.replace(stem, "");
+    let stem = stem.as_ref();
+    let base = stem.strip_prefix("default")?;
+    let mut normalized = DEFAULT_TRAILING_FAMILY_RE.replace(base, "").to_string();
+    normalized = DEFAULT_RAW_HINT_RE.replace(&normalized, "").to_string();
+    normalized = DEFAULT_NUMERIC_SUFFIX_RE.replace(&normalized, "").to_string();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn is_default_prefixed_target_path(target_path: &str) -> bool {
+    split_filename_stem_and_ext(target_path)
+        .and_then(|(stem, _)| default_prefix_base_stem(&stem))
+        .is_some()
+}
+
+fn filename_review_candidate(member: MemberRow) -> Option<FilenameReviewCandidate> {
+    let (stem, _ext) = split_filename_stem_and_ext(&member.target_path)?;
+    let mut keys = Vec::new();
+    let mut derived = false;
+
+    if let Some(base_stem) = default_prefix_base_stem(&stem) {
+        keys.push(format!("subject:{base_stem}"));
+        if let Some(timestamp_key) = canonical_timestamp_key(&base_stem) {
+            keys.push(format!("timestamp:{timestamp_key}"));
+        }
+        derived = true;
+    } else {
+        keys.push(format!("subject:{stem}"));
+        if let Some(same_id_key) = img_same_id_subject_key(&stem) {
+            keys.push(format!("subject:{same_id_key}"));
+        }
+        if let Some(timestamp_key) = canonical_timestamp_key(&stem) {
+            keys.push(format!("timestamp:{timestamp_key}"));
+            if is_timestamp_rendition_derived(&stem) {
+                derived = true;
+            }
+        }
+    }
+
+    keys.sort();
+    keys.dedup();
+    (!keys.is_empty()).then_some(FilenameReviewCandidate {
+        member,
+        keys,
+        derived,
+    })
+}
+
+fn canonical_timestamp_key(stem: &str) -> Option<String> {
+    if let Some(caps) = TIMESTAMP_DERIVED_RE.captures(stem) {
+        return Some(format!("{}-{}", &caps[1], &caps[2]));
+    }
+    if let Some(caps) = TIMESTAMP_MILLIS_RE.captures(stem) {
+        return Some(format!("{}-{}", &caps[1], &caps[2]));
+    }
+    let caps = TIMESTAMP_TOKEN_RE.captures(stem)?;
+    Some(format!("{}-{}", &caps[1], &caps[2]))
+}
+
+fn is_timestamp_rendition_derived(stem: &str) -> bool {
+    TIMESTAMP_DERIVED_RE.is_match(stem)
+}
+
+fn img_same_id_subject_key(stem: &str) -> Option<String> {
+    let caps = IMG_SAME_ID_RE.captures(stem)?;
+    Some(format!("img_{}", &caps[1]))
+}
+
+fn filename_review_group_id(default_member_id: i64) -> i64 {
+    -default_member_id
+}
+
+fn filename_default_group_members(
+    conn: &rusqlite::Connection,
+    review_group_id: i64,
+) -> Result<Vec<MemberRow>> {
+    let default_member_id = review_group_id
+        .checked_neg()
+        .ok_or_else(|| anyhow::anyhow!("invalid filename review group id {review_group_id}"))?;
+    let groups = load_filename_default_review_groups(conn)?;
+    groups
+        .into_iter()
+        .find(|group| group.default_member_id == default_member_id)
+        .map(|group| group.members)
+        .ok_or_else(|| anyhow::anyhow!("filename review group not found: {review_group_id}"))
 }
 
 fn reserve_restore_path(
@@ -1219,7 +1649,7 @@ async fn resolve_bulk(
     let tx = conn.transaction().map_err(internal_error)?;
 
     for res in request.resolutions {
-        let group = load_group_members(&tx, res.group_id).map_err(internal_error)?;
+        let group = load_review_group_members(&tx, res.group_id).map_err(internal_error)?;
         let kept_set: HashSet<_> = res.kept.iter().collect();
         let rejected_set: HashSet<_> = res.rejected.iter().collect();
 
@@ -1265,7 +1695,7 @@ async fn resolve_bulk(
 
         insert_operation(
             &tx,
-            "resolve_group",
+            resolve_operation_name(res.group_id),
             &json!({"group_id": res.group_id, "kept": res.kept, "rejected": res.rejected, "primary": res.primary}).to_string(),
         ).map_err(internal_error)?;
     }
@@ -1280,7 +1710,7 @@ async fn resolve_group(
     Json(request): Json<ResolveRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
-    let group = load_group_members(&conn, id).map_err(internal_error)?;
+    let group = load_review_group_members(&conn, id).map_err(internal_error)?;
     if group.is_empty() {
         return Err((StatusCode::NOT_FOUND, "group not found".into()));
     }
@@ -1352,7 +1782,7 @@ async fn resolve_group(
     }
     insert_operation(
         &tx,
-        "resolve_group",
+        resolve_operation_name(id),
         &json!({"group_id": id, "kept": kept, "rejected": rejected, "primary": primary, "moved": moved_paths.iter().map(|(row_id, _, path)| json!({"id": row_id, "path": path})).collect::<Vec<_>>()})
             .to_string(),
     )
@@ -1371,7 +1801,7 @@ async fn archive_group(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let conn = open_catalog_db_readonly(&state.db_path).map_err(internal_error)?;
-    let group = load_group_members(&conn, id).map_err(internal_error)?;
+    let group = load_review_group_members(&conn, id).map_err(internal_error)?;
     Ok(Json(json!({ "group_id": id, "members": group })))
 }
 
@@ -1807,7 +2237,7 @@ fn move_to_trash(dest: &PathBuf, target_path: &str, group_id: i64) -> Result<Pat
     let trash_dir = dest
         .join(".photo-org")
         .join("trash")
-        .join(format!("group-{}", group_id));
+        .join(trash_group_dir_name(group_id));
 
     // If the file already exists at the target path, move it to trash.
     if path.exists() {
@@ -1885,6 +2315,14 @@ fn choose_best_primary_member(members: &[MemberRow]) -> Option<i64> {
             )
         })
         .map(|member| member.id)
+}
+
+fn load_review_group_members(conn: &rusqlite::Connection, group_id: i64) -> Result<Vec<MemberRow>> {
+    if group_id < 0 {
+        filename_default_group_members(conn, group_id)
+    } else {
+        load_group_members(conn, group_id)
+    }
 }
 
 fn load_group_members(conn: &rusqlite::Connection, group_id: i64) -> Result<Vec<MemberRow>> {
@@ -2003,6 +2441,59 @@ mod tests {
         .unwrap();
     }
 
+    fn insert_filename_review_rows(
+        conn: &rusqlite::Connection,
+        dest: &Path,
+        plain_rel: &str,
+        default_rel: &str,
+    ) {
+        let plain_abs = dest.join(plain_rel);
+        let default_abs = dest.join(default_rel);
+        fs::create_dir_all(plain_abs.parent().unwrap()).unwrap();
+        fs::create_dir_all(default_abs.parent().unwrap()).unwrap();
+        make_png(&plain_abs, [10, 140, 30]);
+        make_png(&default_abs, [120, 40, 10]);
+
+        conn.execute(
+            r#"
+            INSERT INTO target_items (
+                target_path, size_bytes, mime_type, created_at, exact_hash, phash, phash_bits,
+                width, height, group_id, keep_state, is_group_primary, origin_source_id, meta_json
+            ) VALUES
+                (?1, 10, 'image/png', '2024-06-09T00:00:00Z', 'plain-hash', 'plain-phash', 64, 32, 32, NULL, 'undecided', 0, NULL, '{}'),
+                (?2, 8, 'image/png', '2024-06-10T00:00:00Z', 'default-hash', 'default-phash', 64, 32, 32, NULL, 'undecided', 0, NULL, '{}')
+            "#,
+            rusqlite::params![
+                logical_target_path(dest, &plain_abs).unwrap(),
+                logical_target_path(dest, &default_abs).unwrap(),
+            ],
+        )
+        .unwrap();
+    }
+
+    fn insert_ungrouped_review_row(
+        conn: &rusqlite::Connection,
+        dest: &Path,
+        logical_rel: &str,
+        exact_hash: &str,
+        created_at: &str,
+    ) {
+        let abs = dest.join(logical_rel);
+        fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        fs::write(&abs, b"review-test-bytes").unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO target_items (
+                target_path, size_bytes, mime_type, created_at, exact_hash, phash, phash_bits,
+                width, height, group_id, keep_state, is_group_primary, origin_source_id, meta_json
+            ) VALUES
+                (?1, 10, 'image/png', ?2, ?3, 'phash', 64, 32, 32, NULL, 'undecided', 0, NULL, '{}')
+            "#,
+            rusqlite::params![logical_target_path(dest, &abs).unwrap(), created_at, exact_hash],
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn list_groups_supports_page_index_and_page_size() {
         let tmp = tempdir().unwrap();
@@ -2074,6 +2565,99 @@ mod tests {
         assert_eq!(paged["review_mode"], "trash");
         assert_eq!(paged["total_groups"], 2);
         assert_eq!(paged["groups"][0]["status"], "trash-review");
+    }
+
+    #[tokio::test]
+    async fn list_groups_supports_filename_default_review_mode() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        insert_filename_review_rows(
+            &conn,
+            &dest,
+            "2024/06/09/IMG_1234.JPG",
+            "2025/03/17/defaultimg_1234.jpg",
+        );
+
+        let app = router(AppState { db_path, dest });
+        let request = axum::http::Request::builder()
+            .uri("/api/groups?view=filename&page_index=0&page_size=10")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let paged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paged["review_mode"], "filename");
+        assert_eq!(paged["total_groups"], 1);
+        let members = paged["groups"][0]["members"].as_array().unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(paged["groups"][0]["group_id"].as_i64().unwrap() < 0);
+    }
+
+    #[tokio::test]
+    async fn filename_review_mode_includes_shotwell_and_timestamp_patterns() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        insert_ungrouped_review_row(
+            &conn,
+            &dest,
+            "2013/10/17/IMG_5786.CR2",
+            "hash-shotwell-plain",
+            "2013-10-17T00:00:00Z",
+        );
+        insert_ungrouped_review_row(
+            &conn,
+            &dest,
+            "2025/03/17/defaultimg_5786_cr2_shotwell.jpg",
+            "hash-shotwell-derived",
+            "2025-03-17T00:00:00Z",
+        );
+        insert_ungrouped_review_row(
+            &conn,
+            &dest,
+            "2019/12/19/IMG_20191219_215605.jpg",
+            "hash-ts-plain",
+            "2019-12-19T00:00:00Z",
+        );
+        insert_ungrouped_review_row(
+            &conn,
+            &dest,
+            "2019/12/19/20191219-215605-3.jpg",
+            "hash-ts-derived",
+            "2019-12-19T00:00:01Z",
+        );
+
+        let app = router(AppState { db_path, dest });
+        let request = axum::http::Request::builder()
+            .uri("/api/groups?view=filename&page_index=0&page_size=10")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let paged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paged["review_mode"], "filename");
+        assert_eq!(paged["total_groups"], 2);
+
+        let names = paged["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["members"].as_array().unwrap().iter())
+            .filter_map(|member| member["target_path"].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|path| path.contains("defaultimg_5786_cr2_shotwell")));
+        assert!(names.iter().any(|path| path.contains("20191219-215605-3")));
     }
 
     #[tokio::test]
@@ -2197,6 +2781,94 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
         assert!(html.contains(r#""review_mode":"trash""#));
+    }
+
+    #[tokio::test]
+    async fn resolve_filename_default_review_group_moves_rejected_to_trash() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("repo");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        insert_filename_review_rows(
+            &conn,
+            &dest,
+            "2024/06/09/IMG_1234.JPG",
+            "2025/03/17/defaultimg_1234.jpg",
+        );
+
+        let app = router(AppState {
+            db_path: db_path.clone(),
+            dest: dest.clone(),
+        });
+        let request = axum::http::Request::builder()
+            .uri("/api/groups?view=filename&page_index=0&page_size=10")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let paged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let group_id = paged["groups"][0]["group_id"].as_i64().unwrap();
+        let members = paged["groups"][0]["members"].as_array().unwrap();
+        let default_path = members
+            .iter()
+            .find_map(|member| {
+                let path = member["target_path"].as_str()?;
+                path.contains("defaultimg_1234").then_some(path.to_string())
+            })
+            .unwrap();
+        let plain_path = members
+            .iter()
+            .find_map(|member| {
+                let path = member["target_path"].as_str()?;
+                path.contains("IMG_1234").then_some(path.to_string())
+            })
+            .unwrap();
+
+        let resolve_request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/groups/{group_id}/resolve"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "kept": [plain_path],
+                    "rejected": [default_path],
+                    "primary": plain_path,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(resolve_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let verify = open_catalog_db(&db_path).unwrap();
+        let rows = verify
+            .prepare("SELECT target_path, keep_state, is_group_primary, group_id FROM target_items ORDER BY target_path")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert!(rows.iter().any(|(path, keep_state, _, group_id)| {
+            path.contains("/.photo-org/trash/filename-group-")
+                && path.contains("defaultimg_1234")
+                && keep_state == "rejected"
+                && group_id.is_none()
+        }));
+        assert!(rows.iter().any(|(path, keep_state, is_primary, group_id)| {
+            path.ends_with("IMG_1234.JPG")
+                && keep_state == "kept"
+                && *is_primary == 1
+                && group_id.is_none()
+        }));
     }
 
     #[tokio::test]

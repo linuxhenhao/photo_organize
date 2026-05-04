@@ -40,11 +40,11 @@ Current routes:
 - `GET /`
   Returns the embedded review page. The page accepts `page_index`, `page_size`, optional `group_id`, and optional `view=trash` query params and embeds the normalized initial paging values into the frontend bootstrap script.
 - `GET /api/groups`
-  Returns paged groups as JSON for the requested review mode. Default mode is unresolved duplicate review; `view=trash` returns groups that currently have at least one member under `.photo-org/trash/`.
+  Returns paged groups as JSON for the requested review mode. Default mode is unresolved duplicate review; `view=trash` returns groups that currently have at least one member under `.photo-org/trash/`; `view=filename` returns virtual review groups built from trusted filename-derived matches.
 - `POST /api/groups/{id}/resolve`
-  Resolves one group.
+  Resolves one group. This also accepts virtual negative ids for `filename` review groups.
 - `POST /api/groups/resolve_bulk`
-  Resolves every group on the current page in one transaction.
+  Resolves every group on the current page in one transaction, including `filename` virtual groups.
 - `POST /api/groups/{id}/delete_trash`
   Permanently deletes every trash member in one group and updates `target_items`.
 - `POST /api/groups/delete_trash_bulk`
@@ -76,6 +76,16 @@ When `view=trash` is supplied:
 - the response marks those groups with status `trash-review`
 - this is the review surface for confirming permanent deletion of trash files
 
+When `view=filename` is supplied:
+
+- the listing is built from `target_items` rows where `keep_state = 'undecided'`, `group_id IS NULL`, and the stored path is not already under `.photo-org/trash/`
+- the candidate builder uses the repo-documented trusted filename families and merges rows through connected filename keys
+- currently that includes the direct-resolvable families from the investigation notes: `default_camera`, `default_embedded`, `default_shotwell`, and `timestamp_rendition`
+- examples include `defaultimg_5794-2.cr2`, `defaultimg_5808_cr2_embedded.jpg`, `1-defaultimg_1823_cr2_shotwell.jpg`, and `20191219-215605-3.jpg`
+- extensions may differ
+- the response uses virtual negative `group_id` values derived from the `default*` row id; these ids are only for the review UI and are not written into `target_items.group_id`
+- the largest non-derived candidate is preselected as primary in the UI so operators can quickly reject derived renditions
+
 When `group_id` is supplied:
 
 - the response contains only that group
@@ -104,7 +114,7 @@ The page at `/` is a single embedded document.
 Frontend behavior:
 
 - fetches groups from `/api/groups`
-- supports switching between pending review and trash review
+- supports switching between pending review, filename review, and trash review
 - exposes that mode switch directly on the root page header so operators do not need to know query params
 - supports opening one specific group by `group_id` inside the active review mode
 - keeps transient `ui_keep` and `ui_primary` flags in browser memory
@@ -125,6 +135,12 @@ Current UX expectations:
 ## Resolve Semantics
 
 Both resolve endpoints mutate `target_items` and append an `operations_log` entry.
+
+For `filename` virtual groups:
+
+- the resolve path updates `keep_state` and `is_group_primary` on the participating rows
+- rejected files are moved into `DEST/.photo-org/trash/filename-group-<default_row_id>/`
+- the participating rows remain outside algorithmic duplicate groups; `group_id` stays null
 
 ### `POST /api/groups/{id}/resolve`
 
