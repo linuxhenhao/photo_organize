@@ -40,7 +40,7 @@ Current routes:
 - `GET /`
   Returns the embedded review page. The page accepts `page_index`, `page_size`, optional `group_id`, and optional `view=trash` query params and embeds the normalized initial paging values into the frontend bootstrap script.
 - `GET /api/groups`
-  Returns paged groups as JSON for the requested review mode. Default mode is unresolved duplicate review; `view=trash` returns groups that currently have at least one member under `.photo-org/trash/`; `view=filename` returns virtual review groups built from trusted filename-derived matches.
+  Returns paged groups as JSON for the requested review mode. Default mode is unresolved duplicate review; `view=trash` returns groups that currently have at least one member under `.photo-org/trash/`; `view=filename` returns virtual review groups built from trusted filename-derived matches; `view=filename_trash` returns virtual trash-review groups rebuilt from `.photo-org/trash/filename-group-*` files plus their matched kept-side filename candidates.
 - `POST /api/groups/{id}/resolve`
   Resolves one group. This also accepts virtual negative ids for `filename` review groups.
 - `POST /api/groups/resolve_bulk`
@@ -84,7 +84,15 @@ When `view=filename` is supplied:
 - examples include `defaultimg_5794-2.cr2`, `defaultimg_5808_cr2_embedded.jpg`, `1-defaultimg_1823_cr2_shotwell.jpg`, and `20191219-215605-3.jpg`
 - extensions may differ
 - the response uses virtual negative `group_id` values derived from the `default*` row id; these ids are only for the review UI and are not written into `target_items.group_id`
-- the largest non-derived candidate is preselected as primary in the UI so operators can quickly reject derived renditions
+- filename-family and timestamp-rendition patterns are used only to build review groups; primary preselection is then chosen by the normal member ranking rules based on image dimensions and `size_bytes`
+
+When `view=filename_trash` is supplied:
+
+- the listing starts from rows already moved under `.photo-org/trash/filename-group-*`
+- the server rebuilds a virtual group by matching those trash rows back to non-trash filename candidates using the same filename-family and timestamp-rendition logic
+- the response uses a separate virtual negative `group_id` space for these rebuilt trash groups
+- groups are shown only when at least one filename-trash row and at least one matching non-trash candidate are present
+- primary highlighting still follows image dimensions plus `size_bytes`; the filename patterns are used only to rebuild the comparison group
 
 When `group_id` is supplied:
 
@@ -114,7 +122,7 @@ The page at `/` is a single embedded document.
 Frontend behavior:
 
 - fetches groups from `/api/groups`
-- supports switching between pending review, filename review, and trash review
+- supports switching between pending review, filename review, filename trash review, and trash review
 - exposes that mode switch directly on the root page header so operators do not need to know query params
 - supports opening one specific group by `group_id` inside the active review mode
 - keeps transient `ui_keep` and `ui_primary` flags in browser memory
@@ -125,6 +133,7 @@ Frontend behavior:
 - shows `Restore` for trash members so operators can undo a prior reject decision
 - supports single-group confirm and bulk confirm for all visible groups in pending mode
 - supports single-group trash deletion and page-level trash deletion in trash review mode
+- supports page-level trash deletion plus per-file restore/delete inside filename trash review mode
 
 Current UX expectations:
 
@@ -141,6 +150,7 @@ For `filename` virtual groups:
 - the resolve path updates `keep_state` and `is_group_primary` on the participating rows
 - rejected files are moved into `DEST/.photo-org/trash/filename-group-<default_row_id>/`
 - the participating rows remain outside algorithmic duplicate groups; `group_id` stays null
+- those moved rows can later be revisited under `view=filename_trash`, where the server rebuilds a virtual trash-review group from the trashed filename item and the matching kept-side candidates
 
 ### `POST /api/groups/{id}/resolve`
 
@@ -151,6 +161,8 @@ Single-group resolve performs validation before writing:
 - every referenced path must belong to the requested group
 - `primary`, if present, must belong to the group
 - `primary`, if present, must also be included in `kept`
+- `kept` and `primary` paths must still exist at their original managed-library location; a file that already only exists under `.photo-org/trash/` cannot be re-kept through this endpoint
+- `rejected` paths are idempotent: they may still be at the original path or already be under the expected group trash directory
 
 Rejected files are moved before commit into:
 
@@ -162,11 +174,15 @@ If the SQLite transaction commit fails after files were moved, the handler attem
 
 ### `POST /api/groups/resolve_bulk`
 
-Bulk resolve applies multiple group decisions inside one transaction. It also moves rejected files into the trash tree and updates `target_path` rows to the moved location.
+Bulk resolve applies multiple group decisions one group at a time. It also moves rejected files into the trash tree and updates `target_path` rows to the moved location.
 
-Current caveat:
+Current behavior:
 
-- bulk resolve is less defensive than single-group resolve and assumes the client sent coherent per-group decisions
+- each group is validated and committed independently
+- one failing group does not block later groups in the same request
+- the response returns HTTP 200 with `status = "partial"` when some groups failed, plus an `errors` array keyed by `group_id`
+- `kept` and `primary` use the same strict source-path check as single-group resolve
+- `rejected` remains idempotent and may already be in the expected trash location
 
 ### `POST /api/groups/{group_id}/members/{member_id}/delete_trash`
 

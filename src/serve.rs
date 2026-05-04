@@ -182,6 +182,12 @@ struct ResolvedGroupSelection {
     primary_member_id: Option<i64>,
 }
 
+#[derive(Debug, Serialize)]
+struct BulkResolveGroupError {
+    group_id: i64,
+    error: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ImageQuery {
     path: String,
@@ -231,6 +237,10 @@ fn is_trash_review_mode(review_mode: &str) -> bool {
 
 fn is_filename_default_review_mode(review_mode: &str) -> bool {
     review_mode == "filename"
+}
+
+fn is_filename_trash_review_mode(review_mode: &str) -> bool {
+    review_mode == "filename_trash"
 }
 
 fn router(state: AppState) -> Router {
@@ -472,12 +482,21 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
       return pagedData.review_mode === 'filename';
     }
 
+    function isFilenameTrashReviewMode() {
+      return pagedData.review_mode === 'filename_trash';
+    }
+
+    function isTrashLikeReviewMode() {
+      return isTrashReviewMode() || isFilenameTrashReviewMode();
+    }
+
     function isPendingLikeReviewMode() {
-      return !isTrashReviewMode();
+      return !isTrashLikeReviewMode();
     }
 
     function reviewModeLabel() {
       if (isTrashReviewMode()) return 'trash-review';
+      if (isFilenameTrashReviewMode()) return 'filename-trash-review';
       if (isFilenameReviewMode()) return 'filename-review';
       return 'pending';
     }
@@ -506,13 +525,18 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         <div class="header-mode-actions">
           <button class="header-mode-btn" onclick="setReviewMode('pending')" ${pagedData.review_mode === 'pending' ? 'disabled' : ''}>Pending review</button>
           <button class="header-mode-btn" onclick="setReviewMode('filename')" ${isFilenameReviewMode() ? 'disabled' : ''}>Filename review</button>
+          <button class="header-mode-btn" onclick="setReviewMode('filename_trash')" ${isFilenameTrashReviewMode() ? 'disabled' : ''}>Filename trash</button>
           <button class="header-mode-btn" onclick="setReviewMode('trash')" ${isTrashReviewMode() ? 'disabled' : ''}>Trash review</button>
         </div>
       `;
       if (pagedData.total_groups === 0) {
         const emptyLabel = pagedData.group_id
           ? `Group ${pagedData.group_id} not found`
-          : (isTrashReviewMode() ? 'No trash-review groups' : (isFilenameReviewMode() ? 'No filename-review groups' : 'No pending groups'));
+          : (isTrashReviewMode()
+            ? 'No trash-review groups'
+            : (isFilenameTrashReviewMode()
+              ? 'No filename-trash groups'
+              : (isFilenameReviewMode() ? 'No filename-review groups' : 'No pending groups')));
         statsHeader.innerHTML = `<div class="header-stats">${modeActions}<div class="header-pill">${emptyLabel}</div></div>`;
         return;
       }
@@ -528,10 +552,10 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
             ${scopePill}
             <div class="header-pill">Page ${pagedData.current_page} / ${Math.max(pagedData.total_pages, 1)}</div>
             <div class="header-pill">${visibleMembers} items on screen</div>
-            ${isTrashReviewMode() ? `<div class="header-pill">${trashMembers} trash files on screen</div>` : ''}
+            ${isTrashLikeReviewMode() ? `<div class="header-pill">${trashMembers} trash files on screen</div>` : ''}
           </div>
           <div class="header-stats-mobile">
-            <div class="header-pill">${pagedData.group_id ? `group ${pagedData.group_id}` : `${pagedData.total_groups} groups`} • ${visibleMembers} items${isTrashReviewMode() ? ` • ${trashMembers} trash` : ''} • p${pagedData.current_page}/${Math.max(pagedData.total_pages, 1)}</div>
+            <div class="header-pill">${pagedData.group_id ? `group ${pagedData.group_id}` : `${pagedData.total_groups} groups`} • ${visibleMembers} items${isTrashLikeReviewMode() ? ` • ${trashMembers} trash` : ''} • p${pagedData.current_page}/${Math.max(pagedData.total_pages, 1)}</div>
           </div>
         </div>
       `;
@@ -603,8 +627,9 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
           <div class="toolbar-block">
             <button class="page-btn" onclick="setReviewMode('pending')" ${pagedData.review_mode === 'pending' ? 'disabled' : ''}>Pending review</button>
             <button class="page-btn" onclick="setReviewMode('filename')" ${isFilenameReviewMode() ? 'disabled' : ''}>Filename review</button>
+            <button class="page-btn" onclick="setReviewMode('filename_trash')" ${isFilenameTrashReviewMode() ? 'disabled' : ''}>Filename trash</button>
             <button class="page-btn" onclick="setReviewMode('trash')" ${isTrashReviewMode() ? 'disabled' : ''}>Trash review</button>
-            ${isTrashReviewMode()
+            ${isTrashLikeReviewMode()
               ? `<button class="btn-bulk" onclick="deleteTrashOnPage()" ${canBulkDeleteTrash ? '' : 'disabled'}>Delete trash on this page</button>`
               : `<button class="btn-bulk" onclick="confirmAllOnPage()" ${pagedData.group_id !== null && pagedData.groups.some(group => group.status !== 'pending') ? 'disabled' : ''}>Confirm all on this page</button>`}
           </div>
@@ -646,7 +671,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
     }
 
     function setReviewMode(mode) {
-      if (mode !== 'pending' && mode !== 'trash' && mode !== 'filename') return;
+      if (mode !== 'pending' && mode !== 'trash' && mode !== 'filename' && mode !== 'filename_trash') return;
       fetchGroups(0, pagedData.page_size, null, mode);
     }
 
@@ -696,10 +721,16 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
     }
 
     function groupHeading(group) {
-      if (!isFilenameReviewMode()) return `Group ${group.group_id}`;
-      const defaultMember = group.members.find(member => member.target_path.split('/').pop().toLowerCase().startsWith('default'));
-      if (!defaultMember) return `Filename group ${Math.abs(group.group_id)}`;
-      return `Filename group: ${defaultMember.target_path.split('/').pop()}`;
+      if (isFilenameReviewMode()) {
+        const defaultMember = group.members.find(member => member.target_path.split('/').pop().toLowerCase().startsWith('default'));
+        if (!defaultMember) return `Filename group ${Math.abs(group.group_id)}`;
+        return `Filename group: ${defaultMember.target_path.split('/').pop()}`;
+      }
+      if (isFilenameTrashReviewMode()) {
+        const trashMember = group.members.find(isTrashMember) ?? group.members[0];
+        return `Filename trash: ${trashMember.target_path.split('/').pop()}`;
+      }
+      return `Group ${group.group_id}`;
     }
 
     groupsContainer.addEventListener('click', (event) => {
@@ -761,7 +792,7 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
             m.ui_primary = refreshedPrimaryId !== null && m.id === refreshedPrimaryId;
           });
 
-          if (isTrashReviewMode() && !group.members.some(isTrashMember)) {
+          if (isTrashLikeReviewMode() && !group.members.some(isTrashMember)) {
             pagedData.groups = pagedData.groups.filter(g => g.group_id !== groupId);
             pagedData.total_groups = Math.max(0, pagedData.total_groups - 1);
             if (pagedData.groups.length === 0) {
@@ -831,9 +862,11 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
             ? 'No review group matched that id.'
             : (isTrashReviewMode()
               ? 'No groups with trash files found. Use the header button to switch back to pending review.'
+              : (isFilenameTrashReviewMode()
+                ? 'No filename-trash groups found. Use the header button to switch back to filename or pending review.'
               : (isFilenameReviewMode()
                 ? 'No default-prefix filename review groups found. Use the header button to switch back to pending review.'
-                : 'No pending duplicate groups found. Use the header button to open filename or trash review.'))
+                : 'No pending duplicate groups found. Use the header button to open filename or trash review.')))
         );
         return;
       }
@@ -869,13 +902,13 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
           const deleteButton = isTrashMember(member)
             ? `<button type="button" class="member-action reject" data-action="delete-trash-member" data-group-id="${group.group_id}" data-member-id="${member.id}" data-file-name="${fileName.replace(/"/g, '&quot;')}">Delete trash file</button>`
             : '';
-          const restoreButton = isTrashReviewMode() && isTrashMember(member)
+          const restoreButton = isTrashLikeReviewMode() && isTrashMember(member)
             ? `<button type="button" class="member-action keep active" data-action="restore-trash-member" data-group-id="${group.group_id}" data-member-id="${member.id}" data-file-name="${fileName.replace(/"/g, '&quot;')}">Restore</button>`
             : '';
-          const decisionButtonsDisabled = group.status !== 'pending' || isTrashReviewMode() ? 'disabled' : '';
+          const decisionButtonsDisabled = group.status !== 'pending' || isTrashLikeReviewMode() ? 'disabled' : '';
           const statusClass = member.ui_primary ? 'primary' : (member.ui_keep ? 'kept' : 'rejected');
           const statusLabel = member.ui_primary ? 'Primary' : (member.ui_keep ? 'Keep' : 'Reject');
-          const actionButtons = isTrashReviewMode()
+          const actionButtons = isTrashLikeReviewMode()
             ? `
                 <button type="button" class="member-action" onclick="showOverlay('${fullSrc}')">Preview</button>
                 ${restoreButton}
@@ -916,8 +949,8 @@ async fn index(Query(params): Query<GroupParams>) -> Html<String> {
         footer.className = 'group-footer';
         const trashCount = group.members.filter(isTrashMember).length;
         footer.innerHTML = `
-          <div class="group-stats">
-            ${isTrashReviewMode()
+            <div class="group-stats">
+            ${isTrashLikeReviewMode()
               ? `Trash review: <strong>${trashCount}</strong> file(s) ready for permanent deletion`
               : group.status === 'pending'
               ? `Keeping <strong>${keptCount}</strong>, discarding <strong>${rejectedCount}</strong>`
@@ -1027,6 +1060,18 @@ async fn list_groups(
     if is_filename_default_review_mode(review_mode) {
         let all_groups =
             load_filename_default_review_groups(&conn, &state.dest).map_err(internal_error)?;
+        return Ok(Json(page_filename_review_groups(
+            all_groups,
+            page_size,
+            requested_page_index,
+            paging.group_id,
+            review_mode,
+        )));
+    }
+
+    if is_filename_trash_review_mode(review_mode) {
+        let all_groups =
+            load_filename_trash_review_groups(&conn, &state.dest).map_err(internal_error)?;
         return Ok(Json(page_filename_review_groups(
             all_groups,
             page_size,
@@ -1257,7 +1302,7 @@ fn page_filename_review_groups(
 fn filename_review_group_summary(group: FilenameReviewGroup) -> GroupSummary {
     GroupSummary {
         group_id: group.review_group_id,
-        status: "pending".to_string(),
+        status: filename_review_group_status(&group.members),
         members: group
             .members
             .into_iter()
@@ -1274,6 +1319,14 @@ fn filename_review_group_summary(group: FilenameReviewGroup) -> GroupSummary {
                 size_bytes: m.size_bytes,
             })
             .collect(),
+    }
+}
+
+fn filename_review_group_status(members: &[MemberRow]) -> String {
+    if members.iter().any(|member| is_logical_trash_path(StdPath::new(&member.target_path))) {
+        "filename-trash-review".to_string()
+    } else {
+        "pending".to_string()
     }
 }
 
@@ -1484,15 +1537,7 @@ fn load_filename_default_review_groups(
             })
             .collect::<Vec<_>>();
 
-        if let Some(primary_id) = choose_best_primary_member(
-            &members
-                .iter()
-                .filter(|member| member.id != default_member_id)
-                .cloned()
-                .collect::<Vec<_>>(),
-        )
-        .or_else(|| choose_best_primary_member(&members))
-        {
+        if let Some(primary_id) = choose_best_primary_member(&members) {
             for member in &mut members {
                 member.is_group_primary = member.id == primary_id;
             }
@@ -1510,6 +1555,157 @@ fn load_filename_default_review_groups(
         groups.push(FilenameReviewGroup {
             review_group_id: filename_review_group_id(default_member_id),
             default_member_id,
+            members,
+        });
+    }
+
+    groups.sort_by_key(|group| {
+        let first_created = group
+            .members
+            .iter()
+            .map(|member| member.created_at.as_str())
+            .min()
+            .unwrap_or("");
+        (first_created.to_string(), group.default_member_id)
+    });
+    Ok(groups)
+}
+
+fn load_filename_trash_review_groups(
+    conn: &rusqlite::Connection,
+    dest: &StdPath,
+) -> Result<Vec<FilenameReviewGroup>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, target_path, mime_type, keep_state, is_group_primary, exact_hash, phash, width, height, size_bytes, created_at
+        FROM target_items
+        WHERE instr(target_path, '/.photo-org/trash/') = 0
+           OR instr(target_path, '/.photo-org/trash/filename-group-') > 0
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(MemberRow {
+                id: row.get(0)?,
+                target_path: row.get(1)?,
+                mime_type: row.get(2)?,
+                keep_state: row.get(3)?,
+                is_group_primary: row.get::<_, i64>(4)? != 0,
+                exact_hash: row.get(5)?,
+                phash: row.get(6)?,
+                width: row.get(7)?,
+                height: row.get(8)?,
+                size_bytes: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let candidates = rows
+        .into_iter()
+        .filter_map(|member| filename_review_candidate(dest, member))
+        .collect::<Vec<_>>();
+    let mut by_id = HashMap::new();
+    let mut key_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
+    for candidate in candidates {
+        for key in &candidate.keys {
+            key_to_ids
+                .entry(key.clone())
+                .or_default()
+                .push(candidate.member.id);
+        }
+        by_id.insert(candidate.member.id, candidate);
+    }
+
+    let trash_seed_ids = by_id
+        .values()
+        .filter(|candidate| is_filename_group_trash_target_path(&candidate.member.target_path))
+        .map(|candidate| candidate.member.id)
+        .collect::<Vec<_>>();
+
+    let mut groups = Vec::new();
+    let mut seen = HashSet::new();
+    for start_id in trash_seed_ids {
+        if seen.contains(&start_id) {
+            continue;
+        }
+        let mut stack = vec![start_id];
+        let mut component_ids = Vec::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            component_ids.push(id);
+            let candidate = &by_id[&id];
+            for key in &candidate.keys {
+                if let Some(neighbors) = key_to_ids.get(key) {
+                    for neighbor_id in neighbors {
+                        if !seen.contains(neighbor_id)
+                            && filename_review_candidates_compatible(candidate, &by_id[neighbor_id])
+                        {
+                            stack.push(*neighbor_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        if component_ids.len() < 2 {
+            continue;
+        }
+
+        let component = component_ids
+            .into_iter()
+            .filter_map(|id| by_id.get(&id).cloned())
+            .collect::<Vec<_>>();
+        if !component
+            .iter()
+            .any(|candidate| is_filename_group_trash_target_path(&candidate.member.target_path))
+        {
+            continue;
+        }
+        if !component
+            .iter()
+            .any(|candidate| !is_logical_trash_path(StdPath::new(&candidate.member.target_path)))
+        {
+            continue;
+        }
+
+        let trash_member_id = component
+            .iter()
+            .filter(|candidate| is_filename_group_trash_target_path(&candidate.member.target_path))
+            .map(|candidate| candidate.member.id)
+            .min()
+            .unwrap_or(component[0].member.id);
+
+        let mut members = component
+            .iter()
+            .map(|candidate| {
+                let mut member = candidate.member.clone();
+                member.is_group_primary = false;
+                member
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(primary_id) = choose_best_primary_member(&members) {
+            for member in &mut members {
+                member.is_group_primary = member.id == primary_id;
+            }
+        }
+
+        members.sort_by_key(|member| {
+            (
+                !member.is_group_primary,
+                is_logical_trash_path(StdPath::new(&member.target_path)),
+                member.created_at.clone(),
+                member.id,
+            )
+        });
+
+        groups.push(FilenameReviewGroup {
+            review_group_id: filename_trash_review_group_id(trash_member_id),
+            default_member_id: trash_member_id,
             members,
         });
     }
@@ -1688,11 +1884,27 @@ fn filename_review_group_id(default_member_id: i64) -> i64 {
     -default_member_id
 }
 
+fn filename_trash_review_group_id(trash_member_id: i64) -> i64 {
+    -(1_000_000_000_i64 + trash_member_id)
+}
+
+fn is_filename_trash_review_group_id(review_group_id: i64) -> bool {
+    review_group_id <= -1_000_000_000_i64
+}
+
 fn filename_default_group_members(
     conn: &rusqlite::Connection,
     dest: &StdPath,
     review_group_id: i64,
 ) -> Result<Vec<MemberRow>> {
+    if is_filename_trash_review_group_id(review_group_id) {
+        let groups = load_filename_trash_review_groups(conn, dest)?;
+        return groups
+            .into_iter()
+            .find(|group| group.review_group_id == review_group_id)
+            .map(|group| group.members)
+            .ok_or_else(|| anyhow::anyhow!("filename trash review group not found: {review_group_id}"));
+    }
     let default_member_id = review_group_id
         .checked_neg()
         .ok_or_else(|| anyhow::anyhow!("invalid filename review group id {review_group_id}"))?;
@@ -1744,22 +1956,9 @@ async fn resolve_bulk(
     let total_groups = request.resolutions.len();
     let started = Instant::now();
 
-    for res in &request.resolutions {
-        let kept_set: HashSet<_> = res.kept.iter().collect();
-        let rejected_set: HashSet<_> = res.rejected.iter().collect();
-        if !kept_set.is_disjoint(&rejected_set) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("kept and rejected sets overlap in group {}", res.group_id),
-            ));
-        }
-        for path in kept_set.iter().chain(rejected_set.iter()) {
-            validate_path_idempotent(&state.dest, path, res.group_id)?;
-        }
-    }
-
     let mut applied_groups = 0usize;
     let mut skipped_groups = 0usize;
+    let mut failed_groups = Vec::new();
 
     for (index, res) in request.resolutions.into_iter().enumerate() {
         tracing::info!(
@@ -1771,22 +1970,122 @@ async fn resolve_bulk(
             "serve resolve_bulk group start"
         );
 
-        let selection =
-            load_bulk_group_selection(&conn, &state.dest, &res).map_err(internal_error)?;
-        let group_started = Instant::now();
-        let tx = conn.transaction().map_err(internal_error)?;
-
-        let mut moved_paths = Vec::new();
-        for member in &selection.members {
-            if selection.rejected_member_ids.contains(&member.id)
-                && !is_expected_trash_member_path(&member.target_path, res.group_id)
-            {
-                let moved_to = move_to_trash(&state.dest, &member.target_path, res.group_id)
-                    .map_err(internal_error)?;
-                moved_paths.push((member.id, member.target_path.clone(), moved_to));
+        match apply_bulk_resolution_group(&mut conn, &state.dest, &res) {
+            Ok(BulkGroupOutcome::Skipped { elapsed_ms }) => {
+                skipped_groups += 1;
+                tracing::info!(
+                    group_id = res.group_id,
+                    group_index = index + 1,
+                    total_groups,
+                    elapsed_ms,
+                    "serve resolve_bulk group already satisfied"
+                );
+            }
+            Ok(BulkGroupOutcome::Applied {
+                moved_files,
+                elapsed_ms,
+            }) => {
+                applied_groups += 1;
+                tracing::info!(
+                    group_id = res.group_id,
+                    group_index = index + 1,
+                    total_groups,
+                    moved_files,
+                    elapsed_ms,
+                    completed_groups = applied_groups + skipped_groups + failed_groups.len(),
+                    remaining_groups = total_groups
+                        .saturating_sub(applied_groups + skipped_groups + failed_groups.len()),
+                    "serve resolve_bulk group committed"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    group_id = res.group_id,
+                    group_index = index + 1,
+                    total_groups,
+                    error = %error,
+                    completed_groups = applied_groups + skipped_groups + failed_groups.len() + 1,
+                    remaining_groups = total_groups
+                        .saturating_sub(applied_groups + skipped_groups + failed_groups.len() + 1),
+                    "serve resolve_bulk group failed"
+                );
+                failed_groups.push(BulkResolveGroupError {
+                    group_id: res.group_id,
+                    error,
+                });
             }
         }
+    }
 
+    tracing::info!(
+        total_groups,
+        applied_groups,
+        skipped_groups,
+        failed_groups = failed_groups.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "serve resolve_bulk finished"
+    );
+    Ok(Json(json!({
+        "status": if failed_groups.is_empty() { "ok" } else { "partial" },
+        "total_groups": total_groups,
+        "applied_groups": applied_groups,
+        "skipped_groups": skipped_groups,
+        "failed_groups": failed_groups.len(),
+        "errors": failed_groups
+    })))
+}
+
+enum BulkGroupOutcome {
+    Skipped { elapsed_ms: u128 },
+    Applied { moved_files: usize, elapsed_ms: u128 },
+}
+
+fn apply_bulk_resolution_group(
+    conn: &mut rusqlite::Connection,
+    dest: &PathBuf,
+    res: &GroupResolution,
+) -> Result<BulkGroupOutcome, String> {
+    let kept_set: HashSet<_> = res.kept.iter().collect();
+    let rejected_set: HashSet<_> = res.rejected.iter().collect();
+    if !kept_set.is_disjoint(&rejected_set) {
+        return Err(format!(
+            "kept and rejected sets overlap in group {}",
+            res.group_id
+        ));
+    }
+    for path in &res.kept {
+        validate_kept_path_present(dest, path).map_err(|(_, message)| message)?;
+    }
+    for path in &res.rejected {
+        validate_rejected_path_idempotent(dest, path, res.group_id)
+            .map_err(|(_, message)| message)?;
+    }
+    if let Some(primary) = res.primary.as_ref() {
+        validate_kept_path_present(dest, primary).map_err(|(_, message)| message)?;
+    }
+
+    let selection = load_bulk_group_selection(conn, dest, res).map_err(|err| err.to_string())?;
+    let group_started = Instant::now();
+    let tx = conn.transaction().map_err(|err| err.to_string())?;
+
+    let mut moved_paths = Vec::new();
+    for member in &selection.members {
+        if selection.rejected_member_ids.contains(&member.id)
+            && !is_expected_trash_member_path(&member.target_path, res.group_id)
+        {
+            match move_to_trash(dest, &member.target_path, res.group_id) {
+                Ok(moved_to) => moved_paths.push((member.id, member.target_path.clone(), moved_to)),
+                Err(err) => {
+                    for (_, original_path, moved_to) in moved_paths.iter().rev() {
+                        let _ = fs::rename(moved_to, original_path);
+                    }
+                    return Err(err.to_string());
+                }
+            }
+        }
+    }
+
+    let tx_result = (|| -> Result<(), String> {
         for member in &selection.members {
             let keep_state = if selection.kept_member_ids.contains(&member.id) {
                 "kept"
@@ -1803,89 +2102,66 @@ async fn resolve_bulk(
                 "UPDATE target_items SET keep_state = ?1, is_group_primary = ?2 WHERE id = ?3",
                 rusqlite::params![keep_state, if is_primary { 1 } else { 0 }, member.id],
             )
-            .map_err(internal_error)?;
+            .map_err(|err| err.to_string())?;
         }
 
         for (id, _, moved_to) in &moved_paths {
             tx.execute(
                 "UPDATE target_items SET target_path = ?1 WHERE id = ?2",
-                rusqlite::params![
-                    logical_target_path(&state.dest, moved_to).map_err(internal_error)?,
-                    id
-                ],
+                rusqlite::params![logical_target_path(dest, moved_to).map_err(|err| err.to_string())?, id],
             )
-            .map_err(internal_error)?;
+            .map_err(|err| err.to_string())?;
         }
 
         insert_operation(
             &tx,
             resolve_operation_name(res.group_id),
             &json!({"group_id": res.group_id, "kept": res.kept, "rejected": res.rejected, "primary": res.primary}).to_string(),
-        ).map_err(internal_error)?;
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(())
+    })();
 
-        if let Err(err) = tx.commit() {
-            for (_, original_path, moved_to) in moved_paths.iter().rev() {
-                let _ = fs::rename(moved_to, original_path);
-            }
-            return Err(internal_error(err));
+    if let Err(err) = tx_result {
+        drop(tx);
+        for (_, original_path, moved_to) in moved_paths.iter().rev() {
+            let _ = fs::rename(moved_to, original_path);
         }
-
-        let moved_count = moved_paths.len();
-        if moved_count == 0
-            && selection
-                .members
-                .iter()
-                .all(|member| {
-                    let keep_state = if selection.kept_member_ids.contains(&member.id) {
-                        "kept"
-                    } else if selection.rejected_member_ids.contains(&member.id) {
-                        "rejected"
-                    } else {
-                        "undecided"
-                    };
-                    let is_primary = selection
-                        .primary_member_id
-                        .map(|primary_id| primary_id == member.id)
-                        .unwrap_or(false);
-                    member.keep_state == keep_state && member.is_group_primary == is_primary
-                })
-        {
-            skipped_groups += 1;
-            tracing::info!(
-                group_id = res.group_id,
-                group_index = index + 1,
-                total_groups,
-                elapsed_ms = group_started.elapsed().as_millis(),
-                "serve resolve_bulk group already satisfied"
-            );
-        } else {
-            applied_groups += 1;
-            tracing::info!(
-                group_id = res.group_id,
-                group_index = index + 1,
-                total_groups,
-                moved_files = moved_count,
-                elapsed_ms = group_started.elapsed().as_millis(),
-                completed_groups = applied_groups + skipped_groups,
-                remaining_groups = total_groups.saturating_sub(applied_groups + skipped_groups),
-                "serve resolve_bulk group committed"
-            );
-        }
+        return Err(err);
     }
 
-    tracing::info!(
-        total_groups,
-        applied_groups,
-        skipped_groups,
-        elapsed_ms = started.elapsed().as_millis(),
-        "serve resolve_bulk finished"
-    );
-    Ok(Json(json!({
-        "status": "ok",
-        "total_groups": total_groups,
-        "applied_groups": applied_groups,
-        "skipped_groups": skipped_groups
-    })))
+    if let Err(err) = tx.commit() {
+        for (_, original_path, moved_to) in moved_paths.iter().rev() {
+            let _ = fs::rename(moved_to, original_path);
+        }
+        return Err(err.to_string());
+    }
+
+    let moved_count = moved_paths.len();
+    let elapsed_ms = group_started.elapsed().as_millis();
+    if moved_count == 0
+        && selection.members.iter().all(|member| {
+            let keep_state = if selection.kept_member_ids.contains(&member.id) {
+                "kept"
+            } else if selection.rejected_member_ids.contains(&member.id) {
+                "rejected"
+            } else {
+                "undecided"
+            };
+            let is_primary = selection
+                .primary_member_id
+                .map(|primary_id| primary_id == member.id)
+                .unwrap_or(false);
+            member.keep_state == keep_state && member.is_group_primary == is_primary
+        })
+    {
+        Ok(BulkGroupOutcome::Skipped { elapsed_ms })
+    } else {
+        Ok(BulkGroupOutcome::Applied {
+            moved_files: moved_count,
+            elapsed_ms,
+        })
+    }
 }
 
 fn load_bulk_group_selection(
@@ -1893,22 +2169,30 @@ fn load_bulk_group_selection(
     dest: &StdPath,
     resolution: &GroupResolution,
 ) -> Result<ResolvedGroupSelection> {
-    let members = load_review_group_members(conn, dest, resolution.group_id).or_else(|err| {
-        if resolution.group_id < 0 {
-            load_filename_members_from_resolution_paths(conn, dest, resolution)
-                .and_then(|members| {
-                    if members.is_empty() {
-                        Err(err)
-                    } else {
-                        Ok(members)
-                    }
-                })
-        } else {
-            Err(err)
-        }
-    })?;
+    let members = load_resolution_members(conn, dest, resolution.group_id, &resolution.kept, &resolution.rejected, resolution.primary.as_ref())?;
 
     resolve_group_selection(dest, resolution.group_id, members, resolution)
+}
+
+fn load_resolution_members(
+    conn: &rusqlite::Connection,
+    dest: &StdPath,
+    group_id: i64,
+    kept: &[String],
+    rejected: &[String],
+    primary: Option<&String>,
+) -> Result<Vec<MemberRow>> {
+    if group_id >= 0 {
+        return load_review_group_members(conn, dest, group_id);
+    }
+
+    let resolution = GroupResolution {
+        group_id,
+        kept: kept.to_vec(),
+        rejected: rejected.to_vec(),
+        primary: primary.cloned(),
+    };
+    load_filename_members_from_resolution_paths(conn, dest, &resolution)
 }
 
 fn resolve_group_selection(
@@ -1977,6 +2261,29 @@ fn resolve_group_selection(
 fn validate_path_idempotent_anyhow(dest: &PathBuf, target_path: &str, group_id: i64) -> Result<PathBuf> {
     validate_path_idempotent(dest, target_path, group_id)
         .map_err(|(_, message)| anyhow::anyhow!(message))
+}
+
+fn validate_kept_path_present(
+    dest: &PathBuf,
+    target_path: &str,
+) -> Result<PathBuf, (StatusCode, String)> {
+    let original_abs = resolve_physical_path(dest, target_path);
+    if !original_abs.exists() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("kept file not found at source: {}", target_path),
+        ));
+    }
+    ensure_under_target_root(dest, &original_abs).map_err(internal_error)?;
+    Ok(original_abs)
+}
+
+fn validate_rejected_path_idempotent(
+    dest: &PathBuf,
+    target_path: &str,
+    group_id: i64,
+) -> Result<PathBuf, (StatusCode, String)> {
+    validate_path_idempotent(dest, target_path, group_id)
 }
 
 fn load_filename_members_from_resolution_paths(
@@ -2060,13 +2367,14 @@ async fn resolve_group(
     Json(request): Json<ResolveRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
-    let group = load_review_group_members(&conn, &state.dest, id).map_err(internal_error)?;
-    if group.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "group not found".into()));
-    }
     let kept = request.kept.unwrap_or_default();
     let rejected = request.rejected.unwrap_or_default();
     let primary = request.primary;
+    let group = load_resolution_members(&conn, &state.dest, id, &kept, &rejected, primary.as_ref())
+        .map_err(internal_error)?;
+    if group.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "group not found".into()));
+    }
     let kept_set: HashSet<_> = kept.iter().collect();
     let rejected_set: HashSet<_> = rejected.iter().collect();
     if !kept_set.is_disjoint(&rejected_set) {
@@ -2075,10 +2383,14 @@ async fn resolve_group(
             "kept and rejected sets overlap".into(),
         ));
     }
-    for path in kept_set.iter().chain(rejected_set.iter()) {
-        validate_path_idempotent(&state.dest, path, id)?;
+    for path in &kept {
+        validate_kept_path_present(&state.dest, path)?;
+    }
+    for path in &rejected {
+        validate_rejected_path_idempotent(&state.dest, path, id)?;
     }
     if let Some(primary_path) = primary.as_ref() {
+        validate_kept_path_present(&state.dest, primary_path)?;
         if !group
             .iter()
             .any(|member| &member.target_path == primary_path)
@@ -2371,7 +2683,7 @@ async fn delete_trash_group(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     tracing::info!(group_id, "serve trash delete group start");
     let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
-    let group = load_group_members(&conn, group_id).map_err(internal_error)?;
+    let group = load_review_group_members(&conn, &state.dest, group_id).map_err(internal_error)?;
     if group.is_empty() {
         return Err((StatusCode::NOT_FOUND, "group not found".into()));
     }
@@ -2418,7 +2730,7 @@ async fn delete_trash_member(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     tracing::info!(group_id, member_id, "serve trash delete member start");
     let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
-    let group = load_group_members(&conn, group_id).map_err(internal_error)?;
+    let group = load_review_group_members(&conn, &state.dest, group_id).map_err(internal_error)?;
     let member = group
         .iter()
         .find(|member| member.id == member_id)
@@ -2440,7 +2752,7 @@ async fn restore_trash_member(
     let started = Instant::now();
     tracing::info!(group_id, member_id, "serve trash restore member start");
     let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
-    let group = load_group_members(&conn, group_id).map_err(internal_error)?;
+    let group = load_review_group_members(&conn, &state.dest, group_id).map_err(internal_error)?;
     let member = group
         .iter()
         .find(|member| member.id == member_id)
@@ -2481,14 +2793,16 @@ async fn restore_trash_member(
     )
     .map_err(internal_error)?;
 
-    let remaining = load_group_members(&tx, group_id).map_err(internal_error)?;
-    if remaining.iter().all(|member| !member.is_group_primary) {
-        if let Some(primary_id) = choose_best_primary_member(&remaining) {
-            tx.execute(
-                "UPDATE target_items SET is_group_primary = CASE WHEN id = ?1 THEN 1 ELSE 0 END WHERE group_id = ?2",
-                rusqlite::params![primary_id, group_id],
-            )
-            .map_err(internal_error)?;
+    if group_id >= 0 {
+        let remaining = load_review_group_members(&tx, &state.dest, group_id).map_err(internal_error)?;
+        if remaining.iter().all(|member| !member.is_group_primary) {
+            if let Some(primary_id) = choose_best_primary_member(&remaining) {
+                tx.execute(
+                    "UPDATE target_items SET is_group_primary = CASE WHEN id = ?1 THEN 1 ELSE 0 END WHERE group_id = ?2",
+                    rusqlite::params![primary_id, group_id],
+                )
+                .map_err(internal_error)?;
+            }
         }
     }
 
@@ -2706,6 +3020,10 @@ fn is_logical_trash_path(path: &StdPath) -> bool {
         saw_photo_org = part == ".photo-org";
     }
     false
+}
+
+fn is_filename_group_trash_target_path(target_path: &str) -> bool {
+    target_path.contains("/.photo-org/trash/filename-group-")
 }
 
 fn choose_best_primary_member(members: &[MemberRow]) -> Option<i64> {
@@ -3069,6 +3387,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filename_review_primary_uses_resolution_and_size_for_timestamp_renditions() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        insert_ungrouped_review_row(
+            &conn,
+            &dest,
+            "2017/10/24/20171024-180102.jpg",
+            "hash-ts-base",
+            "2017-10-24T00:00:00Z",
+        );
+        insert_ungrouped_review_row(
+            &conn,
+            &dest,
+            "2017/10/24/20171024-180102-3.jpg",
+            "hash-ts-derived",
+            "2017-10-24T00:00:00Z",
+        );
+        conn.execute(
+            "UPDATE target_items SET width = 400, height = 533, size_bytes = 48744 WHERE target_path LIKE ?1",
+            rusqlite::params!["%20171024-180102.jpg"],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE target_items SET width = 800, height = 1066, size_bytes = 560895 WHERE target_path LIKE ?1",
+            rusqlite::params!["%20171024-180102-3.jpg"],
+        )
+        .unwrap();
+
+        let app = router(AppState { db_path, dest });
+        let request = axum::http::Request::builder()
+            .uri("/api/groups?view=filename&page_index=0&page_size=10")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let paged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let target_group = paged["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|group| {
+                group["members"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|member| {
+                        member["target_path"]
+                            .as_str()
+                            .unwrap()
+                            .ends_with("20171024-180102-3.jpg")
+                    })
+            })
+            .unwrap();
+        let primary = target_group["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["is_group_primary"].as_bool().unwrap())
+            .unwrap();
+        assert!(primary["target_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("20171024-180102-3.jpg"));
+    }
+
+    #[tokio::test]
+    async fn list_groups_supports_filename_trash_review_mode() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("repo");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        insert_filename_review_rows(
+            &conn,
+            &dest,
+            "2024/06/09/IMG_1234.JPG",
+            "2025/03/17/defaultimg_1234.jpg",
+        );
+
+        let app = router(AppState {
+            db_path: db_path.clone(),
+            dest: dest.clone(),
+        });
+        let request = axum::http::Request::builder()
+            .uri("/api/groups?view=filename&page_index=0&page_size=10")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let paged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let group_id = paged["groups"][0]["group_id"].as_i64().unwrap();
+        let members = paged["groups"][0]["members"].as_array().unwrap();
+        let default_path = members
+            .iter()
+            .find_map(|member| {
+                let path = member["target_path"].as_str()?;
+                path.contains("defaultimg_1234").then_some(path.to_string())
+            })
+            .unwrap();
+        let plain_path = members
+            .iter()
+            .find_map(|member| {
+                let path = member["target_path"].as_str()?;
+                path.contains("IMG_1234").then_some(path.to_string())
+            })
+            .unwrap();
+
+        let resolve_request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/groups/{group_id}/resolve"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "kept": [plain_path.clone()],
+                    "rejected": [default_path.clone()],
+                    "primary": plain_path.clone(),
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(resolve_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = axum::http::Request::builder()
+            .uri("/api/groups?view=filename_trash&page_index=0&page_size=10")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let paged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paged["review_mode"], "filename_trash");
+        assert_eq!(paged["total_groups"], 1);
+        assert_eq!(paged["groups"][0]["status"], "filename-trash-review");
+        let members = paged["groups"][0]["members"].as_array().unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().any(|member| {
+            member["target_path"]
+                .as_str()
+                .unwrap()
+                .contains("/.photo-org/trash/filename-group-")
+        }));
+        assert!(members.iter().any(|member| {
+            member["target_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("IMG_1234.JPG")
+        }));
+    }
+
+    #[tokio::test]
     async fn index_html_mentions_page_index_and_page_size() {
         let tmp = tempdir().unwrap();
         let dest = tmp.path().join("dest");
@@ -3373,6 +3848,298 @@ mod tests {
         assert!(rows.iter().any(|(path, keep_state, is_primary)| {
             path.ends_with("IMG_1234.JPG") && keep_state == "kept" && *is_primary == 1
         }));
+    }
+
+    #[tokio::test]
+    async fn resolve_filename_review_rejects_kept_path_that_only_exists_in_trash() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("repo");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        insert_filename_review_rows(
+            &conn,
+            &dest,
+            "2024/06/09/IMG_1234.JPG",
+            "2025/03/17/defaultimg_1234.jpg",
+        );
+
+        let app = router(AppState {
+            db_path: db_path.clone(),
+            dest: dest.clone(),
+        });
+        let request = axum::http::Request::builder()
+            .uri("/api/groups?view=filename&page_index=0&page_size=10")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let paged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let group_id = paged["groups"][0]["group_id"].as_i64().unwrap();
+        let members = paged["groups"][0]["members"].as_array().unwrap();
+        let default_path = members
+            .iter()
+            .find_map(|member| {
+                let path = member["target_path"].as_str()?;
+                path.contains("defaultimg_1234").then_some(path.to_string())
+            })
+            .unwrap();
+        let plain_path = members
+            .iter()
+            .find_map(|member| {
+                let path = member["target_path"].as_str()?;
+                path.contains("IMG_1234").then_some(path.to_string())
+            })
+            .unwrap();
+
+        let first_resolve = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/groups/{group_id}/resolve"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "kept": [plain_path.clone()],
+                    "rejected": [default_path.clone()],
+                    "primary": plain_path.clone(),
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(first_resolve).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let second_resolve = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/groups/{group_id}/resolve"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "kept": [default_path.clone()],
+                    "rejected": [],
+                    "primary": default_path,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(second_resolve).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("kept file not found at source"));
+    }
+
+    #[tokio::test]
+    async fn restore_trash_member_supports_filename_trash_review_group() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("repo");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        insert_filename_review_rows(
+            &conn,
+            &dest,
+            "2024/06/09/IMG_1234.JPG",
+            "2025/03/17/defaultimg_1234.jpg",
+        );
+
+        let app = router(AppState {
+            db_path: db_path.clone(),
+            dest: dest.clone(),
+        });
+        let request = axum::http::Request::builder()
+            .uri("/api/groups?view=filename&page_index=0&page_size=10")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let paged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let group_id = paged["groups"][0]["group_id"].as_i64().unwrap();
+        let members = paged["groups"][0]["members"].as_array().unwrap();
+        let default_path = members
+            .iter()
+            .find_map(|member| {
+                let path = member["target_path"].as_str()?;
+                path.contains("defaultimg_1234").then_some(path.to_string())
+            })
+            .unwrap();
+        let plain_path = members
+            .iter()
+            .find_map(|member| {
+                let path = member["target_path"].as_str()?;
+                path.contains("IMG_1234").then_some(path.to_string())
+            })
+            .unwrap();
+
+        let resolve_request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/groups/{group_id}/resolve"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "kept": [plain_path.clone()],
+                    "rejected": [default_path.clone()],
+                    "primary": plain_path.clone(),
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(resolve_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = axum::http::Request::builder()
+            .uri("/api/groups?view=filename_trash&page_index=0&page_size=10")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let paged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let filename_trash_group_id = paged["groups"][0]["group_id"].as_i64().unwrap();
+        let trash_member_id = paged["groups"][0]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| {
+                member["target_path"]
+                    .as_str()
+                    .unwrap()
+                    .contains("/.photo-org/trash/filename-group-")
+            })
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+
+        let restore_request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/api/groups/{filename_trash_group_id}/members/{trash_member_id}/restore_trash"
+            ))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(restore_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(payload["target_path"]
+            .as_str()
+            .unwrap()
+            .contains("defaultimg_1234"));
+    }
+
+    #[tokio::test]
+    async fn resolve_bulk_continues_after_group_failure() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+
+        let keep_1 = dest.join("2024/06/09/keep-1.png");
+        let reject_1 = dest.join("2024/06/09/reject-1.png");
+        let keep_2 = dest.join("2024/06/09/keep-2.png");
+        let reject_2 = dest.join("2024/06/09/reject-2.png");
+        fs::create_dir_all(keep_1.parent().unwrap()).unwrap();
+        make_png(&keep_1, [255, 0, 0]);
+        make_png(&reject_1, [0, 255, 0]);
+        make_png(&keep_2, [0, 0, 255]);
+        make_png(&reject_2, [255, 255, 0]);
+
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO target_items (
+                target_path, size_bytes, mime_type, created_at, exact_hash, phash, phash_bits,
+                width, height, group_id, keep_state, is_group_primary, origin_source_id, meta_json
+            ) VALUES
+                (?1, 1, 'image/png', '2024-06-09T00:00:00Z', 'a1', 'p', 64, 32, 32, 1, 'undecided', 1, NULL, '{}'),
+                (?2, 1, 'image/png', '2024-06-09T00:00:00Z', 'b1', 'p', 64, 32, 32, 1, 'undecided', 0, NULL, '{}'),
+                (?3, 1, 'image/png', '2024-06-09T00:00:00Z', 'a2', 'p', 64, 32, 32, 2, 'undecided', 1, NULL, '{}'),
+                (?4, 1, 'image/png', '2024-06-09T00:00:00Z', 'b2', 'p', 64, 32, 32, 2, 'undecided', 0, NULL, '{}')
+            "#,
+            rusqlite::params![
+                keep_1.to_string_lossy().to_string(),
+                reject_1.to_string_lossy().to_string(),
+                keep_2.to_string_lossy().to_string(),
+                reject_2.to_string_lossy().to_string(),
+            ],
+        )
+        .unwrap();
+
+        fs::rename(&keep_1, dest.join(".photo-org-trash-temp-keep-1.png")).unwrap();
+
+        let app = router(AppState {
+            db_path: db_path.clone(),
+            dest: dest.clone(),
+        });
+        let payload = json!({
+            "resolutions": [
+                {
+                    "group_id": 1,
+                    "kept": [keep_1.to_string_lossy().to_string()],
+                    "rejected": [reject_1.to_string_lossy().to_string()],
+                    "primary": keep_1.to_string_lossy().to_string(),
+                },
+                {
+                    "group_id": 2,
+                    "kept": [keep_2.to_string_lossy().to_string()],
+                    "rejected": [reject_2.to_string_lossy().to_string()],
+                    "primary": keep_2.to_string_lossy().to_string(),
+                }
+            ]
+        });
+
+        let resolve_request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/groups/resolve_bulk")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(payload.to_string()))
+            .unwrap();
+        let response = app.oneshot(resolve_request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["status"], "partial");
+        assert_eq!(result["applied_groups"], 1);
+        assert_eq!(result["skipped_groups"], 0);
+        assert_eq!(result["failed_groups"], 1);
+        assert_eq!(result["errors"][0]["group_id"], 1);
+        assert!(result["errors"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("kept file not found at source"));
+
+        let verify = open_catalog_db(&db_path).unwrap();
+        let rows = verify
+            .prepare("SELECT group_id, target_path, keep_state, is_group_primary FROM target_items ORDER BY group_id, target_path")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert!(rows.iter().any(|(group_id, path, keep_state, is_primary)| {
+            *group_id == Some(1)
+                && path == &reject_1.to_string_lossy()
+                && keep_state == "undecided"
+                && *is_primary == 0
+        }));
+        assert!(rows.iter().any(|(group_id, path, keep_state, is_primary)| {
+            *group_id == Some(2)
+                && path.ends_with("/.photo-org/trash/group-2/reject-2.png")
+                && keep_state == "rejected"
+                && *is_primary == 0
+        }));
+        assert!(rows.iter().any(|(group_id, path, keep_state, is_primary)| {
+            *group_id == Some(2)
+                && path == &keep_2.to_string_lossy()
+                && keep_state == "kept"
+                && *is_primary == 1
+        }));
+        assert!(dest.join(".photo-org/trash/group-2/reject-2.png").exists());
     }
 
     #[tokio::test]
