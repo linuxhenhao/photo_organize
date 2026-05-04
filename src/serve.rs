@@ -174,6 +174,14 @@ struct GroupResolution {
     primary: Option<String>,
 }
 
+#[derive(Debug)]
+struct ResolvedGroupSelection {
+    members: Vec<MemberRow>,
+    kept_member_ids: HashSet<i64>,
+    rejected_member_ids: HashSet<i64>,
+    primary_member_id: Option<i64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ImageQuery {
     path: String,
@@ -1733,6 +1741,8 @@ async fn resolve_bulk(
     Json(request): Json<BulkResolveRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
+    let total_groups = request.resolutions.len();
+    let started = Instant::now();
 
     for res in &request.resolutions {
         let kept_set: HashSet<_> = res.kept.iter().collect();
@@ -1748,35 +1758,46 @@ async fn resolve_bulk(
         }
     }
 
-    let tx = conn.transaction().map_err(internal_error)?;
+    let mut applied_groups = 0usize;
+    let mut skipped_groups = 0usize;
 
-    for res in request.resolutions {
-        let group =
-            load_review_group_members(&tx, &state.dest, res.group_id).map_err(internal_error)?;
-        let kept_set: HashSet<_> = res.kept.iter().collect();
-        let rejected_set: HashSet<_> = res.rejected.iter().collect();
+    for (index, res) in request.resolutions.into_iter().enumerate() {
+        tracing::info!(
+            group_id = res.group_id,
+            group_index = index + 1,
+            total_groups,
+            kept = res.kept.len(),
+            rejected = res.rejected.len(),
+            "serve resolve_bulk group start"
+        );
+
+        let selection =
+            load_bulk_group_selection(&conn, &state.dest, &res).map_err(internal_error)?;
+        let group_started = Instant::now();
+        let tx = conn.transaction().map_err(internal_error)?;
 
         let mut moved_paths = Vec::new();
-        for member in &group {
-            if rejected_set.contains(&member.target_path) {
+        for member in &selection.members {
+            if selection.rejected_member_ids.contains(&member.id)
+                && !is_expected_trash_member_path(&member.target_path, res.group_id)
+            {
                 let moved_to = move_to_trash(&state.dest, &member.target_path, res.group_id)
                     .map_err(internal_error)?;
                 moved_paths.push((member.id, member.target_path.clone(), moved_to));
             }
         }
 
-        for member in &group {
-            let keep_state = if kept_set.contains(&member.target_path) {
+        for member in &selection.members {
+            let keep_state = if selection.kept_member_ids.contains(&member.id) {
                 "kept"
-            } else if rejected_set.contains(&member.target_path) {
+            } else if selection.rejected_member_ids.contains(&member.id) {
                 "rejected"
             } else {
                 "undecided"
             };
-            let is_primary = res
-                .primary
-                .as_ref()
-                .map(|p| p == &member.target_path)
+            let is_primary = selection
+                .primary_member_id
+                .map(|primary_id| primary_id == member.id)
                 .unwrap_or(false);
             tx.execute(
                 "UPDATE target_items SET keep_state = ?1, is_group_primary = ?2 WHERE id = ?3",
@@ -1801,10 +1822,236 @@ async fn resolve_bulk(
             resolve_operation_name(res.group_id),
             &json!({"group_id": res.group_id, "kept": res.kept, "rejected": res.rejected, "primary": res.primary}).to_string(),
         ).map_err(internal_error)?;
+
+        if let Err(err) = tx.commit() {
+            for (_, original_path, moved_to) in moved_paths.iter().rev() {
+                let _ = fs::rename(moved_to, original_path);
+            }
+            return Err(internal_error(err));
+        }
+
+        let moved_count = moved_paths.len();
+        if moved_count == 0
+            && selection
+                .members
+                .iter()
+                .all(|member| {
+                    let keep_state = if selection.kept_member_ids.contains(&member.id) {
+                        "kept"
+                    } else if selection.rejected_member_ids.contains(&member.id) {
+                        "rejected"
+                    } else {
+                        "undecided"
+                    };
+                    let is_primary = selection
+                        .primary_member_id
+                        .map(|primary_id| primary_id == member.id)
+                        .unwrap_or(false);
+                    member.keep_state == keep_state && member.is_group_primary == is_primary
+                })
+        {
+            skipped_groups += 1;
+            tracing::info!(
+                group_id = res.group_id,
+                group_index = index + 1,
+                total_groups,
+                elapsed_ms = group_started.elapsed().as_millis(),
+                "serve resolve_bulk group already satisfied"
+            );
+        } else {
+            applied_groups += 1;
+            tracing::info!(
+                group_id = res.group_id,
+                group_index = index + 1,
+                total_groups,
+                moved_files = moved_count,
+                elapsed_ms = group_started.elapsed().as_millis(),
+                completed_groups = applied_groups + skipped_groups,
+                remaining_groups = total_groups.saturating_sub(applied_groups + skipped_groups),
+                "serve resolve_bulk group committed"
+            );
+        }
     }
 
-    tx.commit().map_err(internal_error)?;
-    Ok(Json(json!({"status": "ok"})))
+    tracing::info!(
+        total_groups,
+        applied_groups,
+        skipped_groups,
+        elapsed_ms = started.elapsed().as_millis(),
+        "serve resolve_bulk finished"
+    );
+    Ok(Json(json!({
+        "status": "ok",
+        "total_groups": total_groups,
+        "applied_groups": applied_groups,
+        "skipped_groups": skipped_groups
+    })))
+}
+
+fn load_bulk_group_selection(
+    conn: &rusqlite::Connection,
+    dest: &StdPath,
+    resolution: &GroupResolution,
+) -> Result<ResolvedGroupSelection> {
+    let members = load_review_group_members(conn, dest, resolution.group_id).or_else(|err| {
+        if resolution.group_id < 0 {
+            load_filename_members_from_resolution_paths(conn, dest, resolution)
+                .and_then(|members| {
+                    if members.is_empty() {
+                        Err(err)
+                    } else {
+                        Ok(members)
+                    }
+                })
+        } else {
+            Err(err)
+        }
+    })?;
+
+    resolve_group_selection(dest, resolution.group_id, members, resolution)
+}
+
+fn resolve_group_selection(
+    dest: &StdPath,
+    group_id: i64,
+    members: Vec<MemberRow>,
+    resolution: &GroupResolution,
+) -> Result<ResolvedGroupSelection> {
+    let dest_buf = dest.to_path_buf();
+    let mut by_physical_path = HashMap::new();
+    for member in &members {
+        by_physical_path.insert(resolve_physical_path(dest, &member.target_path), member.id);
+    }
+
+    let mut kept_member_ids = HashSet::new();
+    for path in &resolution.kept {
+        let physical_path = validate_path_idempotent_anyhow(&dest_buf, path, group_id)?;
+        let member_id = *by_physical_path
+            .get(&physical_path)
+            .ok_or_else(|| anyhow::anyhow!("kept path not found in group {}: {}", group_id, path))?;
+        kept_member_ids.insert(member_id);
+    }
+
+    let mut rejected_member_ids = HashSet::new();
+    for path in &resolution.rejected {
+        let physical_path = validate_path_idempotent_anyhow(&dest_buf, path, group_id)?;
+        let member_id = *by_physical_path
+            .get(&physical_path)
+            .ok_or_else(|| anyhow::anyhow!("rejected path not found in group {}: {}", group_id, path))?;
+        rejected_member_ids.insert(member_id);
+    }
+
+    if !kept_member_ids.is_disjoint(&rejected_member_ids) {
+        return Err(anyhow::anyhow!(
+            "kept and rejected sets overlap in group {}",
+            group_id
+        ));
+    }
+
+    let primary_member_id = if let Some(primary_path) = resolution.primary.as_ref() {
+        let physical_path = validate_path_idempotent_anyhow(&dest_buf, primary_path, group_id)?;
+        let member_id = *by_physical_path
+            .get(&physical_path)
+            .ok_or_else(|| {
+                anyhow::anyhow!("primary path not found in group {}: {}", group_id, primary_path)
+            })?;
+        if !kept_member_ids.contains(&member_id) {
+            return Err(anyhow::anyhow!(
+                "primary path must be kept in group {}",
+                group_id
+            ));
+        }
+        Some(member_id)
+    } else {
+        None
+    };
+
+    Ok(ResolvedGroupSelection {
+        members,
+        kept_member_ids,
+        rejected_member_ids,
+        primary_member_id,
+    })
+}
+
+fn validate_path_idempotent_anyhow(dest: &PathBuf, target_path: &str, group_id: i64) -> Result<PathBuf> {
+    validate_path_idempotent(dest, target_path, group_id)
+        .map_err(|(_, message)| anyhow::anyhow!(message))
+}
+
+fn load_filename_members_from_resolution_paths(
+    conn: &rusqlite::Connection,
+    dest: &StdPath,
+    resolution: &GroupResolution,
+) -> Result<Vec<MemberRow>> {
+    let trash_dir = dest
+        .join(".photo-org")
+        .join("trash")
+        .join(trash_group_dir_name(resolution.group_id));
+    let trash_prefix = format!(
+        "{}/%",
+        logical_target_path(dest, &trash_dir)?
+    );
+    let mut exact_paths = resolution
+        .kept
+        .iter()
+        .chain(resolution.rejected.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(primary) = resolution.primary.as_ref() {
+        exact_paths.push(primary.clone());
+    }
+    exact_paths.sort();
+    exact_paths.dedup();
+
+    let mut sql = String::from(
+        "SELECT id, target_path, mime_type, keep_state, is_group_primary, exact_hash, phash, width, height, size_bytes, created_at FROM target_items WHERE ",
+    );
+    for (index, _) in exact_paths.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(" OR ");
+        }
+        sql.push_str("target_path = ?");
+    }
+    if !exact_paths.is_empty() {
+        sql.push_str(" OR ");
+    }
+    sql.push_str("target_path LIKE ?");
+    sql.push_str(" ORDER BY id");
+
+    let mut params = exact_paths
+        .iter()
+        .map(|path| path.as_str())
+        .collect::<Vec<_>>();
+    params.push(trash_prefix.as_str());
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            Ok(MemberRow {
+                id: row.get(0)?,
+                target_path: row.get(1)?,
+                mime_type: row.get(2)?,
+                keep_state: row.get(3)?,
+                is_group_primary: row.get::<_, i64>(4)? != 0,
+                exact_hash: row.get(5)?,
+                phash: row.get(6)?,
+                width: row.get(7)?,
+                height: row.get(8)?,
+                size_bytes: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(rows)
+}
+
+fn is_expected_trash_member_path(target_path: &str, group_id: i64) -> bool {
+    target_path.contains(&format!(
+        "/.photo-org/trash/{}/",
+        trash_group_dir_name(group_id)
+    ))
 }
 
 async fn resolve_group(
@@ -1924,6 +2171,11 @@ fn delete_trash_members_by_ids(
         .copied()
         .filter(|member_id| seen.insert(*member_id))
         .collect::<Vec<_>>();
+    tracing::info!(
+        requested_members = member_ids.len(),
+        unique_members = unique_member_ids.len(),
+        "serve trash delete batch start"
+    );
     let dedupe_elapsed = started.elapsed();
 
     let mut members = Vec::new();
@@ -1968,6 +2220,11 @@ fn delete_trash_members_by_ids(
         members.push(member);
     }
     let member_load_elapsed = member_load_started.elapsed();
+    tracing::info!(
+        unique_members = unique_member_ids.len(),
+        member_load_ms = member_load_elapsed.as_millis(),
+        "serve trash delete batch loaded members"
+    );
 
     let mut deleted = Vec::new();
     let photo_org_root = dest.join(".photo-org");
@@ -1998,6 +2255,12 @@ fn delete_trash_members_by_ids(
         }));
     }
     let fs_delete_elapsed = fs_delete_started.elapsed();
+    tracing::info!(
+        unique_members = unique_member_ids.len(),
+        deleted_entries = deleted.len(),
+        fs_delete_ms = fs_delete_elapsed.as_millis(),
+        "serve trash delete batch removed files"
+    );
 
     let tx_started = Instant::now();
     let tx = conn.transaction().map_err(internal_error)?;
@@ -2062,6 +2325,20 @@ fn delete_trash_members_by_ids(
     let commit_started = Instant::now();
     tx.commit().map_err(internal_error)?;
     let commit_elapsed = commit_started.elapsed();
+    tracing::info!(
+        unique_members = unique_member_ids.len(),
+        deleted_entries = deleted.len(),
+        touched_groups = group_results.len(),
+        dedupe_ms = dedupe_elapsed.as_millis(),
+        member_load_ms = member_load_elapsed.as_millis(),
+        fs_delete_ms = fs_delete_elapsed.as_millis(),
+        row_delete_ms = row_delete_elapsed.as_millis(),
+        group_repair_ms = group_repair_elapsed.as_millis(),
+        op_log_ms = op_log_elapsed.as_millis(),
+        commit_ms = commit_elapsed.as_millis(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "serve trash delete batch finished"
+    );
 
     if serve_profiling_enabled() {
         tracing::info!(
@@ -2092,6 +2369,7 @@ async fn delete_trash_group(
     Path(group_id): Path<i64>,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    tracing::info!(group_id, "serve trash delete group start");
     let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
     let group = load_group_members(&conn, group_id).map_err(internal_error)?;
     if group.is_empty() {
@@ -2105,6 +2383,11 @@ async fn delete_trash_group(
         ));
     }
     let payload = delete_trash_members_by_ids(&mut conn, &state.dest, &member_ids)?;
+    tracing::info!(
+        group_id,
+        deleted_members = member_ids.len(),
+        "serve trash delete group finished"
+    );
     Ok(Json(json!({
         "group_id": group_id,
         "deleted_members": member_ids.len(),
@@ -2116,8 +2399,16 @@ async fn delete_trash_bulk(
     State(state): State<AppState>,
     Json(request): Json<DeleteTrashMembersRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    tracing::info!(
+        requested_members = request.member_ids.len(),
+        "serve trash delete bulk start"
+    );
     let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
     let payload = delete_trash_members_by_ids(&mut conn, &state.dest, &request.member_ids)?;
+    tracing::info!(
+        requested_members = request.member_ids.len(),
+        "serve trash delete bulk finished"
+    );
     Ok(Json(payload))
 }
 
@@ -2125,6 +2416,7 @@ async fn delete_trash_member(
     Path((group_id, member_id)): Path<(i64, i64)>,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    tracing::info!(group_id, member_id, "serve trash delete member start");
     let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
     let group = load_group_members(&conn, group_id).map_err(internal_error)?;
     let member = group
@@ -2133,6 +2425,7 @@ async fn delete_trash_member(
         .cloned()
         .ok_or_else(|| (StatusCode::NOT_FOUND, "group member not found".to_string()))?;
     let payload = delete_trash_members_by_ids(&mut conn, &state.dest, &[member.id])?;
+    tracing::info!(group_id, member_id, "serve trash delete member finished");
     Ok(Json(json!({
         "group_id": group_id,
         "member_id": member_id,
@@ -2144,6 +2437,8 @@ async fn restore_trash_member(
     Path((group_id, member_id)): Path<(i64, i64)>,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let started = Instant::now();
+    tracing::info!(group_id, member_id, "serve trash restore member start");
     let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
     let group = load_group_members(&conn, group_id).map_err(internal_error)?;
     let member = group
@@ -2213,6 +2508,12 @@ async fn restore_trash_member(
         let _ = fs::rename(&restored_path, &current_path);
         return Err(internal_error(err));
     }
+    tracing::info!(
+        group_id,
+        member_id,
+        elapsed_ms = started.elapsed().as_millis(),
+        "serve trash restore member finished"
+    );
 
     Ok(Json(json!({
         "group_id": group_id,
@@ -2975,6 +3276,102 @@ mod tests {
                 && keep_state == "kept"
                 && *is_primary == 1
                 && group_id.is_none()
+        }));
+    }
+
+    #[tokio::test]
+    async fn resolve_bulk_filename_review_is_idempotent_after_partial_completion() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("repo");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        insert_filename_review_rows(
+            &conn,
+            &dest,
+            "2024/06/09/IMG_1234.JPG",
+            "2025/03/17/defaultimg_1234.jpg",
+        );
+
+        let app = router(AppState {
+            db_path: db_path.clone(),
+            dest: dest.clone(),
+        });
+        let request = axum::http::Request::builder()
+            .uri("/api/groups?view=filename&page_index=0&page_size=10")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let paged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let group_id = paged["groups"][0]["group_id"].as_i64().unwrap();
+        let members = paged["groups"][0]["members"].as_array().unwrap();
+        let default_path = members
+            .iter()
+            .find_map(|member| {
+                let path = member["target_path"].as_str()?;
+                path.contains("defaultimg_1234").then_some(path.to_string())
+            })
+            .unwrap();
+        let plain_path = members
+            .iter()
+            .find_map(|member| {
+                let path = member["target_path"].as_str()?;
+                path.contains("IMG_1234").then_some(path.to_string())
+            })
+            .unwrap();
+        let payload = json!({
+            "resolutions": [{
+                "group_id": group_id,
+                "kept": [plain_path],
+                "rejected": [default_path],
+                "primary": plain_path,
+            }]
+        });
+
+        for _ in 0..2 {
+            let resolve_request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/groups/resolve_bulk")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(payload.to_string()))
+                .unwrap();
+            let response = app.clone().oneshot(resolve_request).await.unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        }
+
+        assert!(dest.join(".photo-org/trash/filename-group-2/defaultimg_1234.jpg").exists());
+        assert!(!dest
+            .join(".photo-org/trash/filename-group-2/1-defaultimg_1234.jpg")
+            .exists());
+
+        let verify = open_catalog_db(&db_path).unwrap();
+        let rows = verify
+            .prepare("SELECT target_path, keep_state, is_group_primary FROM target_items ORDER BY target_path")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(
+            rows.iter()
+                .filter(|(path, keep_state, _)| {
+                    path.contains("defaultimg_1234") && keep_state == "rejected"
+                })
+                .count(),
+            1
+        );
+        assert!(rows.iter().any(|(path, keep_state, is_primary)| {
+            path.ends_with("IMG_1234.JPG") && keep_state == "kept" && *is_primary == 1
         }));
     }
 
