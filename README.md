@@ -160,6 +160,9 @@ Optional profiling summary:
 PHOTO_ORG_PROFILE=1 cargo run -- initcache --db /path/to/catalog.db --dest /path/to/library
 ```
 
+`PHOTO_ORG_PROFILE` is the current profiling env toggle used by the code. Setting it to any value
+enables the `initcache profile summary` log for `initcache`.
+
 ### 4. Serve
 
 Run the local review UI for unresolved duplicate groups.
@@ -179,6 +182,12 @@ http://127.0.0.1:8080/
 ```
 
 The UI serves group pages from `catalog.db`, supports page navigation with `page_index` and `page_size`, and lets you confirm keep/reject/primary decisions locally.
+
+For profiling trash-delete batches in `serve`, run with the same env var:
+
+```bash
+PHOTO_ORG_PROFILE=1 cargo run -- serve --db /path/to/catalog.db --dest /path/to/library
+```
 
 ## Databases
 
@@ -204,6 +213,9 @@ The binary uses `tracing`.
 
 - default behavior enables `warn` globally and `photo_org=info`
 - you can override with `RUST_LOG`
+- set `PHOTO_ORG_PROFILE=1` to enable additional profiling logs in the implemented paths
+  `initcache` logs `initcache profile summary`
+  `serve` logs `serve delete_trash profile`
 
 Example:
 

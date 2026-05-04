@@ -95,7 +95,7 @@ Current sizing guidance for this crate:
 - If a single shared size is required, prefer something around `640px`; `256px` is too small for reliable AKAZE.
 
 ## Profiling
-Set `PHOTO_ORG_PROFILE_INITCACHE=1` to emit per-stage timing breakdowns for `initcache` runs. The profiling summary includes input feature calls, candidate loads, distance checks, AKAZE confirm calls, and DB transaction costs.
+Set `PHOTO_ORG_PROFILE=1` to emit per-stage timing breakdowns for `initcache` runs. The profiling summary includes input feature calls, candidate loads, distance checks, AKAZE confirm calls, and DB transaction costs. The current codebase also uses the same env var for `serve` trash-delete profiling logs.
 
 ## Testing
 Add focused Rust tests next to the implementation or under `tests/` when behavior changes.
