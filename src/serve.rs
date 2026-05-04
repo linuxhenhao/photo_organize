@@ -22,8 +22,8 @@ use std::fs;
 use std::future::Future;
 use std::io::{BufReader, Cursor};
 use std::path::{Component, Path as StdPath, PathBuf};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
-use std::sync::OnceLock;
 use tokio::net::TcpListener;
 
 static UGOS_MODE: Lazy<bool> = Lazy::new(detect_ugos_system);
@@ -42,6 +42,20 @@ fn serve_profiling_enabled() -> bool {
 struct AppState {
     db_path: PathBuf,
     dest: PathBuf,
+    filename_review_cache: Arc<RwLock<FilenameReviewCacheState>>,
+}
+
+#[derive(Default)]
+struct FilenameReviewCache {
+    candidates_by_id: HashMap<i64, FilenameReviewCandidate>,
+    key_to_ids: HashMap<String, Vec<i64>>,
+    default_groups: Vec<FilenameReviewGroup>,
+    trash_groups: Vec<FilenameReviewGroup>,
+}
+
+#[derive(Default)]
+struct FilenameReviewCacheState {
+    cache: Option<FilenameReviewCache>,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,13 +209,20 @@ struct ImageQuery {
 }
 
 pub async fn run(db: PathBuf, dest: PathBuf, host: String, port: u16) -> Result<()> {
-    open_catalog_db(&db)?;
-    let state = AppState { db_path: db, dest };
+    let state = build_app_state(db, dest)?;
     let app = router(state);
     let listener = TcpListener::bind((host.as_str(), port)).await?;
     tracing::info!(addr = %listener.local_addr()?, "serve listening (UGOS mode: {})", *UGOS_MODE);
     serve_with_shutdown(listener, app, interrupt::wait()).await?;
     Ok(())
+}
+
+fn build_app_state(db_path: PathBuf, dest: PathBuf) -> Result<AppState> {
+    Ok(AppState {
+        db_path,
+        dest,
+        filename_review_cache: Arc::new(RwLock::new(FilenameReviewCacheState::default())),
+    })
 }
 
 async fn serve_with_shutdown<F>(listener: TcpListener, app: Router, shutdown: F) -> Result<()>
@@ -1050,7 +1071,6 @@ async fn list_groups(
     State(state): State<AppState>,
     Query(params): Query<GroupParams>,
 ) -> Result<Json<PagedGroups>, (StatusCode, String)> {
-    let conn = open_catalog_db_readonly(&state.db_path).map_err(internal_error)?;
     let paging = normalize_group_params(&params);
     let page_size = paging.page_size;
     let requested_page_index = paging.page_index;
@@ -1058,8 +1078,16 @@ async fn list_groups(
     let review_groups_with_trash = is_trash_review_mode(review_mode);
 
     if is_filename_default_review_mode(review_mode) {
-        let all_groups =
-            load_filename_default_review_groups(&conn, &state.dest).map_err(internal_error)?;
+        ensure_filename_review_cache(&state)?;
+        let all_groups = state
+            .filename_review_cache
+            .read()
+            .map_err(|err| internal_error(err.to_string()))?
+            .cache
+            .as_ref()
+            .expect("filename review cache initialized")
+            .default_groups
+            .clone();
         return Ok(Json(page_filename_review_groups(
             all_groups,
             page_size,
@@ -1070,8 +1098,16 @@ async fn list_groups(
     }
 
     if is_filename_trash_review_mode(review_mode) {
-        let all_groups =
-            load_filename_trash_review_groups(&conn, &state.dest).map_err(internal_error)?;
+        ensure_filename_review_cache(&state)?;
+        let all_groups = state
+            .filename_review_cache
+            .read()
+            .map_err(|err| internal_error(err.to_string()))?
+            .cache
+            .as_ref()
+            .expect("filename review cache initialized")
+            .trash_groups
+            .clone();
         return Ok(Json(page_filename_review_groups(
             all_groups,
             page_size,
@@ -1080,6 +1116,8 @@ async fn list_groups(
             review_mode,
         )));
     }
+
+    let conn = open_catalog_db_readonly(&state.db_path).map_err(internal_error)?;
 
     if let Some(group_id) = paging.group_id {
         let members = load_group_members(&conn, group_id).map_err(internal_error)?;
@@ -1396,6 +1434,495 @@ fn group_status_for_mode(members: &[MemberRow], review_mode: &str) -> String {
     } else {
         "archived".to_string()
     }
+}
+
+fn build_filename_review_cache(
+    conn: &rusqlite::Connection,
+    dest: &StdPath,
+) -> Result<FilenameReviewCache> {
+    let candidates = load_filename_review_candidates(conn, dest)?;
+    let mut cache = FilenameReviewCache::default();
+    for candidate in candidates {
+        for key in &candidate.keys {
+            cache
+                .key_to_ids
+                .entry(key.clone())
+                .or_default()
+                .push(candidate.member.id);
+        }
+        cache.candidates_by_id.insert(candidate.member.id, candidate);
+    }
+    for ids in cache.key_to_ids.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    cache.default_groups = build_default_groups_from_candidates(&cache.candidates_by_id, &cache.key_to_ids);
+    cache.trash_groups = build_trash_groups_from_candidates(&cache.candidates_by_id, &cache.key_to_ids);
+    Ok(cache)
+}
+
+fn ensure_filename_review_cache(state: &AppState) -> Result<(), (StatusCode, String)> {
+    {
+        let cache_state = state
+            .filename_review_cache
+            .read()
+            .map_err(|err| internal_error(err.to_string()))?;
+        if cache_state.cache.is_some() {
+            return Ok(());
+        }
+    }
+
+    let started = Instant::now();
+    let conn = open_catalog_db_readonly(&state.db_path).map_err(internal_error)?;
+    let cache = build_filename_review_cache(&conn, &state.dest).map_err(internal_error)?;
+    tracing::info!(
+        default_groups = cache.default_groups.len(),
+        trash_groups = cache.trash_groups.len(),
+        candidate_count = cache.candidates_by_id.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "serve filename review cache ready"
+    );
+    let mut cache_state = state
+        .filename_review_cache
+        .write()
+        .map_err(|err| internal_error(err.to_string()))?;
+    if cache_state.cache.is_none() {
+        cache_state.cache = Some(cache);
+    }
+    Ok(())
+}
+
+fn load_filename_review_candidates(
+    conn: &rusqlite::Connection,
+    dest: &StdPath,
+) -> Result<Vec<FilenameReviewCandidate>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, target_path, mime_type, keep_state, is_group_primary, exact_hash, phash, width, height, size_bytes, created_at
+        FROM target_items
+        WHERE group_id IS NULL
+          AND (
+            instr(target_path, '/.photo-org/trash/') = 0
+            OR instr(target_path, '/.photo-org/trash/filename-group-') > 0
+          )
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(MemberRow {
+                id: row.get(0)?,
+                target_path: row.get(1)?,
+                mime_type: row.get(2)?,
+                keep_state: row.get(3)?,
+                is_group_primary: row.get::<_, i64>(4)? != 0,
+                exact_hash: row.get(5)?,
+                phash: row.get(6)?,
+                width: row.get(7)?,
+                height: row.get(8)?,
+                size_bytes: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|member| filename_review_candidate(dest, member))
+        .collect())
+}
+
+fn default_review_candidate(member: &MemberRow) -> bool {
+    member.keep_state == "undecided"
+        && !is_logical_trash_path(StdPath::new(&member.target_path))
+}
+
+fn trash_review_candidate(member: &MemberRow) -> bool {
+    !is_logical_trash_path(StdPath::new(&member.target_path))
+        || is_filename_group_trash_target_path(&member.target_path)
+}
+
+fn collect_component_ids(
+    candidates_by_id: &HashMap<i64, FilenameReviewCandidate>,
+    key_to_ids: &HashMap<String, Vec<i64>>,
+    start_id: i64,
+    predicate: impl Fn(&MemberRow) -> bool + Copy,
+) -> HashSet<i64> {
+    let Some(start) = candidates_by_id.get(&start_id) else {
+        return HashSet::new();
+    };
+    if !predicate(&start.member) {
+        return HashSet::new();
+    }
+    let mut seen = HashSet::new();
+    let mut stack = vec![start_id];
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let candidate = &candidates_by_id[&id];
+        for key in &candidate.keys {
+            if let Some(neighbors) = key_to_ids.get(key) {
+                for neighbor_id in neighbors {
+                    let Some(neighbor) = candidates_by_id.get(neighbor_id) else {
+                        continue;
+                    };
+                    if !predicate(&neighbor.member) {
+                        continue;
+                    }
+                    if !seen.contains(neighbor_id)
+                        && filename_review_candidates_compatible(candidate, neighbor)
+                    {
+                        stack.push(*neighbor_id);
+                    }
+                }
+            }
+        }
+    }
+    seen
+}
+
+fn build_default_groups_from_candidates(
+    candidates_by_id: &HashMap<i64, FilenameReviewCandidate>,
+    key_to_ids: &HashMap<String, Vec<i64>>,
+) -> Vec<FilenameReviewGroup> {
+    let mut groups = Vec::new();
+    let mut seen = HashSet::new();
+    for start_id in candidates_by_id.keys().copied().collect::<Vec<_>>() {
+        if seen.contains(&start_id) {
+            continue;
+        }
+        let component_ids = collect_component_ids(
+            candidates_by_id,
+            key_to_ids,
+            start_id,
+            default_review_candidate,
+        );
+        if component_ids.is_empty() {
+            continue;
+        }
+        seen.extend(component_ids.iter().copied());
+        if component_ids.len() < 2 {
+            continue;
+        }
+
+        let component = component_ids
+            .into_iter()
+            .filter_map(|id| candidates_by_id.get(&id).cloned())
+            .collect::<Vec<_>>();
+        if !component.iter().any(|candidate| candidate.derived) {
+            continue;
+        }
+
+        let default_member_id = component
+            .iter()
+            .filter(|candidate| is_default_prefixed_target_path(&candidate.member.target_path))
+            .map(|candidate| candidate.member.id)
+            .min()
+            .or_else(|| {
+                component
+                    .iter()
+                    .filter(|candidate| candidate.derived)
+                    .map(|candidate| candidate.member.id)
+                    .min()
+            })
+            .unwrap_or(component[0].member.id);
+
+        let mut members = component
+            .iter()
+            .map(|candidate| {
+                let mut member = candidate.member.clone();
+                member.is_group_primary = false;
+                member
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(primary_id) = choose_best_primary_member(&members) {
+            for member in &mut members {
+                member.is_group_primary = member.id == primary_id;
+            }
+        }
+
+        members.sort_by_key(|member| {
+            (
+                !member.is_group_primary,
+                !is_default_prefixed_target_path(&member.target_path),
+                member.created_at.clone(),
+                member.id,
+            )
+        });
+
+        groups.push(FilenameReviewGroup {
+            review_group_id: filename_review_group_id(default_member_id),
+            default_member_id,
+            members,
+        });
+    }
+
+    groups.sort_by_key(|group| {
+        let first_created = group
+            .members
+            .iter()
+            .map(|member| member.created_at.as_str())
+            .min()
+            .unwrap_or("");
+        (first_created.to_string(), group.default_member_id)
+    });
+    groups
+}
+
+fn build_trash_groups_from_candidates(
+    candidates_by_id: &HashMap<i64, FilenameReviewCandidate>,
+    key_to_ids: &HashMap<String, Vec<i64>>,
+) -> Vec<FilenameReviewGroup> {
+    let trash_seed_ids = candidates_by_id
+        .values()
+        .filter(|candidate| is_filename_group_trash_target_path(&candidate.member.target_path))
+        .map(|candidate| candidate.member.id)
+        .collect::<Vec<_>>();
+
+    let mut groups = Vec::new();
+    let mut seen = HashSet::new();
+    for start_id in trash_seed_ids {
+        if seen.contains(&start_id) {
+            continue;
+        }
+        let component_ids = collect_component_ids(
+            candidates_by_id,
+            key_to_ids,
+            start_id,
+            trash_review_candidate,
+        );
+        if component_ids.is_empty() {
+            continue;
+        }
+        seen.extend(component_ids.iter().copied());
+        if component_ids.len() < 2 {
+            continue;
+        }
+
+        let component = component_ids
+            .into_iter()
+            .filter_map(|id| candidates_by_id.get(&id).cloned())
+            .collect::<Vec<_>>();
+        if !component
+            .iter()
+            .any(|candidate| is_filename_group_trash_target_path(&candidate.member.target_path))
+        {
+            continue;
+        }
+        if !component
+            .iter()
+            .any(|candidate| !is_logical_trash_path(StdPath::new(&candidate.member.target_path)))
+        {
+            continue;
+        }
+
+        let trash_member_id = component
+            .iter()
+            .filter(|candidate| is_filename_group_trash_target_path(&candidate.member.target_path))
+            .map(|candidate| candidate.member.id)
+            .min()
+            .unwrap_or(component[0].member.id);
+
+        let mut members = component
+            .iter()
+            .map(|candidate| {
+                let mut member = candidate.member.clone();
+                member.is_group_primary = false;
+                member
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(primary_id) = choose_best_primary_member(&members) {
+            for member in &mut members {
+                member.is_group_primary = member.id == primary_id;
+            }
+        }
+
+        members.sort_by_key(|member| {
+            (
+                !member.is_group_primary,
+                is_logical_trash_path(StdPath::new(&member.target_path)),
+                member.created_at.clone(),
+                member.id,
+            )
+        });
+
+        groups.push(FilenameReviewGroup {
+            review_group_id: filename_trash_review_group_id(trash_member_id),
+            default_member_id: trash_member_id,
+            members,
+        });
+    }
+
+    groups.sort_by_key(|group| {
+        let first_created = group
+            .members
+            .iter()
+            .map(|member| member.created_at.as_str())
+            .min()
+            .unwrap_or("");
+        (first_created.to_string(), group.default_member_id)
+    });
+    groups
+}
+
+fn refresh_filename_review_cache_rows(
+    cache_state: &mut FilenameReviewCacheState,
+    conn: &rusqlite::Connection,
+    dest: &StdPath,
+    affected_member_ids: &[i64],
+) -> Result<()> {
+    let Some(cache) = cache_state.cache.as_mut() else {
+        return Ok(());
+    };
+    if affected_member_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut region_ids = HashSet::new();
+    for member_id in affected_member_ids {
+        region_ids.extend(collect_component_ids(
+            &cache.candidates_by_id,
+            &cache.key_to_ids,
+            *member_id,
+            trash_review_candidate,
+        ));
+    }
+
+    for member_id in affected_member_ids {
+        if let Some(previous) = cache.candidates_by_id.remove(member_id) {
+            for key in previous.keys {
+                if let Some(ids) = cache.key_to_ids.get_mut(&key) {
+                    ids.retain(|id| id != member_id);
+                    if ids.is_empty() {
+                        cache.key_to_ids.remove(&key);
+                    }
+                }
+            }
+        }
+    }
+
+    for member_id in affected_member_ids {
+        if let Some(member) = load_filename_review_member(conn, *member_id)? {
+            if let Some(candidate) = filename_review_candidate(dest, member) {
+                for key in &candidate.keys {
+                    let ids = cache.key_to_ids.entry(key.clone()).or_default();
+                    if !ids.contains(member_id) {
+                        ids.push(*member_id);
+                        ids.sort_unstable();
+                    }
+                }
+                cache.candidates_by_id.insert(*member_id, candidate);
+            }
+        }
+    }
+
+    for member_id in affected_member_ids {
+        region_ids.extend(collect_component_ids(
+            &cache.candidates_by_id,
+            &cache.key_to_ids,
+            *member_id,
+            trash_review_candidate,
+        ));
+    }
+
+    cache
+        .default_groups
+        .retain(|group| !group.members.iter().any(|member| region_ids.contains(&member.id)));
+    cache
+        .trash_groups
+        .retain(|group| !group.members.iter().any(|member| region_ids.contains(&member.id)));
+
+    if region_ids.is_empty() {
+        return Ok(());
+    }
+
+    let region_candidates = cache
+        .candidates_by_id
+        .iter()
+        .filter(|(id, _)| region_ids.contains(id))
+        .map(|(id, candidate)| (*id, candidate.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut region_key_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
+    for candidate in region_candidates.values() {
+        for key in &candidate.keys {
+            region_key_to_ids
+                .entry(key.clone())
+                .or_default()
+                .push(candidate.member.id);
+        }
+    }
+    for ids in region_key_to_ids.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+
+    cache.default_groups.extend(build_default_groups_from_candidates(
+        &region_candidates,
+        &region_key_to_ids,
+    ));
+    cache.trash_groups.extend(build_trash_groups_from_candidates(
+        &region_candidates,
+        &region_key_to_ids,
+    ));
+
+    cache.default_groups.sort_by_key(|group| {
+        let first_created = group
+            .members
+            .iter()
+            .map(|member| member.created_at.as_str())
+            .min()
+            .unwrap_or("");
+        (first_created.to_string(), group.default_member_id)
+    });
+    cache.trash_groups.sort_by_key(|group| {
+        let first_created = group
+            .members
+            .iter()
+            .map(|member| member.created_at.as_str())
+            .min()
+            .unwrap_or("");
+        (first_created.to_string(), group.default_member_id)
+    });
+    Ok(())
+}
+
+fn load_filename_review_member(
+    conn: &rusqlite::Connection,
+    member_id: i64,
+) -> Result<Option<MemberRow>> {
+    conn.query_row(
+        r#"
+        SELECT id, target_path, mime_type, keep_state, is_group_primary, exact_hash, phash, width, height, size_bytes, created_at
+        FROM target_items
+        WHERE id = ?1
+          AND group_id IS NULL
+          AND (
+            instr(target_path, '/.photo-org/trash/') = 0
+            OR instr(target_path, '/.photo-org/trash/filename-group-') > 0
+          )
+        "#,
+        rusqlite::params![member_id],
+        |row| {
+            Ok(MemberRow {
+                id: row.get(0)?,
+                target_path: row.get(1)?,
+                mime_type: row.get(2)?,
+                keep_state: row.get(3)?,
+                is_group_primary: row.get::<_, i64>(4)? != 0,
+                exact_hash: row.get(5)?,
+                phash: row.get(6)?,
+                width: row.get(7)?,
+                height: row.get(8)?,
+                size_bytes: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn trash_member_ids(group: &[MemberRow]) -> Vec<i64> {
@@ -1892,6 +2419,31 @@ fn filename_default_group_members(
         .ok_or_else(|| anyhow::anyhow!("filename review group not found: {review_group_id}"))
 }
 
+fn cached_filename_review_group_members(
+    state: &AppState,
+    review_group_id: i64,
+) -> Result<Vec<MemberRow>, (StatusCode, String)> {
+    ensure_filename_review_cache(state)?;
+    let cache = state
+        .filename_review_cache
+        .read()
+        .map_err(|err| internal_error(err.to_string()))?;
+    let cache = cache
+        .cache
+        .as_ref()
+        .expect("filename review cache initialized");
+    let groups = if is_filename_trash_review_group_id(review_group_id) {
+        &cache.trash_groups
+    } else {
+        &cache.default_groups
+    };
+    groups
+        .iter()
+        .find(|group| group.review_group_id == review_group_id)
+        .map(|group| group.members.clone())
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "group not found".to_string()))
+}
+
 fn reserve_restore_path(
     dest: &StdPath,
     created_at: &str,
@@ -1947,7 +2499,23 @@ async fn resolve_bulk(
         );
 
         match apply_bulk_resolution_group(&mut conn, &state.dest, &res) {
-            Ok(BulkGroupOutcome::Skipped { elapsed_ms }) => {
+            Ok(BulkGroupOutcome::Skipped {
+                elapsed_ms,
+                affected_member_ids,
+            }) => {
+                if !affected_member_ids.is_empty() {
+                    let mut cache = state
+                        .filename_review_cache
+                        .write()
+                        .map_err(|err| internal_error(err.to_string()))?;
+                    refresh_filename_review_cache_rows(
+                        &mut cache,
+                        &conn,
+                        &state.dest,
+                        &affected_member_ids,
+                    )
+                    .map_err(internal_error)?;
+                }
                 skipped_groups += 1;
                 tracing::info!(
                     group_id = res.group_id,
@@ -1960,7 +2528,21 @@ async fn resolve_bulk(
             Ok(BulkGroupOutcome::Applied {
                 moved_files,
                 elapsed_ms,
+                affected_member_ids,
             }) => {
+                if !affected_member_ids.is_empty() {
+                    let mut cache = state
+                        .filename_review_cache
+                        .write()
+                        .map_err(|err| internal_error(err.to_string()))?;
+                    refresh_filename_review_cache_rows(
+                        &mut cache,
+                        &conn,
+                        &state.dest,
+                        &affected_member_ids,
+                    )
+                    .map_err(internal_error)?;
+                }
                 applied_groups += 1;
                 tracing::info!(
                     group_id = res.group_id,
@@ -2012,8 +2594,15 @@ async fn resolve_bulk(
 }
 
 enum BulkGroupOutcome {
-    Skipped { elapsed_ms: u128 },
-    Applied { moved_files: usize, elapsed_ms: u128 },
+    Skipped {
+        elapsed_ms: u128,
+        affected_member_ids: Vec<i64>,
+    },
+    Applied {
+        moved_files: usize,
+        elapsed_ms: u128,
+        affected_member_ids: Vec<i64>,
+    },
 }
 
 fn apply_bulk_resolution_group(
@@ -2041,6 +2630,11 @@ fn apply_bulk_resolution_group(
     }
 
     let selection = load_bulk_group_selection(conn, dest, res).map_err(|err| err.to_string())?;
+    let affected_member_ids = selection
+        .members
+        .iter()
+        .map(|member| member.id)
+        .collect::<Vec<_>>();
     let group_started = Instant::now();
     let tx = conn.transaction().map_err(|err| err.to_string())?;
 
@@ -2131,11 +2725,15 @@ fn apply_bulk_resolution_group(
             member.keep_state == keep_state && member.is_group_primary == is_primary
         })
     {
-        Ok(BulkGroupOutcome::Skipped { elapsed_ms })
+        Ok(BulkGroupOutcome::Skipped {
+            elapsed_ms,
+            affected_member_ids,
+        })
     } else {
         Ok(BulkGroupOutcome::Applied {
             moved_files: moved_count,
             elapsed_ms,
+            affected_member_ids,
         })
     }
 }
@@ -2431,6 +3029,15 @@ async fn resolve_group(
         }
         return Err(internal_error(err));
     }
+    let affected_member_ids = group.iter().map(|member| member.id).collect::<Vec<_>>();
+    if !affected_member_ids.is_empty() {
+        let mut cache = state
+            .filename_review_cache
+            .write()
+            .map_err(|err| internal_error(err.to_string()))?;
+        refresh_filename_review_cache_rows(&mut cache, &conn, &state.dest, &affected_member_ids)
+            .map_err(internal_error)?;
+    }
     Ok(Json(json!({"group_id": id, "status": "ok"})))
 }
 
@@ -2671,6 +3278,14 @@ async fn delete_trash_group(
         ));
     }
     let payload = delete_trash_members_by_ids(&mut conn, &state.dest, &member_ids)?;
+    {
+        let mut cache = state
+            .filename_review_cache
+            .write()
+            .map_err(|err| internal_error(err.to_string()))?;
+        refresh_filename_review_cache_rows(&mut cache, &conn, &state.dest, &member_ids)
+            .map_err(internal_error)?;
+    }
     tracing::info!(
         group_id,
         deleted_members = member_ids.len(),
@@ -2693,6 +3308,14 @@ async fn delete_trash_bulk(
     );
     let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
     let payload = delete_trash_members_by_ids(&mut conn, &state.dest, &request.member_ids)?;
+    {
+        let mut cache = state
+            .filename_review_cache
+            .write()
+            .map_err(|err| internal_error(err.to_string()))?;
+        refresh_filename_review_cache_rows(&mut cache, &conn, &state.dest, &request.member_ids)
+            .map_err(internal_error)?;
+    }
     tracing::info!(
         requested_members = request.member_ids.len(),
         "serve trash delete bulk finished"
@@ -2706,13 +3329,25 @@ async fn delete_trash_member(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     tracing::info!(group_id, member_id, "serve trash delete member start");
     let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
-    let group = load_review_group_members(&conn, &state.dest, group_id).map_err(internal_error)?;
+    let group = if group_id < 0 {
+        cached_filename_review_group_members(&state, group_id)?
+    } else {
+        load_review_group_members(&conn, &state.dest, group_id).map_err(internal_error)?
+    };
     let member = group
         .iter()
         .find(|member| member.id == member_id)
         .cloned()
         .ok_or_else(|| (StatusCode::NOT_FOUND, "group member not found".to_string()))?;
     let payload = delete_trash_members_by_ids(&mut conn, &state.dest, &[member.id])?;
+    {
+        let mut cache = state
+            .filename_review_cache
+            .write()
+            .map_err(|err| internal_error(err.to_string()))?;
+        refresh_filename_review_cache_rows(&mut cache, &conn, &state.dest, &[member.id])
+            .map_err(internal_error)?;
+    }
     tracing::info!(group_id, member_id, "serve trash delete member finished");
     Ok(Json(json!({
         "group_id": group_id,
@@ -2728,7 +3363,11 @@ async fn restore_trash_member(
     let started = Instant::now();
     tracing::info!(group_id, member_id, "serve trash restore member start");
     let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
-    let group = load_review_group_members(&conn, &state.dest, group_id).map_err(internal_error)?;
+    let group = if group_id < 0 {
+        cached_filename_review_group_members(&state, group_id)?
+    } else {
+        load_review_group_members(&conn, &state.dest, group_id).map_err(internal_error)?
+    };
     let member = group
         .iter()
         .find(|member| member.id == member_id)
@@ -2797,6 +3436,14 @@ async fn restore_trash_member(
     if let Err(err) = tx.commit() {
         let _ = fs::rename(&restored_path, &current_path);
         return Err(internal_error(err));
+    }
+    {
+        let mut cache = state
+            .filename_review_cache
+            .write()
+            .map_err(|err| internal_error(err.to_string()))?;
+        refresh_filename_review_cache_rows(&mut cache, &conn, &state.dest, &[member_id])
+            .map_err(internal_error)?;
     }
     tracing::info!(
         group_id,
@@ -3300,6 +3947,10 @@ mod tests {
         .unwrap();
     }
 
+    fn test_app(db_path: PathBuf, dest: PathBuf) -> Router {
+        router(build_app_state(db_path, dest).unwrap())
+    }
+
     #[tokio::test]
     async fn list_groups_supports_page_index_and_page_size() {
         let tmp = tempdir().unwrap();
@@ -3311,7 +3962,7 @@ mod tests {
         insert_pending_group(&conn, 2, "/tmp");
         insert_pending_group(&conn, 3, "/tmp");
 
-        let app = router(AppState { db_path, dest });
+        let app = test_app(db_path, dest);
         let request = axum::http::Request::builder()
             .uri("/api/groups?page_index=1&page_size=1")
             .body(axum::body::Body::empty())
@@ -3357,7 +4008,7 @@ mod tests {
             &trash_dir_2.join("reject-2.png").to_string_lossy(),
         );
 
-        let app = router(AppState { db_path, dest });
+        let app = test_app(db_path, dest);
         let request = axum::http::Request::builder()
             .uri("/api/groups?view=trash&page_index=0&page_size=1")
             .body(axum::body::Body::empty())
@@ -3387,7 +4038,7 @@ mod tests {
             "2025/03/17/defaultimg_1234.jpg",
         );
 
-        let app = router(AppState { db_path, dest });
+        let app = test_app(db_path, dest);
         let request = axum::http::Request::builder()
             .uri("/api/groups?view=filename&page_index=0&page_size=10")
             .body(axum::body::Body::empty())
@@ -3441,7 +4092,7 @@ mod tests {
             "2019-12-19T00:00:01Z",
         );
 
-        let app = router(AppState { db_path, dest });
+        let app = test_app(db_path, dest);
         let request = axum::http::Request::builder()
             .uri("/api/groups?view=filename&page_index=0&page_size=10")
             .body(axum::body::Body::empty())
@@ -3498,7 +4149,7 @@ mod tests {
         )
         .unwrap();
 
-        let app = router(AppState { db_path, dest });
+        let app = test_app(db_path, dest);
         let request = axum::http::Request::builder()
             .uri("/api/groups?view=filename&page_index=0&page_size=10")
             .body(axum::body::Body::empty())
@@ -3552,10 +4203,7 @@ mod tests {
             "2025/03/17/defaultimg_1234.jpg",
         );
 
-        let app = router(AppState {
-            db_path: db_path.clone(),
-            dest: dest.clone(),
-        });
+        let app = test_app(db_path.clone(), dest.clone());
         let request = axum::http::Request::builder()
             .uri("/api/groups?view=filename&page_index=0&page_size=10")
             .body(axum::body::Body::empty())
@@ -3631,7 +4279,7 @@ mod tests {
         let db_path = tmp.path().join("catalog.db");
         open_catalog_db(&db_path).unwrap();
 
-        let app = router(AppState { db_path, dest });
+        let app = test_app(db_path, dest);
         let request = axum::http::Request::builder()
             .uri("/")
             .body(axum::body::Body::empty())
@@ -3656,7 +4304,7 @@ mod tests {
         let db_path = tmp.path().join("catalog.db");
         open_catalog_db(&db_path).unwrap();
 
-        let app = router(AppState { db_path, dest });
+        let app = test_app(db_path, dest);
         let request = axum::http::Request::builder()
             .uri("/")
             .body(axum::body::Body::empty())
@@ -3685,7 +4333,7 @@ mod tests {
         let db_path = tmp.path().join("catalog.db");
         open_catalog_db(&db_path).unwrap();
 
-        let app = router(AppState { db_path, dest });
+        let app = test_app(db_path, dest);
         let request = axum::http::Request::builder()
             .uri("/?page_index=2&page_size=1")
             .body(axum::body::Body::empty())
@@ -3709,7 +4357,7 @@ mod tests {
         let db_path = tmp.path().join("catalog.db");
         open_catalog_db(&db_path).unwrap();
 
-        let app = router(AppState { db_path, dest });
+        let app = test_app(db_path, dest);
         let request = axum::http::Request::builder()
             .uri("/?group_id=42&page_size=5")
             .body(axum::body::Body::empty())
@@ -3732,7 +4380,7 @@ mod tests {
         let db_path = tmp.path().join("catalog.db");
         open_catalog_db(&db_path).unwrap();
 
-        let app = router(AppState { db_path, dest });
+        let app = test_app(db_path, dest);
         let request = axum::http::Request::builder()
             .uri("/?view=trash&page_size=5")
             .body(axum::body::Body::empty())
@@ -3760,10 +4408,7 @@ mod tests {
             "2025/03/17/defaultimg_1234.jpg",
         );
 
-        let app = router(AppState {
-            db_path: db_path.clone(),
-            dest: dest.clone(),
-        });
+        let app = test_app(db_path.clone(), dest.clone());
         let request = axum::http::Request::builder()
             .uri("/api/groups?view=filename&page_index=0&page_size=10")
             .body(axum::body::Body::empty())
@@ -3848,10 +4493,7 @@ mod tests {
             "2025/03/17/defaultimg_1234.jpg",
         );
 
-        let app = router(AppState {
-            db_path: db_path.clone(),
-            dest: dest.clone(),
-        });
+        let app = test_app(db_path.clone(), dest.clone());
         let request = axum::http::Request::builder()
             .uri("/api/groups?view=filename&page_index=0&page_size=10")
             .body(axum::body::Body::empty())
@@ -3944,10 +4586,7 @@ mod tests {
             "2025/03/17/defaultimg_1234.jpg",
         );
 
-        let app = router(AppState {
-            db_path: db_path.clone(),
-            dest: dest.clone(),
-        });
+        let app = test_app(db_path.clone(), dest.clone());
         let request = axum::http::Request::builder()
             .uri("/api/groups?view=filename&page_index=0&page_size=10")
             .body(axum::body::Body::empty())
@@ -4021,10 +4660,7 @@ mod tests {
             "2025/03/17/defaultimg_1234.jpg",
         );
 
-        let app = router(AppState {
-            db_path: db_path.clone(),
-            dest: dest.clone(),
-        });
+        let app = test_app(db_path.clone(), dest.clone());
         let request = axum::http::Request::builder()
             .uri("/api/groups?view=filename&page_index=0&page_size=10")
             .body(axum::body::Body::empty())
@@ -4144,10 +4780,7 @@ mod tests {
 
         fs::rename(&keep_1, dest.join(".photo-org-trash-temp-keep-1.png")).unwrap();
 
-        let app = router(AppState {
-            db_path: db_path.clone(),
-            dest: dest.clone(),
-        });
+        let app = test_app(db_path.clone(), dest.clone());
         let payload = json!({
             "resolutions": [
                 {
@@ -4230,7 +4863,7 @@ mod tests {
         let db_path = tmp.path().join("catalog.db");
         open_catalog_db(&db_path).unwrap();
 
-        let app = router(AppState { db_path, dest });
+        let app = test_app(db_path, dest);
         let request = axum::http::Request::builder()
             .uri("/?view=trash")
             .body(axum::body::Body::empty())
@@ -4276,7 +4909,7 @@ mod tests {
         )
         .unwrap();
 
-        let app = router(AppState { db_path, dest });
+        let app = test_app(db_path, dest);
         let request = axum::http::Request::builder()
             .uri("/api/groups?group_id=8&view=trash")
             .body(axum::body::Body::empty())
@@ -4322,10 +4955,7 @@ mod tests {
         )
         .unwrap();
 
-        let app = router(AppState {
-            db_path: db_path.clone(),
-            dest: dest.clone(),
-        });
+        let app = test_app(db_path.clone(), dest.clone());
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/api/groups/1/resolve")
@@ -4400,10 +5030,7 @@ mod tests {
         )
         .unwrap();
 
-        let app = router(AppState {
-            db_path: db_path.clone(),
-            dest: dest.clone(),
-        });
+        let app = test_app(db_path.clone(), dest.clone());
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/api/groups/1/resolve")
@@ -4449,10 +5076,7 @@ mod tests {
         )
         .unwrap();
 
-        let app = router(AppState {
-            db_path: db_path.clone(),
-            dest: dest.clone(),
-        });
+        let app = test_app(db_path.clone(), dest.clone());
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/api/groups/1/members/2/delete_trash")
@@ -4511,10 +5135,7 @@ mod tests {
         )
         .unwrap();
 
-        let app = router(AppState {
-            db_path: db_path.clone(),
-            dest: dest.clone(),
-        });
+        let app = test_app(db_path.clone(), dest.clone());
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/api/groups/1/members/2/delete_trash")
@@ -4558,10 +5179,7 @@ mod tests {
         )
         .unwrap();
 
-        let app = router(AppState {
-            db_path: db_path.clone(),
-            dest: dest.clone(),
-        });
+        let app = test_app(db_path.clone(), dest.clone());
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/api/groups/5/members/2/restore_trash")
@@ -4620,10 +5238,7 @@ mod tests {
         fs::create_dir_all(trash_path.parent().unwrap()).unwrap();
         fs::rename(&old_path, &trash_path).unwrap();
 
-        let app = router(AppState {
-            db_path: db_path.clone(),
-            dest: dest.clone(),
-        });
+        let app = test_app(db_path.clone(), dest.clone());
         let request = axum::http::Request::builder()
             .uri(format!("/image?path={}&size=400", old_target_path))
             .body(axum::body::Body::empty())
@@ -4682,10 +5297,7 @@ mod tests {
         )
         .unwrap();
 
-        let app = router(AppState {
-            db_path: db_path.clone(),
-            dest: dest.clone(),
-        });
+        let app = test_app(db_path.clone(), dest.clone());
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/api/groups/7/delete_trash")
@@ -4740,10 +5352,7 @@ mod tests {
             &trash_path_2.to_string_lossy(),
         );
 
-        let app = router(AppState {
-            db_path: db_path.clone(),
-            dest: dest.clone(),
-        });
+        let app = test_app(db_path.clone(), dest.clone());
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/api/groups/delete_trash_bulk")
@@ -4778,7 +5387,7 @@ mod tests {
         let db_path = tmp.path().join("catalog.db");
         open_catalog_db(&db_path).unwrap();
 
-        let state = AppState { db_path, dest };
+        let state = build_app_state(db_path, dest).unwrap();
         let app = router(state);
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
