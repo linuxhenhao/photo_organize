@@ -17,9 +17,10 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::fs;
 use std::future::Future;
-use std::io::Cursor;
+use std::io::{BufReader, Cursor};
 use std::path::{Component, Path as StdPath, PathBuf};
 use std::time::Instant;
 use std::sync::OnceLock;
@@ -88,6 +89,21 @@ struct FilenameReviewCandidate {
     member: MemberRow,
     keys: Vec<String>,
     derived: bool,
+    optics_signature: Option<String>,
+    effective_orientation: EffectiveOrientation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EffectiveOrientation {
+    Landscape,
+    Portrait,
+    Square,
+}
+
+#[derive(Clone, Debug)]
+struct FilenameReviewHints {
+    optics_signature: Option<String>,
+    effective_orientation: EffectiveOrientation,
 }
 
 static TIMESTAMP_TOKEN_RE: Lazy<Regex> =
@@ -1001,7 +1017,8 @@ async fn list_groups(
     let review_groups_with_trash = is_trash_review_mode(review_mode);
 
     if is_filename_default_review_mode(review_mode) {
-        let all_groups = load_filename_default_review_groups(&conn).map_err(internal_error)?;
+        let all_groups =
+            load_filename_default_review_groups(&conn, &state.dest).map_err(internal_error)?;
         return Ok(Json(page_filename_review_groups(
             all_groups,
             page_size,
@@ -1354,6 +1371,7 @@ fn trash_member_ids(group: &[MemberRow]) -> Vec<i64> {
 
 fn load_filename_default_review_groups(
     conn: &rusqlite::Connection,
+    dest: &StdPath,
 ) -> Result<Vec<FilenameReviewGroup>> {
     let mut stmt = conn.prepare(
         r#"
@@ -1385,7 +1403,7 @@ fn load_filename_default_review_groups(
 
     let candidates = rows
         .into_iter()
-        .filter_map(filename_review_candidate)
+        .filter_map(|member| filename_review_candidate(dest, member))
         .collect::<Vec<_>>();
     let mut by_id = HashMap::new();
     let mut key_to_ids: HashMap<String, Vec<i64>> = HashMap::new();
@@ -1416,7 +1434,12 @@ fn load_filename_default_review_groups(
             for key in &candidate.keys {
                 if let Some(neighbors) = key_to_ids.get(key) {
                     for neighbor_id in neighbors {
-                        if !seen.contains(neighbor_id) {
+                        if !seen.contains(neighbor_id)
+                            && filename_review_candidates_compatible(
+                                candidate,
+                                &by_id[neighbor_id],
+                            )
+                        {
                             stack.push(*neighbor_id);
                         }
                     }
@@ -1522,7 +1545,8 @@ fn is_default_prefixed_target_path(target_path: &str) -> bool {
         .is_some()
 }
 
-fn filename_review_candidate(member: MemberRow) -> Option<FilenameReviewCandidate> {
+fn filename_review_candidate(dest: &StdPath, member: MemberRow) -> Option<FilenameReviewCandidate> {
+    let fallback_orientation = effective_orientation_from_dimensions(member.width, member.height);
     let (stem, _ext) = split_filename_stem_and_ext(&member.target_path)?;
     let mut keys = Vec::new();
     let mut derived = false;
@@ -1548,10 +1572,15 @@ fn filename_review_candidate(member: MemberRow) -> Option<FilenameReviewCandidat
 
     keys.sort();
     keys.dedup();
+    let hints = read_filename_review_hints(dest, &member);
     (!keys.is_empty()).then_some(FilenameReviewCandidate {
         member,
         keys,
         derived,
+        optics_signature: hints.as_ref().and_then(|hint| hint.optics_signature.clone()),
+        effective_orientation: hints
+            .map(|hint| hint.effective_orientation)
+            .unwrap_or(fallback_orientation),
     })
 }
 
@@ -1575,18 +1604,91 @@ fn img_same_id_subject_key(stem: &str) -> Option<String> {
     Some(format!("img_{}", &caps[1]))
 }
 
+// Filename-only grouping is too permissive for cases like IMG_2454.JPG vs img_2454.jpg:
+// both share the same basename family, but EXIF shows different optics/orientation.
+// We keep the filename families as the coarse candidate generator, then require
+// orientation agreement and reject links when both sides expose conflicting lens signatures.
+fn filename_review_candidates_compatible(
+    left: &FilenameReviewCandidate,
+    right: &FilenameReviewCandidate,
+) -> bool {
+    if left.effective_orientation != right.effective_orientation {
+        return false;
+    }
+    match (&left.optics_signature, &right.optics_signature) {
+        (Some(left_sig), Some(right_sig)) => left_sig == right_sig,
+        _ => true,
+    }
+}
+
+fn read_filename_review_hints(
+    dest: &StdPath,
+    member: &MemberRow,
+) -> Option<FilenameReviewHints> {
+    let path = resolve_physical_path(dest, &member.target_path);
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
+    let orientation = exif
+        .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+        .and_then(|field| field.value.get_uint(0))
+        .map(effective_orientation_from_exif)
+        .unwrap_or_else(|| effective_orientation_from_dimensions(member.width, member.height));
+    Some(FilenameReviewHints {
+        optics_signature: exif_optics_signature(&exif),
+        effective_orientation: orientation,
+    })
+}
+
+fn exif_optics_signature(exif: &exif::Exif) -> Option<String> {
+    for tag in [
+        exif::Tag::LensModel,
+        exif::Tag::LensSpecification,
+        exif::Tag::FocalLengthIn35mmFilm,
+        exif::Tag::FocalLength,
+    ] {
+        let Some(field) = exif.get_field(tag, exif::In::PRIMARY) else {
+            continue;
+        };
+        let rendered = field.display_value().with_unit(exif).to_string();
+        let normalized = rendered.trim().trim_matches('"').to_ascii_lowercase();
+        if !normalized.is_empty() {
+            return Some(normalized);
+        }
+    }
+    None
+}
+
+fn effective_orientation_from_exif(value: u32) -> EffectiveOrientation {
+    match value {
+        5..=8 => EffectiveOrientation::Portrait,
+        _ => EffectiveOrientation::Landscape,
+    }
+}
+
+fn effective_orientation_from_dimensions(width: i64, height: i64) -> EffectiveOrientation {
+    if width == height {
+        EffectiveOrientation::Square
+    } else if height > width {
+        EffectiveOrientation::Portrait
+    } else {
+        EffectiveOrientation::Landscape
+    }
+}
+
 fn filename_review_group_id(default_member_id: i64) -> i64 {
     -default_member_id
 }
 
 fn filename_default_group_members(
     conn: &rusqlite::Connection,
+    dest: &StdPath,
     review_group_id: i64,
 ) -> Result<Vec<MemberRow>> {
     let default_member_id = review_group_id
         .checked_neg()
         .ok_or_else(|| anyhow::anyhow!("invalid filename review group id {review_group_id}"))?;
-    let groups = load_filename_default_review_groups(conn)?;
+    let groups = load_filename_default_review_groups(conn, dest)?;
     groups
         .into_iter()
         .find(|group| group.default_member_id == default_member_id)
@@ -1649,7 +1751,8 @@ async fn resolve_bulk(
     let tx = conn.transaction().map_err(internal_error)?;
 
     for res in request.resolutions {
-        let group = load_review_group_members(&tx, res.group_id).map_err(internal_error)?;
+        let group =
+            load_review_group_members(&tx, &state.dest, res.group_id).map_err(internal_error)?;
         let kept_set: HashSet<_> = res.kept.iter().collect();
         let rejected_set: HashSet<_> = res.rejected.iter().collect();
 
@@ -1710,7 +1813,7 @@ async fn resolve_group(
     Json(request): Json<ResolveRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut conn = open_catalog_db(&state.db_path).map_err(internal_error)?;
-    let group = load_review_group_members(&conn, id).map_err(internal_error)?;
+    let group = load_review_group_members(&conn, &state.dest, id).map_err(internal_error)?;
     if group.is_empty() {
         return Err((StatusCode::NOT_FOUND, "group not found".into()));
     }
@@ -1801,7 +1904,7 @@ async fn archive_group(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let conn = open_catalog_db_readonly(&state.db_path).map_err(internal_error)?;
-    let group = load_review_group_members(&conn, id).map_err(internal_error)?;
+    let group = load_review_group_members(&conn, &state.dest, id).map_err(internal_error)?;
     Ok(Json(json!({ "group_id": id, "members": group })))
 }
 
@@ -2317,9 +2420,13 @@ fn choose_best_primary_member(members: &[MemberRow]) -> Option<i64> {
         .map(|member| member.id)
 }
 
-fn load_review_group_members(conn: &rusqlite::Connection, group_id: i64) -> Result<Vec<MemberRow>> {
+fn load_review_group_members(
+    conn: &rusqlite::Connection,
+    dest: &StdPath,
+    group_id: i64,
+) -> Result<Vec<MemberRow>> {
     if group_id < 0 {
-        filename_default_group_members(conn, group_id)
+        filename_default_group_members(conn, dest, group_id)
     } else {
         load_group_members(conn, group_id)
     }
