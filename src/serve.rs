@@ -1382,31 +1382,7 @@ fn find_in_trash(dest: &PathBuf, target_path: &str, group_id: i64) -> Option<Pat
         .join(".photo-org")
         .join("trash")
         .join(trash_group_dir_name(group_id));
-    if !trash_dir.exists() {
-        return None;
-    }
-
-    // Since target_path in DB includes the "repo/" prefix (or whatever dest is),
-    // but the file in trash might only use the basename, we use the original path's basename.
-    let expected_name = safe_file_name(StdPath::new(target_path));
-    let mut idx = 0usize;
-    loop {
-        let candidate = if idx == 0 {
-            trash_dir.join(&expected_name)
-        } else {
-            trash_dir.join(format!("{}-{}", idx, &expected_name))
-        };
-
-        if candidate.exists() {
-            return Some(candidate);
-        }
-
-        if idx > 100 {
-            break;
-        }
-        idx += 1;
-    }
-    None
+    find_existing_trash_variant(&trash_dir, StdPath::new(target_path))
 }
 
 fn group_status_for_mode(members: &[MemberRow], review_mode: &str) -> String {
@@ -2841,7 +2817,18 @@ async fn image(
     State(state): State<AppState>,
     Query(query): Query<ImageQuery>,
 ) -> Result<Response, (StatusCode, String)> {
-    let path = resolve_physical_path(&state.dest, &query.path);
+    let mut path = resolve_physical_path(&state.dest, &query.path);
+    if !path.exists() {
+        if let Some(repaired_target_path) =
+            repair_stale_target_path_to_trash(&state.db_path, &state.dest, &query.path)
+                .map_err(internal_error)?
+        {
+            path = resolve_physical_path(&state.dest, &repaired_target_path);
+        }
+    }
+    if !path.exists() {
+        return Err((StatusCode::NOT_FOUND, format!("file not found: {}", query.path)));
+    }
     ensure_under_target_root(&state.dest, &path).map_err(internal_error)?;
 
     // 1. Try UGOS thumbnail if enabled
@@ -2918,6 +2905,99 @@ async fn image(
         HeaderValue::from_static("image/jpeg"),
     );
     Ok(resp)
+}
+
+fn repair_stale_target_path_to_trash(
+    catalog_db: &StdPath,
+    dest: &StdPath,
+    stale_target_path: &str,
+) -> Result<Option<String>> {
+    let conn = open_catalog_db(catalog_db)?;
+    let row = conn
+        .query_row(
+            "SELECT id, target_path, group_id, keep_state FROM target_items WHERE target_path = ?1",
+            rusqlite::params![stale_target_path],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((row_id, target_path, group_id, keep_state)) = row else {
+        return Ok(None);
+    };
+
+    let candidate = find_expected_stale_trash_path(dest, &target_path, group_id, row_id);
+    let Some(repaired_path) = candidate else {
+        return Ok(None);
+    };
+
+    let logical = logical_target_path(dest, &repaired_path)?;
+    if logical == target_path {
+        return Ok(Some(logical));
+    }
+
+    conn.execute(
+        "UPDATE target_items SET target_path = ?1, keep_state = ?2 WHERE id = ?3",
+        rusqlite::params![
+            logical,
+            if keep_state == "rejected" { keep_state } else { "rejected".to_string() },
+            row_id
+        ],
+    )?;
+    Ok(Some(
+        conn.query_row(
+            "SELECT target_path FROM target_items WHERE id = ?1",
+            rusqlite::params![row_id],
+            |row| row.get::<_, String>(0),
+        )?,
+    ))
+}
+
+fn find_expected_stale_trash_path(
+    dest: &StdPath,
+    target_path: &str,
+    group_id: Option<i64>,
+    row_id: i64,
+) -> Option<PathBuf> {
+    let trash_dir = if let Some(group_id) = group_id {
+        dest.join(".photo-org")
+            .join("trash")
+            .join(trash_group_dir_name(group_id))
+    } else {
+        dest.join(".photo-org")
+            .join("trash")
+            .join(format!("filename-group-{}", row_id))
+    };
+    find_existing_trash_variant(&trash_dir, StdPath::new(target_path))
+}
+
+fn find_existing_trash_variant(trash_dir: &StdPath, original_path: &StdPath) -> Option<PathBuf> {
+    if !trash_dir.exists() {
+        return None;
+    }
+
+    let expected_name = safe_file_name(original_path);
+    let mut idx = 0usize;
+    loop {
+        let candidate = if idx == 0 {
+            trash_dir.join(&expected_name)
+        } else {
+            trash_dir.join(format!("{}-{}", idx, &expected_name))
+        };
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if idx > 100 {
+            break;
+        }
+        idx += 1;
+    }
+    None
 }
 
 fn resolve_ugos_thumb(path: &StdPath) -> Option<PathBuf> {
@@ -4509,6 +4589,61 @@ mod tests {
             logical_target_path(&dest, &restored_path).unwrap()
         );
         assert_eq!(restored_row.1, "kept");
+    }
+
+    #[tokio::test]
+    async fn image_repairs_stale_filename_target_path_to_trash() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("repo");
+        fs::create_dir_all(&dest).unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        insert_filename_review_rows(
+            &conn,
+            &dest,
+            "2024/06/09/IMG_1234.JPG",
+            "2025/03/17/defaultimg_1234.jpg",
+        );
+        let (default_id, old_target_path): (i64, String) = conn
+            .query_row(
+                "SELECT id, target_path FROM target_items WHERE target_path LIKE '%defaultimg_1234.jpg'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let old_path = resolve_physical_path(&dest, &old_target_path);
+        let trash_path = dest
+            .join(".photo-org")
+            .join("trash")
+            .join(format!("filename-group-{}", default_id))
+            .join("defaultimg_1234.jpg");
+        fs::create_dir_all(trash_path.parent().unwrap()).unwrap();
+        fs::rename(&old_path, &trash_path).unwrap();
+
+        let app = router(AppState {
+            db_path: db_path.clone(),
+            dest: dest.clone(),
+        });
+        let request = axum::http::Request::builder()
+            .uri(format!("/image?path={}&size=400", old_target_path))
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(!body.is_empty());
+
+        let repaired: (String, String) = open_catalog_db(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT target_path, keep_state FROM target_items WHERE id = ?1",
+                rusqlite::params![default_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(repaired.0, logical_target_path(&dest, &trash_path).unwrap());
+        assert_eq!(repaired.1, "rejected");
     }
 
     #[tokio::test]
