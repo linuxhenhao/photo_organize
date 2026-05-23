@@ -1,0 +1,38 @@
+[package]
+name = "photo-org"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.8.9"
+blake3 = "1.8.4"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+clap = { version = "4.5.60", features = ["derive"] }
+ctrlc = "3.5.1"
+exif = { package = "kamadak-exif", version = "0.6.1" }
+image = "0.25.6"
+img_hash = "3.2.0"
+lru = "0.12"
+mimetype-detector = "0.3.8"
+rayon = "1.12.0"
+regex = "1.11"
+rsraw = { git = "https://github.com/hexilee/rsraw.git", branch = "main" }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.14"
+tokio = { version = "1.51.1", features = ["macros", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+walkdir = "2.5.0"
+akaze = "0.7.0"
+tower = { version = "0.5", features = ["util"] }
+xattr = "1.3"
+once_cell = "1.19"
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+[patch.crates-io]
+bitarray = { path = "vendor/bitarray" }

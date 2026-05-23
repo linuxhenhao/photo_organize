@@ -1,0 +1,4 @@
+interface:
+  display_name: "Photo Group Snapshot"
+  short_description: "Fetch remote photo-org group metadata and files"
+  default_prompt: "Use $photo-org-group-snapshot to fetch a remote photo-org group snapshot with metadata, feature cache rows, and image files for analysis."

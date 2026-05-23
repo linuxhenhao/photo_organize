@@ -1,0 +1,110 @@
+{
+  "total_grouped_items": 28413,
+  "total_groups": 10277,
+  "candidate_pair_count": 10774,
+  "candidate_group_count": 8150,
+  "adjacent_id_pair_count": 97,
+  "adjacent_id_group_count": 54,
+  "categories": [
+    {
+      "category": "default_camera:same_core",
+      "pair_count": 6131,
+      "group_count": 5392
+    },
+    {
+      "category": "default_other:same_core",
+      "pair_count": 1442,
+      "group_count": 1314
+    },
+    {
+      "category": "timestamp_rendition:same_id",
+      "pair_count": 1079,
+      "group_count": 772
+    },
+    {
+      "category": "timestamp_rendition:same_core",
+      "pair_count": 444,
+      "group_count": 275
+    },
+    {
+      "category": "timestamp_rendition",
+      "pair_count": 426,
+      "group_count": 304
+    },
+    {
+      "category": "default_embedded:same_core",
+      "pair_count": 379,
+      "group_count": 326
+    },
+    {
+      "category": "default_shotwell:same_core",
+      "pair_count": 268,
+      "group_count": 254
+    },
+    {
+      "category": "default_camera:other",
+      "pair_count": 240,
+      "group_count": 120
+    },
+    {
+      "category": "default_timestamp:same_core",
+      "pair_count": 172,
+      "group_count": 172
+    },
+    {
+      "category": "default_camera:adjacent_id",
+      "pair_count": 53,
+      "group_count": 34
+    },
+    {
+      "category": "default_other:other",
+      "pair_count": 51,
+      "group_count": 47
+    },
+    {
+      "category": "default_embedded:adjacent_id",
+      "pair_count": 21,
+      "group_count": 15
+    },
+    {
+      "category": "default_shotwell:adjacent_id",
+      "pair_count": 19,
+      "group_count": 13
+    },
+    {
+      "category": "default_camera:same_id",
+      "pair_count": 17,
+      "group_count": 17
+    },
+    {
+      "category": "default_timestamp",
+      "pair_count": 16,
+      "group_count": 12
+    },
+    {
+      "category": "default_hash:other",
+      "pair_count": 7,
+      "group_count": 7
+    },
+    {
+      "category": "timestamp_rendition:adjacent_id",
+      "pair_count": 4,
+      "group_count": 2
+    },
+    {
+      "category": "default_embedded:other",
+      "pair_count": 2,
+      "group_count": 2
+    },
+    {
+      "category": "default_shotwell:other",
+      "pair_count": 2,
+      "group_count": 2
+    },
+    {
+      "category": "default_shotwell:same_id",
+      "pair_count": 1,
+      "group_count": 1
+    }
+  ]
+}

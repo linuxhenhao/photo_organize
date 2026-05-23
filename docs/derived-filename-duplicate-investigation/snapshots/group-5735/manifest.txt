@@ -1,0 +1,11 @@
+group_id: 5735
+remote_host: nas-photo
+remote_db_path: /volume3/DocsAndMedia/Multimedia/repo/repo.db
+remote_media_root: /volume3/DocsAndMedia/Multimedia
+fetched_at_utc: 2026-05-01T02:14:12.888326+00:00
+item_count: 30
+distinct_exact_hashes: 30
+distinct_phashes: 22
+operations_log_rows: 0
+downloaded_files: 0
+missing_remote_files: 0
