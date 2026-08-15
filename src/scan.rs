@@ -1,7 +1,9 @@
-use crate::db::{now_string, open_scan_db};
+use crate::db::{FEATURE_VERSION, now_string, open_scan_db};
+use crate::feature_loader::{has_reusable_feature_cache, save_feature_cache};
 use crate::features::{
     AkazeStatus, VisualFeatures, compute_base_features_from_bytes,
-    compute_base_features_from_reader, is_raw_like_mime, supports_visual_features,
+    compute_base_features_from_reader, compute_visual_features_for_mime_from_bytes,
+    is_raw_like_mime, supports_visual_features,
 };
 use crate::interrupt;
 use crate::util::{
@@ -13,6 +15,7 @@ use blake3::Hasher as Blake3Hasher;
 use rayon::prelude::*;
 use rusqlite::{Connection, Transaction, params};
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -36,6 +39,21 @@ pub(crate) struct DiscoveredFile {
     pub(crate) scan_status: String,
     pub(crate) last_scanned_at: String,
     pub(crate) meta_json: String,
+    pub(crate) visual_features: Option<VisualFeatures>,
+}
+
+#[derive(Debug, Clone)]
+struct ExistingScanItem {
+    phash: String,
+    phash_bits: i64,
+    width: i64,
+    height: i64,
+}
+
+#[derive(Debug, Default)]
+struct ScanReuse {
+    items_by_hash: HashMap<(String, i64), ExistingScanItem>,
+    reusable_features: HashSet<(String, i64)>,
 }
 
 pub fn run(scan_db: &Path, roots: &[PathBuf]) -> Result<()> {
@@ -46,6 +64,10 @@ fn scan_with_db_path(scan_db: &Path, roots: &[PathBuf]) -> Result<()> {
     let files = collect_file_paths(roots)?;
     let total = files.len();
     let run_id = now_string();
+    let reuse = {
+        let conn = open_scan_db(scan_db)?;
+        load_scan_reuse(&conn)?
+    };
     let progress = ProgressReporter::new("scan discover", total);
     progress.log_start();
 
@@ -79,7 +101,7 @@ fn scan_with_db_path(scan_db: &Path, roots: &[PathBuf]) -> Result<()> {
             return;
         }
 
-        let result = match discover_file(path) {
+        let result = match discover_file_for_scan(path, &reuse) {
             Ok(mut item) => {
                 item.last_scanned_at = run_id.clone();
                 Some(item)
@@ -128,6 +150,18 @@ pub(crate) fn collect_file_paths(roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
 }
 
 pub(crate) fn discover_file(path: &Path) -> Result<DiscoveredFile> {
+    discover_file_inner(path, false, None)
+}
+
+fn discover_file_for_scan(path: &Path, reuse: &ScanReuse) -> Result<DiscoveredFile> {
+    discover_file_inner(path, true, Some(reuse))
+}
+
+fn discover_file_inner(
+    path: &Path,
+    compute_akaze: bool,
+    reuse: Option<&ScanReuse>,
+) -> Result<DiscoveredFile> {
     let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let now = now_string();
@@ -136,24 +170,41 @@ pub(crate) fn discover_file(path: &Path) -> Result<DiscoveredFile> {
     let created_at = metadata_time(path, &mime_type, &meta, &mut file)
         .unwrap_or_else(|| fallback_file_time(&meta));
     let exact_hash = exact_hash_file(&mut file)?;
-    let visual = if supports_visual_features(path, &mime_type) {
-        if is_raw_like_mime(&mime_type) {
-            let bytes = read_all_bytes(&mut file, path)?;
-            compute_base_features_from_bytes(&bytes, path, &mime_type)?
-                .unwrap_or_else(empty_visual_features)
-        } else {
-            file.seek(SeekFrom::Start(0))
-                .with_context(|| format!("rewind {}", path.display()))?;
-            match compute_base_features_from_reader(BufReader::new(&mut file), path) {
-                Ok(features) => features,
-                Err(err) => {
-                    tracing::warn!(path = %path.display(), error = %err, "base feature extraction failed");
-                    empty_visual_features()
-                }
+    let size_bytes = i64::try_from(meta.len()).unwrap_or(i64::MAX);
+    let visual_supported = supports_visual_features(path, &mime_type);
+    let cache_key = (exact_hash.clone(), size_bytes);
+    let reusable_akaze = reuse
+        .map(|state| state.reusable_features.contains(&cache_key))
+        .unwrap_or(false);
+    let prior_item = reuse.and_then(|state| state.items_by_hash.get(&cache_key));
+    let (visual, persist_features) = if reusable_akaze {
+        let visual = if let Some(prev) = prior_item.filter(|item| !item.phash.is_empty()) {
+            VisualFeatures {
+                exact_hash: exact_hash.clone(),
+                phash: prev.phash.clone(),
+                phash_bits: prev.phash_bits,
+                phash_value: 0,
+                width: prev.width,
+                height: prev.height,
+                size_bytes_hint: size_bytes,
+                akaze_status: AkazeStatus::Pending,
+                akaze_keypoints: None,
+                akaze_points: None,
+                akaze_descriptors: None,
             }
-        }
+        } else {
+            compute_scan_base_features(&mut file, path, &mime_type)?
+        };
+        (visual, false)
+    } else if compute_akaze && visual_supported {
+        (
+            compute_scan_akaze_features(&mut file, path, &mime_type, &exact_hash, size_bytes)?,
+            true,
+        )
+    } else if visual_supported {
+        (compute_scan_base_features(&mut file, path, &mime_type)?, false)
     } else {
-        empty_visual_features()
+        (empty_visual_features(), false)
     };
     let meta_json = json!({
         "fingerprint": {
@@ -165,17 +216,114 @@ pub(crate) fn discover_file(path: &Path) -> Result<DiscoveredFile> {
 
     Ok(DiscoveredFile {
         path: path.to_path_buf(),
-        size_bytes: i64::try_from(meta.len()).unwrap_or(i64::MAX),
+        size_bytes,
         mime_type,
         created_at,
         exact_hash,
-        phash: visual.phash,
+        phash: visual.phash.clone(),
         phash_bits: visual.phash_bits,
         width: visual.width,
         height: visual.height,
         scan_status: "present".to_string(),
         last_scanned_at: now,
         meta_json,
+        visual_features: persist_features.then_some(visual),
+    })
+}
+
+fn compute_scan_base_features(
+    file: &mut File,
+    path: &Path,
+    mime_type: &str,
+) -> Result<VisualFeatures> {
+    if is_raw_like_mime(mime_type) {
+        let bytes = read_all_bytes(file, path)?;
+        return Ok(
+            compute_base_features_from_bytes(&bytes, path, mime_type)?
+                .unwrap_or_else(empty_visual_features),
+        );
+    }
+
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("rewind {}", path.display()))?;
+    match compute_base_features_from_reader(BufReader::new(&mut *file), path) {
+        Ok(features) => Ok(features),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "base feature extraction failed");
+            Ok(empty_visual_features())
+        }
+    }
+}
+
+fn compute_scan_akaze_features(
+    file: &mut File,
+    path: &Path,
+    mime_type: &str,
+    exact_hash: &str,
+    size_bytes: i64,
+) -> Result<VisualFeatures> {
+    let bytes = read_all_bytes(file, path)?;
+    let mut features = match compute_visual_features_for_mime_from_bytes(&bytes, path, mime_type)? {
+        Some(features) => features,
+        None => {
+            let mut fallback = empty_visual_features();
+            fallback.akaze_status = AkazeStatus::DecodeError;
+            fallback
+        }
+    };
+    features.exact_hash = exact_hash.to_string();
+    features.size_bytes_hint = size_bytes;
+    Ok(features)
+}
+
+fn load_scan_reuse(conn: &Connection) -> Result<ScanReuse> {
+    let mut items_by_hash = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT exact_hash, size_bytes, phash, phash_bits, width, height FROM source_items",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            ExistingScanItem {
+                phash: row.get(2)?,
+                phash_bits: row.get(3)?,
+                width: row.get(4)?,
+                height: row.get(5)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (exact_hash, size_bytes, item) = row?;
+        if exact_hash.is_empty() {
+            continue;
+        }
+        items_by_hash
+            .entry((exact_hash, size_bytes))
+            .and_modify(|prev: &mut ExistingScanItem| {
+                if prev.phash.is_empty() && !item.phash.is_empty() {
+                    *prev = item.clone();
+                }
+            })
+            .or_insert(item);
+    }
+
+    let mut reusable_features = HashSet::new();
+    let mut feat_stmt =
+        conn.prepare("SELECT exact_hash, size_bytes FROM feature_cache WHERE feature_version = ?1")?;
+    let feat_rows = feat_stmt.query_map(params![FEATURE_VERSION], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for row in feat_rows {
+        let (exact_hash, size_bytes) = row?;
+        if has_reusable_feature_cache(conn, &exact_hash, size_bytes)? {
+            reusable_features.insert((exact_hash, size_bytes));
+        }
+    }
+
+    Ok(ScanReuse {
+        items_by_hash,
+        reusable_features,
     })
 }
 
@@ -321,6 +469,11 @@ fn mark_missing_unseen(tx: &Transaction<'_>, run_id: &str) -> Result<()> {
 fn write_scan_batch(conn: &mut Connection, batch: &[DiscoveredFile], run_id: &str) -> Result<()> {
     let tx = conn.transaction()?;
     upsert_items(&tx, batch, run_id)?;
+    for item in batch {
+        if let Some(visual) = &item.visual_features {
+            save_feature_cache(&tx, item.size_bytes, visual)?;
+        }
+    }
     tx.commit()?;
     Ok(())
 }
@@ -381,6 +534,18 @@ mod tests {
             )
             .unwrap();
         assert!(!phash.is_empty());
+        let cached: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feature_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cached, 2);
+        let ready: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM feature_cache WHERE akaze_status != 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ready, 2);
 
         fs::remove_file(&b).unwrap();
         run(&scan_db, &[src]).unwrap();
@@ -420,6 +585,71 @@ mod tests {
         assert_eq!(exact_hash, expected_hash);
         assert!(phash.is_empty());
         assert_eq!(phash_bits, 0);
+        let cached: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feature_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cached, 0);
+    }
+
+    #[test]
+    fn discover_file_computes_phash_for_raw() {
+        let arw = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data/source/DSC00903.ARW");
+        let cr2 = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data/source/IMG_5798.CR2");
+        for path in [&arw, &cr2] {
+            let discovered = discover_file(path).unwrap();
+            assert!(
+                !discovered.phash.is_empty(),
+                "expected pHash for {}",
+                path.display()
+            );
+            assert!(discovered.width > 0);
+            assert!(discovered.height > 0);
+        }
+    }
+
+    #[test]
+    fn scan_reuses_akaze_for_renamed_exact_copy() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let first = src.join("a.jpg");
+        copy_fixture("img_2023_05_01.jpg", &first);
+
+        let scan_db = tmp.path().join("scan.db");
+        run(&scan_db, &[src.clone()]).unwrap();
+        let conn = open_scan_db(&scan_db).unwrap();
+        let cached_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feature_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cached_before, 1);
+        let updated_before: String = conn
+            .query_row("SELECT updated_at FROM feature_cache", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+
+        let second = src.join("renamed.jpg");
+        fs::copy(&first, &second).unwrap();
+        run(&scan_db, &[src]).unwrap();
+
+        let conn = open_scan_db(&scan_db).unwrap();
+        let cached_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feature_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cached_after, 1);
+        let updated_after: String = conn
+            .query_row("SELECT updated_at FROM feature_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(updated_before, updated_after);
+        let renamed_phash: String = conn
+            .query_row(
+                "SELECT phash FROM source_items WHERE source_path = ?1",
+                [second.to_string_lossy().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!renamed_phash.is_empty());
     }
 
     #[test]

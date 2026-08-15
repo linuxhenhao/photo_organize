@@ -5,7 +5,7 @@
 It provides one binary with four commands:
 
 - `scan`: discover source files and write source-side facts into a scan database
-- `import`: scan sources, copy canonical files into the target library, and create duplicate groups in `catalog.db`
+- `import`: scan sources, copy canonical files into the target library, skip exact duplicates, and optionally create visual duplicate groups in `catalog.db`
 - `initcache`: adopt an existing target library directly into `catalog.db` without a target-side scan database
 - `serve`: run the local duplicate-resolution web UI
 
@@ -15,7 +15,7 @@ This crate owns:
 
 - the `photo-org` CLI
 - the SQLite schema for `catalog.db` and source scan databases
-- parallel source scanning with hashes, pHash, dimensions, and MIME detection
+- parallel source scanning with hashes, pHash, AKAZE, dimensions, and MIME detection
 - target import into `DEST/YYYY/MM/DD/...`
 - target adoption via `initcache`
 - the local web UI for resolving duplicate groups
@@ -92,11 +92,11 @@ cargo run -- scan \
   --src /photos/cards
 ```
 
-This writes file discovery facts into `source_items` in the scan database.
+This writes file discovery facts into `source_items` and AKAZE features into `feature_cache` in the scan database.
 
 ### 2. Import
 
-Import canonical files into the target library and group likely duplicates in `catalog.db`.
+Import canonical files into the target library. By default `import` only skips exact duplicates (same content hash) and does not create visual near-duplicate groups. It still copies AKAZE features from the scan database into `catalog.db.feature_cache`. If a file that will actually be imported is missing AKAZE in the scan cache, `import` backfills it. It does not recompute AKAZE for a hash already present in the target catalog.
 
 Use an existing scan database:
 
@@ -117,6 +117,18 @@ cargo run -- import \
   --dest /path/to/library
 ```
 
+Enable pHash/AKAZE visual grouping with `--visual-dedup`:
+
+```bash
+cargo run -- import \
+  --db /path/to/catalog.db \
+  --src /photos/inbox \
+  --dest /path/to/library \
+  --visual-dedup
+```
+
+`import` requires `--db`, `--dest`, and at least one of `--src` or `--scan-db`.
+
 When `--src` is provided and `--scan-db` is omitted, `import` uses:
 
 ```text
@@ -126,6 +138,7 @@ DEST/.photo-org/import-scan.db
 Tuning flags:
 
 ```text
+--visual-dedup         opt-in visual near-duplicate grouping (off by default)
 --phash-threshold      default 14
 --akaze-min-matches    default 10
 ```
@@ -197,7 +210,7 @@ Main target-side database. Important tables include:
 
 - `target_items`: current files in the target library plus group and keep state
   `target_path` uses a logical `DEST_BASENAME/...` form instead of an absolute filesystem path
-- `feature_cache`: persisted AKAZE cache keyed by content hash and size
+- `feature_cache`: persisted AKAZE cache keyed by content hash and size; filled by `import` from the scan DB and by `initcache`
 - `operations_log`: audit log for review actions
 
 ### Scan database
@@ -205,6 +218,7 @@ Main target-side database. Important tables include:
 Used by `scan` and optionally by `import`.
 
 - stores source-side discovery facts in `source_items`
+- stores AKAZE features in `feature_cache` with the same content-hash key as the catalog
 - typically named `import-scan.db`, but the path is user-controlled
 
 ## Logging

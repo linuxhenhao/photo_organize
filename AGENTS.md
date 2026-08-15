@@ -14,15 +14,15 @@ Long-running `scan`, `import`, and `initcache` paths should emit periodic progre
 For the full design rationale, crate selection, and data-model decisions, see `docs/rust-rewrite-design.md`.
 
 Current internal structure also includes:
-- `feature_loader`: loads second-stage AKAZE data through a cache-first path and persists it in `catalog.db`.
+- `feature_loader`: loads second-stage AKAZE data through a cache-first path and persists it in `scan-db.feature_cache` and `catalog.db.feature_cache`.
 - `phash_index`: keeps an in-memory BK-tree over persisted 64-bit pHash values so `import` and `initcache` only run AKAZE on threshold-matching candidates.
 - `util`: MIME detection, EXIF date parsing, filename-safe normalization, path-safety checks, and the `ProgressReporter` used for periodic progress logs.
 - `interrupt`: shared Ctrl+C signal handling, exposing `check()` for sync bail-out and `wait()` for async graceful shutdown.
 
 ## Command Workflows
 
-- **`scan`**: Discovery phase. Walks source directories, extracts metadata (EXIF, hashes, pHash) in parallel, and upserts facts into a `scan-db` (`source_items`).
-- **`import`**: Transformation phase. Runs `scan` to refresh `scan-db`, selects canonical representatives for exact-duplicate groups, pre-warms visual features in parallel, and then serially copies files to the target directory while performing pHash/AKAZE grouping.
+- **`scan`**: Discovery phase. Walks source directories, extracts metadata (EXIF, hashes, pHash) and AKAZE features in parallel, upserts facts into `scan-db` (`source_items`), and persists AKAZE rows in `scan-db.feature_cache`. Re-scans skip AKAZE when a reusable cache row already exists for the same content hash and size, including renamed or copied files. `discover_file` (used by `initcache`) still computes RAW pHash from embedded previews.
+- **`import`**: Transformation phase. Runs `scan` to refresh `scan-db`, selects one canonical per exact-hash group, copies new files to the target directory, and copies scan AKAZE rows into `catalog.db.feature_cache`. Missing AKAZE is backfilled only for hashes that are not already in `target_items`. Visual pHash/AKAZE grouping runs only when `--visual-dedup` is set.
 - **`initcache`**: Adoption phase. 
     - **Stage 1 (Ingest)**: Parallel discovery of existing target files, reusing DB facts if file size/mtime match.
     - **Stage 2 (Pre-warm)**: Parallel computation of missing visual features for potential duplicates.
@@ -45,15 +45,19 @@ Current internal structure also includes:
       - `group_status`: Flow-control column used by `initcache`. Starts as `'pending'` on ingest, then serially flipped to `'completed'` after grouping. The pre-warm and grouping passes only process rows where `group_status = 'pending'`.
       - `keep_state`: One of `'undecided'`, `'kept'`, or `'rejected'`. Set by `serve` resolution and used to filter unresolved groups.
       - `is_group_primary`: Marks the preferred representative in a duplicate group.
-    - `feature_cache`: Content-based cache (exact hash + size) for AKAZE keypoints and descriptors to avoid redundant re-decoding. Includes `akaze_status`, `akaze_points`, and `feature_version` for schema migration.
+    - `feature_cache`: Content-based cache (exact hash + size) for AKAZE keypoints and descriptors to avoid redundant re-decoding. Includes `akaze_status`, `akaze_points`, and `feature_version` for schema migration. `import` copies scan rows in a transaction and does not replace a durable catalog row with a retryable scan row.
     - `operations_log`: Audit log of changes (imports, group resolutions).
-- **`scan-db`**: A source-specific database (usually `import-scan.db`) used as a staging area during `scan` and `import` to track discovered source files and their metadata.
+- **`scan-db`**: A source-specific database (usually `import-scan.db`) used as a staging area during `scan` and `import`.
+    - `source_items`: discovered source files and per-file facts (`exact_hash`, `pHash`, dimensions).
+    - `feature_cache`: same AKAZE schema as `catalog.db`; written by `scan`, copied into the catalog by `import`.
 
 ## Change Rules
 Keep the command set limited to `scan`, `import`, `initcache`, and `serve`.
 Prefer small, explicit modules over a large monolith, and keep path validation and database mutation visible in code.
 
 The rewrite should stay local-first and avoid reintroducing the removed Go maintenance commands.
+
+**Every commit must keep documentation in sync with the code.** If behavior, CLI flags, workflows, schema, or matching rules change, update the same commit: `AGENTS.md`, `README.md`, `docs/rust-rewrite-design.md`, and `docs/e2e-test-plan.md` as applicable. Do not leave design or user docs describing the old path.
 
 When touching duplicate matching:
 - Keep pHash coarse filtering cheap and in-memory.

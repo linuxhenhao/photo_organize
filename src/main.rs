@@ -9,7 +9,7 @@ mod serve;
 mod util;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -22,29 +22,49 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Discover source files into a scan database
     Scan {
+        /// Path to the source scan database
         #[arg(long = "scan-db")]
         scan_db: PathBuf,
+        /// Source directory to scan. Repeatable
         #[arg(long = "src", required = true)]
         src: Vec<PathBuf>,
     },
+    /// Copy canonical files into the target library
+    #[command(group(
+        ArgGroup::new("import_input")
+            .required(true)
+            .multiple(true)
+            .args(["scan_db", "src"])
+    ))]
     Import {
+        /// Path to catalog.db
         #[arg(long)]
         db: PathBuf,
+        /// Existing source scan database. Required unless --src is given
         #[arg(long = "scan-db")]
         scan_db: Option<PathBuf>,
+        /// Source directory to scan before import. Repeatable. Required unless --scan-db is given
         #[arg(long = "src")]
         src: Vec<PathBuf>,
+        /// Target library directory
         #[arg(long)]
         dest: PathBuf,
+        /// Enable pHash/AKAZE near-duplicate grouping. Default: exact-hash only
+        #[arg(long)]
+        visual_dedup: bool,
         #[arg(long, default_value_t = 14)]
         phash_threshold: u32,
         #[arg(long, default_value_t = 10)]
         akaze_min_matches: usize,
     },
+    /// Adopt an existing target library into catalog.db
     Initcache {
+        /// Path to catalog.db
         #[arg(long)]
         db: PathBuf,
+        /// Existing target library directory
         #[arg(long)]
         dest: PathBuf,
         #[arg(long, default_value_t = 14)]
@@ -52,9 +72,12 @@ enum Commands {
         #[arg(long, default_value_t = 10)]
         akaze_min_matches: usize,
     },
+    /// Run the local duplicate-resolution web UI
     Serve {
+        /// Path to catalog.db
         #[arg(long)]
         db: PathBuf,
+        /// Target library directory
         #[arg(long)]
         dest: PathBuf,
         #[arg(long, default_value = "127.0.0.1")]
@@ -87,6 +110,7 @@ async fn main() -> Result<()> {
             scan_db,
             src,
             dest,
+            visual_dedup,
             phash_threshold,
             akaze_min_matches,
         } => import::run(
@@ -94,6 +118,7 @@ async fn main() -> Result<()> {
             scan_db.as_ref(),
             &src,
             &dest,
+            visual_dedup,
             phash_threshold,
             akaze_min_matches,
         )?,
@@ -112,4 +137,50 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_requires_scan_db_or_src() {
+        let err = Cli::try_parse_from(["photo-org", "import", "--db", "c.db", "--dest", "lib"])
+            .expect_err("import without --scan-db or --src should fail at parse time");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("scan-db") && msg.contains("src"),
+            "unexpected clap error: {msg}"
+        );
+    }
+
+    #[test]
+    fn import_accepts_src_without_scan_db() {
+        Cli::try_parse_from([
+            "photo-org",
+            "import",
+            "--db",
+            "c.db",
+            "--dest",
+            "lib",
+            "--src",
+            "inbox",
+        ])
+        .expect("import --src should be enough");
+    }
+
+    #[test]
+    fn import_accepts_scan_db_without_src() {
+        Cli::try_parse_from([
+            "photo-org",
+            "import",
+            "--db",
+            "c.db",
+            "--dest",
+            "lib",
+            "--scan-db",
+            "scan.db",
+        ])
+        .expect("import --scan-db should be enough");
+    }
 }

@@ -69,6 +69,7 @@ fn init_scan_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_source_items_exact_hash ON source_items(exact_hash);
         "#,
     )?;
+    init_feature_cache_schema(conn)?;
     Ok(())
 }
 
@@ -99,6 +100,17 @@ fn init_catalog_schema(conn: &Connection) -> Result<()> {
             payload_json TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS idx_target_items_group_id ON target_items(group_id);
+        CREATE INDEX IF NOT EXISTS idx_target_items_phash ON target_items(phash);
+        "#,
+    )?;
+    init_feature_cache_schema(conn)?;
+    Ok(())
+}
+
+fn init_feature_cache_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
         CREATE TABLE IF NOT EXISTS feature_cache (
             exact_hash TEXT NOT NULL,
             size_bytes INTEGER NOT NULL,
@@ -110,8 +122,6 @@ fn init_catalog_schema(conn: &Connection) -> Result<()> {
             updated_at TEXT NOT NULL,
             PRIMARY KEY (exact_hash, size_bytes)
         );
-        CREATE INDEX IF NOT EXISTS idx_target_items_group_id ON target_items(group_id);
-        CREATE INDEX IF NOT EXISTS idx_target_items_phash ON target_items(phash);
         "#,
     )?;
     migrate_feature_cache_schema(conn)?;
