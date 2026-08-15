@@ -1,5 +1,7 @@
 use crate::db::{max_group_id, open_catalog_db, open_scan_db};
-use crate::feature_loader::{FeatureLoader, FeatureRequest, has_reusable_feature_cache};
+use crate::feature_loader::{
+    FeatureLoader, FeatureRequest, copy_feature_cache, has_reusable_feature_cache,
+};
 use crate::features::{
     AkazeStatus, VisualFeatures, akaze_confirm, phash_to_u64, supports_visual_features,
 };
@@ -191,6 +193,7 @@ pub fn run(
     scan_db: Option<&PathBuf>,
     src_roots: &[PathBuf],
     dest: &Path,
+    visual_dedup: bool,
     phash_threshold: u32,
     akaze_min_matches: usize,
 ) -> Result<()> {
@@ -206,6 +209,7 @@ pub fn run(
             catalog_db,
             &scan_db_path,
             dest,
+            visual_dedup,
             phash_threshold,
             akaze_min_matches,
         )
@@ -215,6 +219,7 @@ pub fn run(
             catalog_db,
             scan_db_path,
             dest,
+            visual_dedup,
             phash_threshold,
             akaze_min_matches,
         )
@@ -536,6 +541,7 @@ fn prewarm_pass_initcache(catalog_db: &Path, dest: &Path, phash_threshold: u32) 
                 created_at: String::new(),
                 last_scanned_at: String::new(),
                 meta_json: String::new(),
+                visual_features: None,
             };
             Ok(PendingForPrewarm { id, file })
         })?
@@ -810,6 +816,7 @@ fn import_from_scan_db(
     catalog_db: &Path,
     scan_db: &Path,
     dest: &Path,
+    visual_dedup: bool,
     phash_threshold: u32,
     akaze_min_matches: usize,
 ) -> Result<()> {
@@ -817,6 +824,10 @@ fn import_from_scan_db(
     let scan_conn = open_scan_db(scan_db)?;
     let mut catalog_conn = open_catalog_db(catalog_db)?;
     normalize_catalog_target_paths(&catalog_conn, dest)?;
+    let copied_features = copy_feature_cache(&scan_conn, &mut catalog_conn)?;
+    if copied_features > 0 {
+        tracing::info!(copied_features, "copied scan feature cache into catalog");
+    }
     let mut feature_loader = FeatureLoader::default();
     let mut phash_index = PhashIndex::from_catalog(&catalog_conn)?;
     let rows = load_scan_rows(&scan_conn)?;
@@ -840,9 +851,10 @@ fn import_from_scan_db(
     let prewarm_conn = open_catalog_db(catalog_db)?;
     let mut to_prewarm = Vec::new();
     for row in &canonical_rows {
-        if !supports_visual_features(Path::new(&row.source_path), &row.mime_type)
-            || row.phash.is_empty()
-        {
+        if target_exists_with_hash(&prewarm_conn, &row.exact_hash)? {
+            continue;
+        }
+        if !supports_visual_features(Path::new(&row.source_path), &row.mime_type) {
             continue;
         }
         if has_reusable_feature_cache(&prewarm_conn, &row.exact_hash, row.size_bytes)? {
@@ -861,6 +873,7 @@ fn import_from_scan_db(
             scan_status: String::new(),
             last_scanned_at: String::new(),
             meta_json: String::new(),
+            visual_features: None,
         });
     }
     drop(prewarm_conn);
@@ -927,6 +940,7 @@ fn import_from_scan_db(
             &mut phash_index,
             dest,
             &canonical,
+            visual_dedup,
             phash_threshold,
             akaze_min_matches,
         )?;
@@ -1006,6 +1020,7 @@ fn import_single(
     phash_index: &mut PhashIndex,
     dest: &Path,
     row: &ScanRow,
+    visual_dedup: bool,
     phash_threshold: u32,
     akaze_min_matches: usize,
 ) -> Result<TargetRow> {
@@ -1019,6 +1034,7 @@ fn import_single(
         feature_loader,
         phash_index,
         input,
+        visual_dedup,
         phash_threshold,
         akaze_min_matches,
         "completed",
@@ -1041,6 +1057,7 @@ fn adopt_single(
         feature_loader,
         phash_index,
         input,
+        true,
         phash_threshold,
         akaze_min_matches,
         group_status,
@@ -1053,11 +1070,13 @@ fn process_catalog_input(
     feature_loader: &mut FeatureLoader,
     phash_index: &mut PhashIndex,
     input: CatalogInput,
+    visual_dedup: bool,
     phash_threshold: u32,
     akaze_min_matches: usize,
     group_status: &str,
 ) -> Result<TargetRow> {
-    let visual_supported = supports_visual_features(&input.target_path, &input.mime_type);
+    let visual_supported =
+        visual_dedup && supports_visual_features(&input.target_path, &input.mime_type);
     let input_feature_started = Instant::now();
     let visual = if visual_supported {
         feature_loader.load(
@@ -1563,6 +1582,7 @@ mod tests {
             Some(&scan_db),
             &[src],
             &dest,
+            false,
             64,
             1,
         )
@@ -1603,6 +1623,7 @@ mod tests {
             Some(&scan_db),
             &[src],
             &dest,
+            true,
             14,
             6,
         )
@@ -1629,6 +1650,127 @@ mod tests {
             )
             .unwrap();
         assert_eq!(distinct_groups, 1);
+    }
+
+    #[test]
+    fn import_skips_visual_grouping_without_visual_dedup() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let a = src.join("2024-06-09_a.jpg");
+        let b = src.join("2024-06-09_b.jpg");
+        copy_source_fixture("DSC00903.thumb.jpg", &a);
+        fs::copy(&a, &b).unwrap();
+        append_trailing_byte(&b);
+
+        let scan_db = tmp.path().join("scan.db");
+        run(
+            &tmp.path().join("catalog.db"),
+            Some(&scan_db),
+            &[src],
+            &dest,
+            false,
+            14,
+            6,
+        )
+        .unwrap();
+
+        let catalog = open_catalog_db(tmp.path().join("catalog.db")).unwrap();
+        let count: i64 = catalog
+            .query_row("SELECT COUNT(*) FROM target_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        let grouped: i64 = catalog
+            .query_row(
+                "SELECT COUNT(*) FROM target_items WHERE group_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(grouped, 0);
+        let cached: i64 = catalog
+            .query_row("SELECT COUNT(*) FROM feature_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cached, 2);
+    }
+
+    #[test]
+    fn import_does_not_recompute_features_for_exact_duplicates() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let a = src.join("2024-06-09_a.jpg");
+        copy_source_fixture("DSC00903.thumb.jpg", &a);
+
+        let catalog_db = tmp.path().join("catalog.db");
+        let scan_db = tmp.path().join("scan.db");
+        run(&catalog_db, Some(&scan_db), &[src.clone()], &dest, false, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        catalog.execute("DELETE FROM feature_cache", []).unwrap();
+        drop(catalog);
+        let scan = crate::db::open_scan_db(&scan_db).unwrap();
+        scan.execute("DELETE FROM feature_cache", []).unwrap();
+        drop(scan);
+
+        run(&catalog_db, Some(&scan_db), &[], &dest, false, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let cached: i64 = catalog
+            .query_row("SELECT COUNT(*) FROM feature_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cached, 0);
+        let count: i64 = catalog
+            .query_row("SELECT COUNT(*) FROM target_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn initcache_preserves_raw_phash_after_mtime_change() {
+        let tmp = tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let raw = dest.join("DSC00903.ARW");
+        copy_source_fixture("DSC00903.ARW", &raw);
+
+        let catalog_db = tmp.path().join("catalog.db");
+        initcache(&catalog_db, &dest, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let path = logical_target_path(&dest, &raw).unwrap();
+        let phash_before: String = catalog
+            .query_row(
+                "SELECT phash FROM target_items WHERE target_path = ?1",
+                params![&path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!phash_before.is_empty());
+        drop(catalog);
+
+        let file = fs::File::options().write(true).open(&raw).unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(file);
+
+        initcache(&catalog_db, &dest, 14, 6).unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let phash_after: String = catalog
+            .query_row(
+                "SELECT phash FROM target_items WHERE target_path = ?1",
+                params![&path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phash_after, phash_before);
     }
 
     #[test]

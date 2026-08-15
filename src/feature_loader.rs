@@ -339,6 +339,54 @@ pub fn save_feature_cache(
     Ok(())
 }
 
+pub fn copy_feature_cache(from: &Connection, to: &mut Connection) -> Result<usize> {
+    let tx = to.transaction()?;
+    let copied = {
+        let mut insert = tx.prepare(
+            r#"
+            INSERT INTO feature_cache (
+                exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors,
+                akaze_points, feature_version, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(exact_hash, size_bytes) DO UPDATE SET
+                akaze_status = excluded.akaze_status,
+                akaze_keypoints = excluded.akaze_keypoints,
+                akaze_descriptors = excluded.akaze_descriptors,
+                akaze_points = excluded.akaze_points,
+                feature_version = excluded.feature_version,
+                updated_at = excluded.updated_at
+            WHERE feature_cache.akaze_status IN ('pending', 'decode_error')
+               OR excluded.akaze_status NOT IN ('pending', 'decode_error')
+            "#,
+        )?;
+        let mut stmt = from.prepare(
+            r#"
+            SELECT exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors,
+                   akaze_points, feature_version, updated_at
+            FROM feature_cache
+            WHERE feature_version = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![FEATURE_VERSION])?;
+        let mut copied = 0usize;
+        while let Some(row) = rows.next()? {
+            copied += insert.execute(params![
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<Vec<u8>>>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+            ])?;
+        }
+        copied
+    };
+    tx.commit()?;
+    Ok(copied)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -829,5 +877,65 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored_status, "decode_error");
+    }
+
+    #[test]
+    fn copy_feature_cache_does_not_replace_ready_with_decode_error() {
+        let tmp = tempdir().unwrap();
+        let mut catalog = open_catalog_db(tmp.path().join("catalog.db")).unwrap();
+        catalog
+            .execute(
+                "INSERT INTO feature_cache (exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, feature_version, updated_at)
+                 VALUES ('same-hash', 10, 'ready', 31, x'00', ?1, datetime('now'))",
+                params![FEATURE_VERSION],
+            )
+            .unwrap();
+        let scan = crate::db::open_scan_db(tmp.path().join("scan.db")).unwrap();
+        scan.execute(
+            "INSERT INTO feature_cache (exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, feature_version, updated_at)
+             VALUES ('same-hash', 10, 'decode_error', NULL, NULL, ?1, datetime('now'))",
+            params![FEATURE_VERSION],
+        )
+        .unwrap();
+
+        copy_feature_cache(&scan, &mut catalog).unwrap();
+        let status: String = catalog
+            .query_row(
+                "SELECT akaze_status FROM feature_cache WHERE exact_hash = 'same-hash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "ready");
+    }
+
+    #[test]
+    fn copy_feature_cache_upgrades_decode_error_to_ready() {
+        let tmp = tempdir().unwrap();
+        let mut catalog = open_catalog_db(tmp.path().join("catalog.db")).unwrap();
+        catalog
+            .execute(
+                "INSERT INTO feature_cache (exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, feature_version, updated_at)
+                 VALUES ('same-hash', 10, 'decode_error', NULL, NULL, ?1, datetime('now'))",
+                params![FEATURE_VERSION],
+            )
+            .unwrap();
+        let scan = crate::db::open_scan_db(tmp.path().join("scan.db")).unwrap();
+        scan.execute(
+            "INSERT INTO feature_cache (exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, feature_version, updated_at)
+             VALUES ('same-hash', 10, 'ready', 31, x'00', ?1, datetime('now'))",
+            params![FEATURE_VERSION],
+        )
+        .unwrap();
+
+        copy_feature_cache(&scan, &mut catalog).unwrap();
+        let status: String = catalog
+            .query_row(
+                "SELECT akaze_status FROM feature_cache WHERE exact_hash = 'same-hash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "ready");
     }
 }

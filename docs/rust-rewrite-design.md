@@ -50,16 +50,16 @@ Use one binary, for example `photo-org`.
 Commands:
 
 - `photo-org scan --scan-db /data/scan-phone.db --src /mnt/phone`
-- `photo-org import --db catalog.db --dest /photos/library`
 - `photo-org import --db catalog.db --scan-db /data/scan-phone.db --dest /photos/library`
 - `photo-org import --db catalog.db --src /mnt/phone --dest /photos/library`
+- `photo-org import --db catalog.db --src /mnt/phone --dest /photos/library --visual-dedup`
 - `photo-org initcache --db catalog.db --dest /photos/library`
 - `photo-org serve --db catalog.db --dest /photos/library --host 127.0.0.1 --port 8080`
 
 This keeps the operational model simple:
 
-- `scan` builds or refreshes source inventory in a separate scan database
-- `import` copies new canonical files into the target tree and records visual group membership
+- `scan` builds or refreshes source inventory and per-file AKAZE cache in a separate scan database
+- `import` copies new canonical files into the target tree, persists AKAZE into the catalog, and records visual group membership only with `--visual-dedup`
 - `initcache` adopts an existing target tree into the database without copying files and without introducing a durable source-side scan database for `--dest`
 - `serve` shows visual groups and applies manual keep/delete decisions
 
@@ -98,7 +98,8 @@ Implementation note:
 - `exact_hash`, `pHash`, `phash_bits`, and image dimensions are base per-file facts and belong on `source_items` or `target_items`
 - second-stage cached feature data refers to expensive confirmation data such as AKAZE descriptors, not to base per-file facts
 - the destination of those collected facts should be pluggable
-- `scan` writes source facts into `source_items`
+- `scan` writes source facts into `source_items` and per-file AKAZE rows into `scan-db.feature_cache`
+- `import` copies those AKAZE rows into `catalog.db.feature_cache` for files that are actually imported
 - `initcache` writes target facts directly into `target_items`
 - shared traversal and feature code is desirable; shared durable row semantics are not
 
@@ -284,6 +285,9 @@ This schema is much easier to reason about than the current `file_cache + thumbn
 - extract timestamp and basic metadata
 - compute exact hash for every file
 - compute `pHash` only for decodable image-like inputs
+- compute and persist AKAZE for visual files in `scan-db.feature_cache` (same content-hash key as the catalog)
+- skip AKAZE on re-scan when a reusable cache row already exists for the same `exact_hash` and `size_bytes`, even if the path changed
+- `initcache` / `discover_file` still extract RAW pHash from embedded previews; they must not write empty visual facts over completed target rows
 - do not attempt AKAZE matching during `scan`; `scan` computes per-file facts, not cross-file grouping
 - upsert by `source_path`
 - mark missing files as stale rather than deleting immediately
@@ -320,7 +324,7 @@ Video files:
 All accepted timestamps should be normalized into one internal representation before writing to the database. If container metadata is present but obviously malformed, fall back to the next source and log the conflict.
 
 ## Import Command Design
-`import` reads `source_items`, chooses canonical files, copies them into the target tree, and records visual group membership in `target_items`.
+`import` reads `source_items`, chooses canonical files, copies them into the target tree, and persists AKAZE into `catalog.db.feature_cache`. Visual group membership is recorded only when `--visual-dedup` is set.
 
 `import` may also auto-run a scan when `--src` is provided directly. In that mode:
 - the command creates or refreshes a scan DB for that source
@@ -347,8 +351,16 @@ Source-side persistence rules:
 - `DEST/YYYY/MM/DD/file.ext`
 - conflict resolution by suffixing: `name-1.ext`, `name-2.ext`
 
+### Feature persistence
+- copy `scan-db.feature_cache` rows into `catalog.db.feature_cache`
+- if a canonical file is missing AKAZE, backfill it only after confirming its `exact_hash` is not already in `target_items`
+- never recompute AKAZE for an exact duplicate of a file already in the target catalog
+- source-side exact-hash groups collapse to one canonical before copy or backfill
+
 ### Visual grouping
-After canonical import of an item:
+Visual grouping is opt-in via `--visual-dedup`. Without that flag, `import` still persists AKAZE but leaves `group_id` unset.
+
+After canonical import of an item when `--visual-dedup` is set:
 
 1. search existing `target_items` with non-empty `phash`
 2. compare Hamming distance against a threshold
@@ -553,11 +565,13 @@ Rules:
 - compute AKAZE descriptors once per file and reuse them for all candidate comparisons in that operation
 
 AKAZE work should be performed in:
-- `import` when a new canonical file is evaluated against nearby existing target items
+- `scan`, as a per-file extraction persisted in `scan-db.feature_cache`
+- `import`, by copying scan cache rows into `catalog.db.feature_cache`, and by backfilling only hashes that are not already in `target_items`
+- `import --visual-dedup`, when a newly imported canonical is matched against nearby existing target items
 - `initcache` when constructing visual groups for an existing target tree
 
-AKAZE should not run in:
-- `scan`
+AKAZE matching should not run in:
+- default `import` (no `--visual-dedup`)
 - web list endpoints
 - any generic background maintenance loop
 
@@ -576,7 +590,9 @@ Recommended table:
 - `PRIMARY KEY (exact_hash, size_bytes)`
 
 Design rules:
-- cache entries are created on demand during `import`, `initcache`, or explicit target-side analysis
+- `scan` writes `feature_cache` rows into the scan DB while discovering visual files
+- `import` copies those rows into `catalog.db` in a transaction, does not replace a durable catalog row with a retryable scan row, and backfills only for hashes not already in `target_items`
+- `initcache` writes feature rows for adopted target files
 - there is no separate command to populate the table
 - the cache is read-through and write-through
 - the cache key is content-based `exact_hash + size_bytes`, not the path
@@ -584,10 +600,9 @@ Design rules:
 - cache misses are allowed and only affect performance, not correctness
 
 Feature cache policy:
-- this is the primary durable performance cache in the system
-- it should be used only for managed target files
-- source-side scan rows do not need heavyweight long-term feature persistence
-- `serve` should reuse this table whenever visual-group operations need feature data
+- `catalog.db.feature_cache` is the durable target-side cache
+- `scan-db.feature_cache` is staging and may be deleted with the scan DB
+- `serve` should reuse the catalog table whenever visual-group operations need feature data
 
 If AKAZE serialization turns out to be too large or unstable in the first implementation, the minimum acceptable fallback is:
 - keep AKAZE in an in-memory per-run cache only
@@ -650,16 +665,15 @@ The rewrite should use staged parallelism with bounded worker pools.
 - blocking image decode and AKAZE work moved to dedicated blocking pools
 - DB writes for group resolution serialized per group or through one mutation path
 
-### Target-Only Feature Persistence
-Feature persistence should happen only after a file is part of the managed target repository.
+### Feature Persistence
+AKAZE is computed per file as early as `scan` so later import and visual matching can reuse it.
 
 That means:
-- `scan` may compute transient `pHash` for staging and planning
-- `scan` should not persist heavyweight AKAZE feature rows as durable cache
-- `import` should persist feature rows for imported target files
-- `initcache` should persist feature rows for adopted target files
-
-This keeps durable cache aligned with the actual managed library instead of with arbitrary removable sources.
+- `scan` persists AKAZE in `scan-db.feature_cache` for visual files
+- `import` copies those rows into `catalog.db.feature_cache`
+- `import` backfills missing AKAZE only for files that are not exact duplicates of anything already in the target catalog
+- `initcache` persists feature rows for adopted target files
+- deleting a scan DB must not invalidate already-imported catalog feature rows
 
 ### SQLite Concurrency
 SQLite should remain the source of truth and should not be stressed with uncontrolled concurrent writers.

@@ -357,6 +357,13 @@ async fn e2e_cli_scan_import_initcache_and_serve() {
         .query_row("SELECT COUNT(*) FROM source_items", [], |row| row.get(0))
         .unwrap();
     assert!(scanned > 0, "scan produced no rows");
+    let scanned_features: i64 = scan_conn
+        .query_row("SELECT COUNT(*) FROM feature_cache", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        scanned_features > 0,
+        "scan did not persist AKAZE feature_cache rows"
+    );
     drop(scan_conn);
 
     let import_args = vec![
@@ -376,6 +383,13 @@ async fn e2e_cli_scan_import_initcache_and_serve() {
         .query_row("SELECT COUNT(*) FROM target_items", [], |row| row.get(0))
         .unwrap();
     assert!(imported > 0, "import produced no target_items");
+    let imported_features: i64 = import_conn
+        .query_row("SELECT COUNT(*) FROM feature_cache", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        imported_features > 0,
+        "import did not copy AKAZE feature_cache into catalog"
+    );
     drop(import_conn);
 
     fs::remove_file(&catalog_db).unwrap();
