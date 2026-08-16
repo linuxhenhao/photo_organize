@@ -107,7 +107,7 @@ Run `cargo test` for every code change in this crate.
 Keep `docs/e2e-test-plan.md` in sync with the expected end-to-end regression coverage and use it as the baseline for behavior-sensitive changes.
 Any code change that can affect CLI workflows, `serve`, path handling, duplicate grouping, file moves/deletes/restores, or catalog state must preserve this end-to-end suite and leave the `e2e-test-plan` scenarios passing.
 
-For Bookworm-targeted release builds inside Docker, use `./container_build.sh`. It uses the `photo-org-build:bookworm` image (building it automatically if missing) and mounts the host Cargo registry and git caches into the container so repeated builds do not re-download Rust dependencies.
+For Bookworm-targeted release builds inside a container, use `./container_build.sh`. It prefers Podman and falls back to Docker (`CONTAINER_ENGINE` overrides the choice), uses the `photo-org-build:bookworm` image (building it automatically if missing), and mounts the host Cargo registry and git caches into the container so repeated builds do not re-download Rust dependencies.
 
 The expensive full-tree `initcache` regression lives in `tests/initcache_full_test_data.rs` and is intentionally `#[ignore]`; run it explicitly when changing import/initcache candidate selection, feature caching, or target adoption behavior.
 

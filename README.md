@@ -47,13 +47,13 @@ Release build:
 cargo build --release
 ```
 
-For the Bookworm-targeted Docker release build used by this repo:
+For the Bookworm-targeted container release build used by this repo:
 
 ```bash
 ./container_build.sh
 ```
 
-That script builds inside the `photo-org-build:bookworm` image and mounts host Cargo caches to avoid repeated dependency downloads.
+That script prefers Podman and falls back to Docker (`CONTAINER_ENGINE` overrides the choice). It builds inside the `photo-org-build:bookworm` image and mounts host Cargo caches to avoid repeated dependency downloads.
 
 ## Requirements
 
