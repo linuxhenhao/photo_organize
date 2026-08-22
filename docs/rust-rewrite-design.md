@@ -59,7 +59,7 @@ Commands:
 This keeps the operational model simple:
 
 - `scan` builds or refreshes source inventory and per-file AKAZE cache in a separate scan database
-- `import` copies new canonical files into the target tree, persists AKAZE into the catalog, and records visual group membership only with `--visual-dedup`
+- `import` copies new canonical files into the target tree, persists AKAZE into the catalog for hashes not already in `target_items`, skips dest recopy for already-imported exact hashes, and records visual group membership only with `--visual-dedup`
 - `initcache` adopts an existing target tree into the database without copying files and without introducing a durable source-side scan database for `--dest`
 - `serve` shows visual groups and applies manual keep/delete decisions
 
@@ -324,7 +324,7 @@ Video files:
 All accepted timestamps should be normalized into one internal representation before writing to the database. If container metadata is present but obviously malformed, fall back to the next source and log the conflict.
 
 ## Import Command Design
-`import` reads `source_items`, chooses canonical files, copies them into the target tree, and persists AKAZE into `catalog.db.feature_cache`. Visual group membership is recorded only when `--visual-dedup` is set.
+`import` reads `source_items`, chooses canonical files, copies new unique files into the target tree, and persists AKAZE into `catalog.db.feature_cache` when a canonical hash is not already in `target_items`. Already-imported exact hashes skip dest recopy and do not rewrite current-version catalog `feature_cache` rows. Visual group membership, pHash index load, and AKAZE pre-warm run only when `--visual-dedup` is set.
 
 `import` may also auto-run a scan when `--src` is provided directly. In that mode:
 - the command creates or refreshes a scan DB for that source
@@ -352,13 +352,15 @@ Source-side persistence rules:
 - conflict resolution by suffixing: `name-1.ext`, `name-2.ext`
 
 ### Feature persistence
-- copy `scan-db.feature_cache` rows into `catalog.db.feature_cache`
+- copy `scan-db.feature_cache` rows into `catalog.db.feature_cache` only when at least one canonical hash is not already in `target_items`
+- do not replace a current-version durable catalog `feature_cache` row with another current-version scan row
 - if a canonical file is missing AKAZE, backfill it only after confirming its `exact_hash` is not already in `target_items`
 - never recompute AKAZE for an exact duplicate of a file already in the target catalog
 - source-side exact-hash groups collapse to one canonical before copy or backfill
+- reopening a catalog whose `feature_cache` rows are already at the current feature version must not rewrite those rows
 
 ### Visual grouping
-Visual grouping is opt-in via `--visual-dedup`. Without that flag, `import` still persists AKAZE but leaves `group_id` unset.
+Visual grouping is opt-in via `--visual-dedup`. Without that flag, `import` still persists AKAZE for newly imported hashes but leaves `group_id` unset, and does not load the in-memory pHash index or run AKAZE pre-warm.
 
 After canonical import of an item when `--visual-dedup` is set:
 
@@ -566,7 +568,7 @@ Rules:
 
 AKAZE work should be performed in:
 - `scan`, as a per-file extraction persisted in `scan-db.feature_cache`
-- `import`, by copying scan cache rows into `catalog.db.feature_cache`, and by backfilling only hashes that are not already in `target_items`
+- `import`, by copying scan cache rows into `catalog.db.feature_cache` when a canonical hash is new, and by backfilling only hashes that are not already in `target_items`
 - `import --visual-dedup`, when a newly imported canonical is matched against nearby existing target items
 - `initcache` when constructing visual groups for an existing target tree
 
@@ -591,7 +593,7 @@ Recommended table:
 
 Design rules:
 - `scan` writes `feature_cache` rows into the scan DB while discovering visual files
-- `import` copies those rows into `catalog.db` in a transaction, does not replace a durable catalog row with a retryable scan row, and backfills only for hashes not already in `target_items`
+- `import` copies those rows into `catalog.db` in a transaction, does not replace a durable catalog row with a retryable scan row, does not rewrite current-version durable rows, and backfills only for hashes not already in `target_items`
 - `initcache` writes feature rows for adopted target files
 - there is no separate command to populate the table
 - the cache is read-through and write-through
@@ -670,7 +672,7 @@ AKAZE is computed per file as early as `scan` so later import and visual matchin
 
 That means:
 - `scan` persists AKAZE in `scan-db.feature_cache` for visual files
-- `import` copies those rows into `catalog.db.feature_cache`
+- `import` copies those rows into `catalog.db.feature_cache` when importing new hashes, and skips that copy when every canonical is already in `target_items`
 - `import` backfills missing AKAZE only for files that are not exact duplicates of anything already in the target catalog
 - `initcache` persists feature rows for adopted target files
 - deleting a scan DB must not invalidate already-imported catalog feature rows
@@ -799,6 +801,10 @@ Required properties:
 - log the source path and operation id on scan/import failures
 - log group id and request id on web resolve operations
 - emit summary lines for scan and import counts
+- log `import` startup stages and catalog-open/migrate steps with `elapsed_ms` so a long pause is attributable
+- log a per-file `scan file start`/`scan file done` pair with `elapsed_ms` so the first slow file is visible immediately, and keep progress output alive with a time-cadence fallback in `ProgressReporter` (about every 10s) even when a single file dominates the count step
+- keep `fs::copy` as a single blocking call in `import` (no chunked IO) and run a progress thread that stats the growing temp file every 10s, logging `copy in progress` with `bytes_copied`, `total_bytes`, and `percent`, so a multi-GB file transfer shows real progress without changing the copy semantics
+- skip `feature_cache` rewrite on catalog open when rows are already at the current feature version
 - return actionable CLI errors instead of bare unwrap-style failures
 
 ## Testing Strategy

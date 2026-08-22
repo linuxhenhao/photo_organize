@@ -9,7 +9,8 @@ It owns the new `photo-org` binary, the SQLite schema for `catalog.db` and scan 
 It also handles RAW preview extraction in pure Rust when possible so camera RAW files can participate in scan/import grouping without shelling out to `exiftool`.
 `initcache` should scan target-file facts directly into `catalog.db.target_items`; target adoption must not depend on a persistent target-side `source_items` scan database such as `initcache-scan.db`.
 Repeated `initcache` runs should reuse prior `target_items` facts when file `size_bytes` and stored `modified_at` are unchanged, and only fall back to re-reading file content and recomputing hashes when that fingerprint changes.
-Long-running `scan`, `import`, and `initcache` paths should emit periodic progress logs with total, processed, and remaining counts so operators can tell that work is advancing.
+Long-running `scan`, `import`, and `initcache` paths should emit periodic progress logs with total, processed, and remaining counts so operators can tell that work is advancing. `ProgressReporter` logs on a count step and falls back to a time cadence (about every 10s) so a single slow file cannot stall the output. `scan` also logs a `scan file start`/`scan file done` pair per file with `elapsed_ms`, so the first slow file is visible immediately instead of a long silent gap. `import` keeps `fs::copy` as a single blocking call (no chunked IO) but runs a progress thread that stats the growing temp file every 10s and logs `copy in progress` with `bytes_copied`, `total_bytes`, and `percent`, so a multi-GB copy reports real progress instead of looking hung.
+`import` should also log each startup stage and catalog-open/migrate step with `elapsed_ms` before the work starts, not only after it finishes.
 
 For the full design rationale, crate selection, and data-model decisions, see `docs/rust-rewrite-design.md`.
 
@@ -22,7 +23,7 @@ Current internal structure also includes:
 ## Command Workflows
 
 - **`scan`**: Discovery phase. Walks source directories, extracts metadata (EXIF, hashes, pHash) and AKAZE features in parallel, upserts facts into `scan-db` (`source_items`), and persists AKAZE rows in `scan-db.feature_cache`. Re-scans skip AKAZE when a reusable cache row already exists for the same content hash and size, including renamed or copied files. `discover_file` (used by `initcache`) still computes RAW pHash from embedded previews.
-- **`import`**: Transformation phase. Runs `scan` to refresh `scan-db`, selects one canonical per exact-hash group, copies new files to the target directory, and copies scan AKAZE rows into `catalog.db.feature_cache`. Missing AKAZE is backfilled only for hashes that are not already in `target_items`. Visual pHash/AKAZE grouping runs only when `--visual-dedup` is set.
+- **`import`**: Transformation phase. Runs `scan` to refresh `scan-db`, selects one canonical per exact-hash group, copies new files to the target directory, and copies scan AKAZE rows into `catalog.db.feature_cache` only when a canonical hash is not already in `target_items`. Missing AKAZE is backfilled only for hashes that are not already in `target_items`. Visual pHash/AKAZE grouping, in-memory pHash index load, and AKAZE pre-warm run only when `--visual-dedup` is set. A second import of already-imported exact hashes skips dest recopy and does not rewrite current-version `feature_cache` rows. Catalog open skips `feature_cache` rewrite when rows are already at the current feature version.
 - **`initcache`**: Adoption phase. 
     - **Stage 1 (Ingest)**: Parallel discovery of existing target files, reusing DB facts if file size/mtime match.
     - **Stage 2 (Pre-warm)**: Parallel computation of missing visual features for potential duplicates.

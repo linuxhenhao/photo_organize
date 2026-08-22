@@ -197,6 +197,14 @@ pub fn run(
     phash_threshold: u32,
     akaze_min_matches: usize,
 ) -> Result<()> {
+    tracing::info!(
+        db = %catalog_db.display(),
+        dest = %dest.display(),
+        scan_db = ?scan_db.map(|p| p.display().to_string()),
+        src_count = src_roots.len(),
+        visual_dedup,
+        "import start"
+    );
     if let Some(src_roots) = (!src_roots.is_empty()).then_some(src_roots) {
         let scan_db_path = scan_db
             .cloned()
@@ -820,17 +828,49 @@ fn import_from_scan_db(
     phash_threshold: u32,
     akaze_min_matches: usize,
 ) -> Result<()> {
+    tracing::info!(
+        catalog_db = %catalog_db.display(),
+        scan_db = %scan_db.display(),
+        dest = %dest.display(),
+        visual_dedup,
+        "import from scan db start"
+    );
     fs::create_dir_all(dest)?;
+
+    tracing::info!("import stage start: open_scan_db");
+    let started = Instant::now();
     let scan_conn = open_scan_db(scan_db)?;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "import stage done: open_scan_db"
+    );
+
+    tracing::info!("import stage start: open_catalog_db");
+    let started = Instant::now();
     let mut catalog_conn = open_catalog_db(catalog_db)?;
-    normalize_catalog_target_paths(&catalog_conn, dest)?;
-    let copied_features = copy_feature_cache(&scan_conn, &mut catalog_conn)?;
-    if copied_features > 0 {
-        tracing::info!(copied_features, "copied scan feature cache into catalog");
-    }
-    let mut feature_loader = FeatureLoader::default();
-    let mut phash_index = PhashIndex::from_catalog(&catalog_conn)?;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "import stage done: open_catalog_db"
+    );
+
+    tracing::info!("import stage start: normalize_catalog_target_paths");
+    let started = Instant::now();
+    let normalized = normalize_catalog_target_paths(&catalog_conn, dest)?;
+    tracing::info!(
+        normalized,
+        elapsed_ms = started.elapsed().as_millis(),
+        "import stage done: normalize_catalog_target_paths"
+    );
+
+    tracing::info!("import stage start: load_scan_rows");
+    let started = Instant::now();
     let rows = load_scan_rows(&scan_conn)?;
+    tracing::info!(
+        rows = rows.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "import stage done: load_scan_rows"
+    );
+
     let mut grouped: BTreeMap<String, Vec<ScanRow>> = BTreeMap::new();
     for row in rows.into_iter().filter(|row| row.scan_status == "present") {
         if row.exact_hash.is_empty() {
@@ -842,41 +882,86 @@ fn import_from_scan_db(
     let progress = ProgressReporter::new("import canonicals", grouped.len());
     progress.log_start();
 
-    // --- Start Pre-warming Phase for Import ---
     let canonical_rows: Vec<ScanRow> = grouped
         .values()
         .map(|candidates| choose_canonical(candidates))
         .collect();
 
-    let prewarm_conn = open_catalog_db(catalog_db)?;
-    let mut to_prewarm = Vec::new();
+    tracing::info!("import stage start: copy_feature_cache");
+    let started = Instant::now();
+    let mut needs_feature_copy = false;
     for row in &canonical_rows {
-        if target_exists_with_hash(&prewarm_conn, &row.exact_hash)? {
-            continue;
+        if !target_exists_with_hash(&catalog_conn, &row.exact_hash)? {
+            needs_feature_copy = true;
+            break;
         }
-        if !supports_visual_features(Path::new(&row.source_path), &row.mime_type) {
-            continue;
-        }
-        if has_reusable_feature_cache(&prewarm_conn, &row.exact_hash, row.size_bytes)? {
-            continue;
-        }
-        to_prewarm.push(DiscoveredFile {
-            path: PathBuf::from(&row.source_path),
-            size_bytes: row.size_bytes,
-            mime_type: row.mime_type.clone(),
-            created_at: String::new(),
-            exact_hash: row.exact_hash.clone(),
-            phash: row.phash.clone(),
-            phash_bits: row.phash_bits,
-            width: row.width,
-            height: row.height,
-            scan_status: String::new(),
-            last_scanned_at: String::new(),
-            meta_json: String::new(),
-            visual_features: None,
-        });
     }
-    drop(prewarm_conn);
+    let copied_features = if needs_feature_copy {
+        copy_feature_cache(&scan_conn, &mut catalog_conn)?
+    } else {
+        0
+    };
+    tracing::info!(
+        copied_features,
+        skipped = !needs_feature_copy,
+        elapsed_ms = started.elapsed().as_millis(),
+        "import stage done: copy_feature_cache"
+    );
+
+    let mut feature_loader = FeatureLoader::default();
+    tracing::info!("import stage start: phash_index");
+    let started = Instant::now();
+    let mut phash_index = if visual_dedup {
+        PhashIndex::from_catalog(&catalog_conn)?
+    } else {
+        PhashIndex::default()
+    };
+    tracing::info!(
+        visual_dedup,
+        elapsed_ms = started.elapsed().as_millis(),
+        "import stage done: phash_index"
+    );
+
+    tracing::info!(
+        canonicals = canonical_rows.len(),
+        "import stage start: prewarm_select"
+    );
+    let started = Instant::now();
+    let mut to_prewarm = Vec::new();
+    if visual_dedup {
+        for row in &canonical_rows {
+            if target_exists_with_hash(&catalog_conn, &row.exact_hash)? {
+                continue;
+            }
+            if !supports_visual_features(Path::new(&row.source_path), &row.mime_type) {
+                continue;
+            }
+            if has_reusable_feature_cache(&catalog_conn, &row.exact_hash, row.size_bytes)? {
+                continue;
+            }
+            to_prewarm.push(DiscoveredFile {
+                path: PathBuf::from(&row.source_path),
+                size_bytes: row.size_bytes,
+                mime_type: row.mime_type.clone(),
+                created_at: String::new(),
+                exact_hash: row.exact_hash.clone(),
+                phash: row.phash.clone(),
+                phash_bits: row.phash_bits,
+                width: row.width,
+                height: row.height,
+                scan_status: String::new(),
+                last_scanned_at: String::new(),
+                meta_json: String::new(),
+                visual_features: None,
+            });
+        }
+    }
+    tracing::info!(
+        to_prewarm = to_prewarm.len(),
+        visual_dedup,
+        elapsed_ms = started.elapsed().as_millis(),
+        "import stage done: prewarm_select"
+    );
 
     if !to_prewarm.is_empty() {
         tracing::info!(
@@ -924,13 +1009,23 @@ fn import_from_scan_db(
         interrupt::check()?;
         tracing::info!(cached, "feature pre-warming complete");
     }
-    // --- End Pre-warming Phase ---
 
+    tracing::info!(
+        canonicals = canonical_rows.len(),
+        "import stage start: copy canonicals"
+    );
+    let copy_started = Instant::now();
     let mut imported = 0usize;
     for canonical in canonical_rows {
         interrupt::check()?;
+        let item_started = Instant::now();
         if target_exists_with_hash(&catalog_conn, &canonical.exact_hash)? {
-            tracing::info!(source = %canonical.source_path, hash = %canonical.exact_hash, "skipping already imported exact duplicate");
+            tracing::info!(
+                source = %canonical.source_path,
+                hash = %canonical.exact_hash,
+                elapsed_ms = item_started.elapsed().as_millis(),
+                "skipping already imported exact duplicate"
+            );
             progress.item_done();
             continue;
         }
@@ -945,9 +1040,19 @@ fn import_from_scan_db(
             akaze_min_matches,
         )?;
         imported += 1;
-        tracing::info!(target = %visual.target_path, group_id = ?visual.group_id, "imported canonical file");
+        tracing::info!(
+            target = %visual.target_path,
+            group_id = ?visual.group_id,
+            elapsed_ms = item_started.elapsed().as_millis(),
+            "imported canonical file"
+        );
         progress.item_done();
     }
+    tracing::info!(
+        imported,
+        elapsed_ms = copy_started.elapsed().as_millis(),
+        "import stage done: copy canonicals"
+    );
 
     tracing::info!(db = %catalog_db.display(), imported, "import complete");
     Ok(())
@@ -1026,7 +1131,20 @@ fn import_single(
 ) -> Result<TargetRow> {
     let source_path = Path::new(&row.source_path);
     let target_path = reserve_target_path(dest, &row.created_at, source_path)?;
+    tracing::info!(
+        source = %source_path.display(),
+        target = %target_path.display(),
+        size_bytes = row.size_bytes,
+        "copying canonical file"
+    );
+    let copy_started = Instant::now();
     copy_to_target(source_path, &target_path)?;
+    tracing::info!(
+        target = %target_path.display(),
+        size_bytes = row.size_bytes,
+        elapsed_ms = copy_started.elapsed().as_millis(),
+        "copied canonical file"
+    );
     let input = catalog_input_from_scan_row(row, target_path);
     process_catalog_input(
         conn,
@@ -1293,7 +1411,46 @@ fn copy_to_target(source: &Path, target: &Path) -> Result<()> {
     let parent = target.parent().context("target path has no parent")?;
     fs::create_dir_all(parent)?;
     let temp = NamedTempFile::new_in(parent)?;
-    fs::copy(source, temp.path())?;
+
+    // Keep fs::copy as a single blocking call (no chunked IO), but surface
+    // real progress by stat-ing the growing temp file on a timer.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let source_for_log = source.to_path_buf();
+    let target_for_log = target.to_path_buf();
+    let temp_path_for_progress = temp.path().to_path_buf();
+    let total_bytes = fs::metadata(source).map(|m| m.len()).unwrap_or(0);
+    let heartbeat = std::thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            match done_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let copied = fs::metadata(&temp_path_for_progress)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    let percent = if total_bytes > 0 {
+                        format!("{:.1}%", copied as f64 * 100.0 / total_bytes as f64)
+                    } else {
+                        "?%".to_string()
+                    };
+                    tracing::info!(
+                        source = %source_for_log.display(),
+                        target = %target_for_log.display(),
+                        bytes_copied = copied,
+                        total_bytes,
+                        percent,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "copy in progress"
+                    );
+                }
+            }
+        }
+    });
+
+    let copied = fs::copy(source, temp.path());
+    let _ = done_tx.send(());
+    let _ = heartbeat.join();
+    copied.with_context(|| format!("copy {} -> {}", source.display(), temp.path().display()))?;
     temp.persist(target)
         .with_context(|| format!("persist {} -> {}", source.display(), target.display()))?;
     Ok(())
@@ -1518,10 +1675,11 @@ fn choose_primary_member(rows: &[TargetRow]) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::open_catalog_db;
+    use crate::db::{FEATURE_VERSION, open_catalog_db};
     use crate::util::logical_target_path;
     use std::fs;
     use std::path::PathBuf;
+    use std::time::SystemTime;
     use tempfile::tempdir;
 
     fn mock_fixture_path(name: &str) -> PathBuf {
@@ -1730,6 +1888,207 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM target_items", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    fn dest_file_count(dest: &Path) -> usize {
+        walkdir::WalkDir::new(dest)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file())
+            .count()
+    }
+
+    fn dest_file_fingerprints(dest: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
+        let mut files = Vec::new();
+        for entry in walkdir::WalkDir::new(dest)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file())
+        {
+            let meta = fs::metadata(entry.path()).unwrap();
+            files.push((
+                entry.path().to_path_buf(),
+                meta.len(),
+                meta.modified().unwrap(),
+            ));
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files
+    }
+
+    #[test]
+    fn import_second_run_skips_without_reading_removed_sources() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let a = src.join("img_a.jpg");
+        let b = src.join("img_b.jpg");
+        copy_mock_fixture("img_2023_05_01.jpg", &a);
+        copy_mock_fixture("img_2023_05_02.jpg", &b);
+
+        let catalog_db = tmp.path().join("catalog.db");
+        let scan_db = tmp.path().join("scan.db");
+        run(
+            &catalog_db,
+            Some(&scan_db),
+            &[src.clone()],
+            &dest,
+            false,
+            14,
+            6,
+        )
+        .unwrap();
+
+        let dest_count_after_first = dest_file_count(&dest);
+        let fingerprints_after_first = dest_file_fingerprints(&dest);
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let target_count_after_first: i64 = catalog
+            .query_row("SELECT COUNT(*) FROM target_items", [], |row| row.get(0))
+            .unwrap();
+        drop(catalog);
+        assert!(dest_count_after_first >= 2);
+        assert_eq!(target_count_after_first, 2);
+
+        fs::remove_file(&a).unwrap();
+        fs::remove_file(&b).unwrap();
+
+        run(&catalog_db, Some(&scan_db), &[], &dest, false, 14, 6).unwrap();
+
+        assert_eq!(dest_file_count(&dest), dest_count_after_first);
+        assert_eq!(dest_file_fingerprints(&dest), fingerprints_after_first);
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let target_count_after_second: i64 = catalog
+            .query_row("SELECT COUNT(*) FROM target_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(target_count_after_second, target_count_after_first);
+    }
+
+    #[test]
+    fn import_noop_against_populated_catalog_does_not_rewrite_current_feature_cache() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+
+        let a = src.join("img_a.jpg");
+        copy_mock_fixture("img_2023_05_01.jpg", &a);
+
+        let catalog_db = tmp.path().join("catalog.db");
+        let scan_db = tmp.path().join("scan.db");
+        run(
+            &catalog_db,
+            Some(&scan_db),
+            &[src.clone()],
+            &dest,
+            false,
+            14,
+            6,
+        )
+        .unwrap();
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let original_cache: Vec<(String, i64, String, i64, String)> = catalog
+            .prepare(
+                "SELECT exact_hash, size_bytes, akaze_status, feature_version, updated_at
+                 FROM feature_cache ORDER BY exact_hash, size_bytes",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(!original_cache.is_empty());
+
+        let filler_updated_at = "2019-06-07T08:09:10Z";
+        for i in 0..250 {
+            let hash = format!("filler-{i:04}");
+            catalog
+                .execute(
+                    r#"
+                    INSERT INTO target_items (
+                        target_path, size_bytes, mime_type, created_at, exact_hash, phash, phash_bits,
+                        width, height, group_id, keep_state, is_group_primary, group_status,
+                        origin_source_id, meta_json
+                    ) VALUES (?1, 10, 'image/jpeg', '2019-01-01T00:00:00Z', ?2, '', 0, 1, 1,
+                              NULL, 'undecided', 0, 'completed', NULL, '{}')
+                    "#,
+                    params![format!("dest/filler/{i:04}.jpg"), hash],
+                )
+                .unwrap();
+            catalog
+                .execute(
+                    r#"
+                    INSERT INTO feature_cache (
+                        exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors,
+                        akaze_points, feature_version, updated_at
+                    ) VALUES (?1, 10, 'ready', 0, x'00', x'00', ?2, ?3)
+                    "#,
+                    params![hash, FEATURE_VERSION, filler_updated_at],
+                )
+                .unwrap();
+        }
+        drop(catalog);
+
+        let dest_count_after_first = dest_file_count(&dest);
+        let fingerprints_after_first = dest_file_fingerprints(&dest);
+        fs::remove_file(&a).unwrap();
+
+        run(&catalog_db, Some(&scan_db), &[], &dest, false, 14, 6).unwrap();
+
+        assert_eq!(dest_file_count(&dest), dest_count_after_first);
+        assert_eq!(dest_file_fingerprints(&dest), fingerprints_after_first);
+
+        let catalog = open_catalog_db(&catalog_db).unwrap();
+        let after_imported_cache: Vec<(String, i64, String, i64, String)> = catalog
+            .prepare(
+                "SELECT exact_hash, size_bytes, akaze_status, feature_version, updated_at
+                 FROM feature_cache
+                 WHERE exact_hash NOT LIKE 'filler-%'
+                 ORDER BY exact_hash, size_bytes",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(after_imported_cache, original_cache);
+
+        let filler_unchanged: i64 = catalog
+            .query_row(
+                "SELECT COUNT(*) FROM feature_cache
+                 WHERE exact_hash LIKE 'filler-%'
+                   AND akaze_status = 'ready'
+                   AND feature_version = ?1
+                   AND updated_at = ?2",
+                params![FEATURE_VERSION, filler_updated_at],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(filler_unchanged, 250);
+        let target_count: i64 = catalog
+            .query_row("SELECT COUNT(*) FROM target_items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(target_count, 251);
     }
 
     #[test]

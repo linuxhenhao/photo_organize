@@ -5,7 +5,7 @@
 It provides one binary with four commands:
 
 - `scan`: discover source files and write source-side facts into a scan database
-- `import`: scan sources, copy canonical files into the target library, skip exact duplicates, and optionally create visual duplicate groups in `catalog.db`
+- `import`: scan sources, copy canonical files into the target library, skip exact duplicates (including dest recopy), and optionally create visual duplicate groups in `catalog.db`
 - `initcache`: adopt an existing target library directly into `catalog.db` without a target-side scan database
 - `serve`: run the local duplicate-resolution web UI
 
@@ -227,6 +227,11 @@ The binary uses `tracing`.
 
 - default behavior enables `warn` globally and `photo_org=info`
 - you can override with `RUST_LOG`
+- `import` logs each startup stage (`open_scan_db`, `open_catalog_db`, `normalize_catalog_target_paths`, `load_scan_rows`, `copy_feature_cache`, `phash_index`, `prewarm_select`, `copy canonicals`) with `elapsed_ms` on start and done lines
+- catalog open also logs SQLite open, `journal_mode=WAL`, and `feature_cache` migrate start/skip/done; current-version cache rows are not rewritten on reopen
+- default `import` (no `--visual-dedup`) skips pHash index load and AKAZE pre-warm, and skips dest recopy plus `feature_cache` copy when every canonical hash is already in `target_items`
+- `scan` logs a `scan file start`/`scan file done` pair per file with `elapsed_ms`; `ProgressReporter` falls back to a ~10s time cadence so a slow single file cannot stall progress output
+- `import` keeps `fs::copy` single-call (no chunked IO) and emits a `copy in progress` log every 10s with `bytes_copied`, `total_bytes`, and `percent` while a large file is being copied
 - set `PHOTO_ORG_PROFILE=1` to enable additional profiling logs in the implemented paths
   `initcache` logs `initcache profile summary`
   `serve` logs `serve delete_trash profile`

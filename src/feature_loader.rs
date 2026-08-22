@@ -356,7 +356,6 @@ pub fn copy_feature_cache(from: &Connection, to: &mut Connection) -> Result<usiz
                 feature_version = excluded.feature_version,
                 updated_at = excluded.updated_at
             WHERE feature_cache.akaze_status IN ('pending', 'decode_error')
-               OR excluded.akaze_status NOT IN ('pending', 'decode_error')
             "#,
         )?;
         let mut stmt = from.prepare(
@@ -937,5 +936,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "ready");
+    }
+
+    #[test]
+    fn copy_feature_cache_does_not_rewrite_current_ready_rows() {
+        let tmp = tempdir().unwrap();
+        let mut catalog = open_catalog_db(tmp.path().join("catalog.db")).unwrap();
+        let updated_at = "2021-02-03T04:05:06Z";
+        catalog
+            .execute(
+                "INSERT INTO feature_cache (exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, akaze_points, feature_version, updated_at)
+                 VALUES ('same-hash', 10, 'ready', 31, x'00', x'00', ?1, ?2)",
+                params![FEATURE_VERSION, updated_at],
+            )
+            .unwrap();
+        let scan = crate::db::open_scan_db(tmp.path().join("scan.db")).unwrap();
+        scan.execute(
+            "INSERT INTO feature_cache (exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors, akaze_points, feature_version, updated_at)
+             VALUES ('same-hash', 10, 'ready', 99, x'ff', x'ff', ?1, datetime('now'))",
+            params![FEATURE_VERSION],
+        )
+        .unwrap();
+
+        let copied = copy_feature_cache(&scan, &mut catalog).unwrap();
+        assert_eq!(copied, 0);
+        let row: (i64, Vec<u8>, String) = catalog
+            .query_row(
+                "SELECT akaze_keypoints, akaze_descriptors, updated_at FROM feature_cache WHERE exact_hash = 'same-hash'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, 31);
+        assert_eq!(row.1, vec![0_u8]);
+        assert_eq!(row.2, updated_at);
     }
 }

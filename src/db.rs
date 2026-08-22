@@ -1,22 +1,58 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::path::Path;
+use std::time::Instant;
 
 pub const FEATURE_VERSION: i64 = 7;
 
 pub fn open_scan_db(path: impl AsRef<Path>) -> Result<Connection> {
-    let conn = Connection::open(path.as_ref())
-        .with_context(|| format!("open scan db {}", path.as_ref().display()))?;
+    let path = path.as_ref();
+    let started = Instant::now();
+    tracing::info!(db = %path.display(), "opening scan db");
+    let conn = Connection::open(path).with_context(|| format!("open scan db {}", path.display()))?;
     configure_writable(&conn)?;
     init_scan_schema(&conn)?;
+    tracing::info!(
+        db = %path.display(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "opened scan db"
+    );
     Ok(conn)
 }
 
 pub fn open_catalog_db(path: impl AsRef<Path>) -> Result<Connection> {
-    let conn = Connection::open(path.as_ref())
-        .with_context(|| format!("open catalog db {}", path.as_ref().display()))?;
+    let path = path.as_ref();
+    let total_started = Instant::now();
+    tracing::info!(db = %path.display(), "opening catalog db");
+
+    let started = Instant::now();
+    let conn =
+        Connection::open(path).with_context(|| format!("open catalog db {}", path.display()))?;
+    tracing::info!(
+        db = %path.display(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "catalog sqlite open"
+    );
+
+    let started = Instant::now();
     configure_writable(&conn)?;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "catalog sqlite pragmas"
+    );
+
+    let started = Instant::now();
     init_catalog_schema(&conn)?;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "catalog schema/migrate"
+    );
+
+    tracing::info!(
+        db = %path.display(),
+        elapsed_ms = total_started.elapsed().as_millis(),
+        "opened catalog db"
+    );
     Ok(conn)
 }
 
@@ -31,7 +67,16 @@ pub fn open_catalog_db_readonly(path: impl AsRef<Path>) -> Result<Connection> {
 }
 
 fn configure_writable(conn: &Connection) -> Result<()> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    let started = Instant::now();
+    let current: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if !current.eq_ignore_ascii_case("wal") {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+    }
+    tracing::info!(
+        already_wal = current.eq_ignore_ascii_case("wal"),
+        elapsed_ms = started.elapsed().as_millis(),
+        "catalog/scan journal_mode=WAL"
+    );
     conn.pragma_update(None, "busy_timeout", 5000_i64)?;
     configure_common(conn)?;
     Ok(())
@@ -102,6 +147,7 @@ fn init_catalog_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_target_items_group_id ON target_items(group_id);
         CREATE INDEX IF NOT EXISTS idx_target_items_phash ON target_items(phash);
+        CREATE INDEX IF NOT EXISTS idx_target_items_exact_hash ON target_items(exact_hash);
         "#,
     )?;
     init_feature_cache_schema(conn)?;
@@ -142,8 +188,61 @@ fn migrate_feature_cache_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn exec_timed(conn: &Connection, stage: &'static str, sql: &str, version: i64) -> Result<usize> {
+    tracing::info!(stage, "feature_cache migrate start");
+    let started = Instant::now();
+    let rows = conn.execute(sql, params![version])?;
+    tracing::info!(
+        stage,
+        rows,
+        elapsed_ms = started.elapsed().as_millis(),
+        "feature_cache migrate done"
+    );
+    Ok(rows)
+}
+
+fn feature_cache_needs_normalize(conn: &Connection) -> Result<bool> {
+    let needs = conn
+        .query_row(
+            r#"
+            SELECT 1 FROM feature_cache
+            WHERE
+                feature_version < ?1
+                OR akaze_status IS NULL
+                OR akaze_status = ''
+                OR (
+                    akaze_descriptors IS NOT NULL
+                    AND akaze_points IS NOT NULL
+                    AND akaze_status != 'ready'
+                )
+                OR (
+                    akaze_descriptors IS NULL
+                    AND akaze_status IN ('pending', 'unavailable', '')
+                )
+            LIMIT 1
+            "#,
+            params![FEATURE_VERSION],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(needs)
+}
+
 fn normalize_feature_cache_rows(conn: &Connection) -> Result<()> {
-    conn.execute(
+    tracing::info!("feature_cache migrate start");
+    let started = Instant::now();
+    if !feature_cache_needs_normalize(conn)? {
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_millis(),
+            "feature_cache migrate skipped (already current)"
+        );
+        return Ok(());
+    }
+
+    exec_timed(
+        conn,
+        "normalize_ready",
         r#"
         UPDATE feature_cache
         SET
@@ -159,10 +258,12 @@ fn normalize_feature_cache_rows(conn: &Connection) -> Result<()> {
                 OR feature_version < ?1
             )
         "#,
-        params![FEATURE_VERSION],
+        FEATURE_VERSION,
     )?;
 
-    conn.execute(
+    exec_timed(
+        conn,
+        "normalize_decode_error",
         r#"
         UPDATE feature_cache
         SET
@@ -178,10 +279,12 @@ fn normalize_feature_cache_rows(conn: &Connection) -> Result<()> {
                 OR (akaze_status = 'decode_error' AND feature_version < ?1)
             )
         "#,
-        params![FEATURE_VERSION],
+        FEATURE_VERSION,
     )?;
 
-    conn.execute(
+    exec_timed(
+        conn,
+        "normalize_too_small",
         r#"
         UPDATE feature_cache
         SET feature_version = ?1
@@ -190,10 +293,12 @@ fn normalize_feature_cache_rows(conn: &Connection) -> Result<()> {
             AND akaze_status = 'too_small'
             AND feature_version < ?1
         "#,
-        params![FEATURE_VERSION],
+        FEATURE_VERSION,
     )?;
 
-    conn.execute(
+    exec_timed(
+        conn,
+        "delete_missing_points",
         r#"
         DELETE FROM feature_cache
         WHERE
@@ -201,10 +306,12 @@ fn normalize_feature_cache_rows(conn: &Connection) -> Result<()> {
             AND akaze_points IS NULL
             AND feature_version < ?1
         "#,
-        params![FEATURE_VERSION],
+        FEATURE_VERSION,
     )?;
 
-    conn.execute(
+    exec_timed(
+        conn,
+        "delete_legacy_no_keypoints",
         r#"
         DELETE FROM feature_cache
         WHERE
@@ -212,8 +319,12 @@ fn normalize_feature_cache_rows(conn: &Connection) -> Result<()> {
             AND akaze_status = 'no_keypoints'
             AND feature_version < ?1
         "#,
-        params![FEATURE_VERSION],
+        FEATURE_VERSION,
     )?;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "feature_cache migrate done"
+    );
     Ok(())
 }
 
@@ -407,6 +518,77 @@ mod tests {
             .unwrap();
         assert_eq!(ready_row.0, "ready");
         assert_eq!(ready_row.1, FEATURE_VERSION);
+    }
+
+    #[test]
+    fn open_catalog_db_does_not_rewrite_current_version_feature_cache_rows() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let conn = open_catalog_db(&db_path).unwrap();
+        let ready_blob = serialize_akaze_descriptors(&[vec![9, 8, 7, 6]]).unwrap();
+        let points_blob = serialize_akaze_points(&[AkazePoint { x: 3.0, y: 4.0 }]).unwrap();
+        let updated_at = "2020-01-02T03:04:05Z";
+        conn.execute(
+            "INSERT INTO feature_cache (
+                exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors,
+                akaze_points, feature_version, updated_at
+             ) VALUES (?1, ?2, 'ready', ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "current-ready",
+                42_i64,
+                1_i64,
+                ready_blob.clone(),
+                points_blob.clone(),
+                FEATURE_VERSION,
+                updated_at
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO feature_cache (
+                exact_hash, size_bytes, akaze_status, akaze_keypoints, akaze_descriptors,
+                akaze_points, feature_version, updated_at
+             ) VALUES (?1, ?2, 'decode_error', NULL, NULL, NULL, ?3, ?4)",
+            params!["current-error", 7_i64, FEATURE_VERSION, updated_at],
+        )
+        .unwrap();
+        drop(conn);
+
+        let reopened = open_catalog_db(&db_path).unwrap();
+        let ready: (String, i64, String, Vec<u8>, Vec<u8>) = reopened
+            .query_row(
+                "SELECT akaze_status, feature_version, updated_at, akaze_descriptors, akaze_points
+                 FROM feature_cache WHERE exact_hash = 'current-ready'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(ready.0, "ready");
+        assert_eq!(ready.1, FEATURE_VERSION);
+        assert_eq!(ready.2, updated_at);
+        assert_eq!(ready.3, ready_blob);
+        assert_eq!(ready.4, points_blob);
+
+        let error: (String, i64, String, Option<Vec<u8>>) = reopened
+            .query_row(
+                "SELECT akaze_status, feature_version, updated_at, akaze_descriptors
+                 FROM feature_cache WHERE exact_hash = 'current-error'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(error.0, "decode_error");
+        assert_eq!(error.1, FEATURE_VERSION);
+        assert_eq!(error.2, updated_at);
+        assert!(error.3.is_none());
     }
 }
 

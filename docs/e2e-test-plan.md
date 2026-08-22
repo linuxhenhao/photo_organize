@@ -36,7 +36,7 @@
 把现有 `integration_test.sh` 的核心能力迁到 Rust integration test 中，形成 `cargo test` 可直接跑的稳定回归：
 
 - `scan`：能生成 `scan.db`，并为图像写入 `feature_cache`
-- `import`：能生成 `catalog.db` 和目标树，即使未开 `--visual-dedup` 也会把 AKAZE 写入目标库 `feature_cache`；对目标库中已有的精确重复不补算 AKAZE
+- `import`：能生成 `catalog.db` 和目标树，即使未开 `--visual-dedup` 也会把 AKAZE 写入目标库 `feature_cache`；对目标库中已有的精确重复不补算 AKAZE、不重拷目标文件；第二次 import 已导入哈希时不改写当前版本 `feature_cache` 行
 - `initcache`：能重新采用现有目标树，且不会复制文件
 - `serve`：能真实监听 HTTP 并返回有效 JSON/图片响应
 
