@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 pub const PROFILE_ENV: &str = "PHOTO_ORG_PROFILE";
 
@@ -245,6 +245,7 @@ pub struct ProgressReporter {
     step: usize,
     processed: AtomicUsize,
     next_log_at: AtomicUsize,
+    last_log_at: std::sync::Mutex<Option<Instant>>,
 }
 
 impl ProgressReporter {
@@ -256,6 +257,7 @@ impl ProgressReporter {
             step,
             processed: AtomicUsize::new(0),
             next_log_at: AtomicUsize::new(step.min(total.max(1))),
+            last_log_at: std::sync::Mutex::new(None),
         }
     }
 
@@ -276,6 +278,9 @@ impl ProgressReporter {
         loop {
             let next = self.next_log_at.load(Ordering::Relaxed);
             if processed < next {
+                // Fall back to a time-based cadence so slow single files cannot
+                // stall progress output for minutes on large trees.
+                self.maybe_log_time(processed);
                 return;
             }
 
@@ -296,9 +301,36 @@ impl ProgressReporter {
                     remaining = self.total.saturating_sub(processed),
                     "progress update"
                 );
+                if let Ok(mut last) = self.last_log_at.lock() {
+                    *last = Some(Instant::now());
+                }
                 return;
             }
         }
+    }
+
+    fn maybe_log_time(&self, processed: usize) {
+        let Ok(mut last) = self.last_log_at.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        let due = last
+            .map(|t| now.duration_since(t).as_secs() >= 10)
+            .unwrap_or(false);
+        if !due {
+            if last.is_none() {
+                *last = Some(now);
+            }
+            return;
+        }
+        *last = Some(now);
+        tracing::info!(
+            stage = %self.label,
+            processed,
+            total = self.total,
+            remaining = self.total.saturating_sub(processed),
+            "progress update (time)"
+        );
     }
 }
 

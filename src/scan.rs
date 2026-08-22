@@ -20,6 +20,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::Instant;
 use walkdir::WalkDir;
 
 const MIME_PREFIX_BYTES: usize = 3072;
@@ -101,6 +102,8 @@ fn scan_with_db_path(scan_db: &Path, roots: &[PathBuf]) -> Result<()> {
             return;
         }
 
+        let file_started = Instant::now();
+        tracing::info!(path = %path.display(), "scan file start");
         let result = match discover_file_for_scan(path, &reuse) {
             Ok(mut item) => {
                 item.last_scanned_at = run_id.clone();
@@ -111,6 +114,12 @@ fn scan_with_db_path(scan_db: &Path, roots: &[PathBuf]) -> Result<()> {
                 None
             }
         };
+        tracing::info!(
+            path = %path.display(),
+            ok = result.is_some(),
+            elapsed_ms = file_started.elapsed().as_millis(),
+            "scan file done"
+        );
 
         if let Some(item) = result {
             let _ = tx_chan.send(item);
